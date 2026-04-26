@@ -14,6 +14,8 @@ interface ModelsProviderEntry {
 	api: Api;
 	baseUrl: string;
 	models: ProviderModelDefinition[];
+	apiKey?: string;
+	compat?: Record<string, unknown>;
 }
 
 interface ModelsFileData {
@@ -88,13 +90,16 @@ function toCost(value: unknown): ProviderModelDefinition["cost"] {
 	};
 }
 
-function normalizeModelRecord(model: unknown, providerApi: Api): ProviderModelDefinition | null {
+function normalizeModelRecord(model: unknown, providerApi: Api, providerCompat?: Record<string, unknown>): ProviderModelDefinition | null {
 	if (!isRecord(model) || typeof model.id !== "string" || !model.id.trim()) {
 		return null;
 	}
 
 	const modelId = model.id.trim();
-	const compat = isRecord(model.compat) ? { ...model.compat } : undefined;
+	const modelCompat = isRecord(model.compat) ? { ...model.compat } : undefined;
+	const compat = providerCompat || modelCompat
+		? { ...(providerCompat ?? {}), ...(modelCompat ?? {}) }
+		: undefined;
 	const headers = isRecord(model.headers)
 		? Object.fromEntries(
 				Object.entries(model.headers)
@@ -174,20 +179,30 @@ function normalizeModelsFileData(parsed: unknown): ModelsFileData {
 			continue;
 		}
 
+		const providerCompat = isRecord(rawProvider.compat) ? { ...rawProvider.compat } : undefined;
+		const rawApiKey = typeof rawProvider.apiKey === "string" ? rawProvider.apiKey.trim() : undefined;
+
 		const models = Array.isArray(rawModels)
 			? rawModels
-					.map((model) => normalizeModelRecord(model, api as Api))
+					.map((model) => normalizeModelRecord(model, api as Api, providerCompat))
 					.filter((model): model is ProviderModelDefinition => model !== null)
 			: [];
 		if (models.length === 0) {
 			continue;
 		}
 
-		providers[providerId] = {
+		const entry: ModelsProviderEntry = {
 			api: api as Api,
 			baseUrl: baseUrl.trim(),
 			models,
 		};
+		if (rawApiKey) {
+			entry.apiKey = rawApiKey;
+		}
+		if (providerCompat) {
+			entry.compat = providerCompat;
+		}
+		providers[providerId] = entry;
 	}
 
 	return { providers };
@@ -346,6 +361,7 @@ export class ProviderRegistry {
 			apis,
 			baseUrl: fromFile.baseUrl,
 			models: [...fromFile.models],
+			apiKey: fromFile.apiKey,
 		};
 	}
 

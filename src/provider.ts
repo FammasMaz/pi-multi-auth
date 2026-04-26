@@ -679,11 +679,23 @@ export function createRotatingStreamWrapper(
 					});
 					let innerStream: AssistantMessageEventStream;
 					try {
-						innerStream = activeBaseProvider.streamSimple(activeModel, context, {
-							...options,
-							apiKey: selected.secret,
-							signal: watchdog.signal,
-						});
+						// Build forwarded options, omitting keys with undefined values
+						// to prevent the OpenAI SDK from rejecting undefined timeout/maxRetries.
+						const forwardedOptions: Record<string, unknown> = {};
+						if (options) {
+							for (const [key, value] of Object.entries(options)) {
+								if (value !== undefined) {
+									forwardedOptions[key] = value;
+								}
+							}
+						}
+						forwardedOptions.apiKey = selected.secret;
+						forwardedOptions.signal = watchdog.signal;
+						innerStream = activeBaseProvider.streamSimple(
+							activeModel,
+							context,
+							forwardedOptions as SimpleStreamOptions,
+						);
 					} catch (error: unknown) {
 						watchdog.dispose();
 						if (watchdog.isCallerAbort(error)) {
@@ -921,6 +933,30 @@ export async function registerMultiAuthProviders(
 
 	for (const metadata of metadataToRegister) {
 		recordProviderDiscovery(metadata.provider);
+	}
+
+	// Auto-seed API keys from models.json into auth.json for custom providers
+	// that have an apiKey defined but no credentials stored yet.
+	for (const metadata of metadataToRegister) {
+		if (!metadata.apiKey) {
+			continue;
+		}
+		try {
+			// addApiKeyCredential deduplicates, so calling it when the key
+			// is already stored is a safe no-op.
+			const result = await accountManager.addApiKeyCredential(metadata.provider, metadata.apiKey);
+			if (result.didAddCredential) {
+				multiAuthDebugLogger.log("models_json_apikey_seeded", {
+					provider: metadata.provider,
+					credentialId: result.credentialId,
+				});
+			}
+		} catch (error: unknown) {
+			multiAuthDebugLogger.log("models_json_apikey_seed_failed", {
+				provider: metadata.provider,
+				error: getErrorMessage(error),
+			});
+		}
 	}
 
 	multiAuthDebugLogger.log("providers_discovered", {

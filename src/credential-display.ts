@@ -21,7 +21,19 @@ function redact(secret: string): string {
 }
 
 export function getCredentialSecret(credential: StoredAuthCredential): string {
-	return credential.type === "oauth" ? credential.access : credential.key;
+	if (credential.type === "oauth") {
+		// Google Gemini CLI / Antigravity OAuth credentials encode a
+		// JSON payload with {token, projectId} as the API key.
+		const projectId =
+			typeof (credential as Record<string, unknown>).projectId === "string"
+				? ((credential as Record<string, unknown>).projectId as string).trim()
+				: "";
+		if (projectId) {
+			return JSON.stringify({ token: credential.access, projectId });
+		}
+		return credential.access;
+	}
+	return credential.key;
 }
 
 export function formatCredentialRedaction(credential: StoredAuthCredential): string {

@@ -2909,10 +2909,34 @@ export class AccountManager {
 			return credential;
 		}
 
-		const refreshedCredential = await this.refreshCredentialToken(provider, credentialId, credential);
-		this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
-		await this.persistOAuthRefreshSchedule(provider);
-		return refreshedCredential;
+		try {
+			const refreshedCredential = await this.refreshCredentialToken(provider, credentialId, credential);
+			this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
+			await this.persistOAuthRefreshSchedule(provider);
+			return refreshedCredential;
+		} catch (error: unknown) {
+			// When the OAuth refresh provider is unavailable (e.g. google-antigravity),
+			// or the refresh fails transiently, fall back to using the existing
+			// access token rather than blocking the request entirely.
+			// The API call itself will determine whether the token is still valid.
+			const isUnsupportedRefresh =
+				isOAuthRefreshFailureError(error) &&
+				error.details.errorCode === UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE;
+			const isTransientRefresh =
+				isOAuthRefreshFailureError(error) && !error.details.permanent;
+
+			if (isUnsupportedRefresh || isTransientRefresh) {
+				multiAuthDebugLogger.log("oauth_refresh_fallback_to_existing", {
+					provider,
+					credentialId,
+					reason: isUnsupportedRefresh ? "unsupported_refresh_provider" : "transient_refresh_failure",
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return credential;
+			}
+
+			throw error;
+		}
 	}
 
 	private async refreshCredentialToken(
