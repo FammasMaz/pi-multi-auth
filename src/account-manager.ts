@@ -174,6 +174,7 @@ type AcquireCredentialOptions = {
 	excludedCredentialIds?: Set<string>;
 	modelId?: string;
 	selectionCache?: CredentialSelectionCache;
+	signal?: AbortSignal;
 };
 
 export interface ResolvedFailoverTarget extends ChainResult {
@@ -2181,11 +2182,14 @@ export class AccountManager {
 				selectedRotationMode = pooledSelection.poolMode;
 				selectedPoolState = pooledSelection.poolState;
 			} else if (state.rotationMode === "balancer") {
-				const selectedCredentialId = await this.keyDistributor.acquireKey({
-					providerId: provider,
-					excludedIds: [...effectiveExcludedCredentialIds],
-					requestingSessionId: `orchestrator:${provider}`,
-				});
+				const selectedCredentialId = await this.keyDistributor.acquireKey(
+					{
+						providerId: provider,
+						excludedIds: [...effectiveExcludedCredentialIds],
+						requestingSessionId: `orchestrator:${provider}`,
+					},
+					{ signal: options?.signal },
+				);
 				selectedIndex = state.credentialIds.indexOf(selectedCredentialId);
 				if (selectedIndex < 0) {
 					state = await this.syncProviderState(provider);
@@ -2220,6 +2224,7 @@ export class AccountManager {
 				excludedCredentialIds: nextExcludedCredentialIds,
 				modelId: options?.modelId,
 				selectionCache,
+				signal: options?.signal,
 			});
 		}
 
