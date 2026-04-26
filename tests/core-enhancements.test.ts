@@ -46,8 +46,9 @@ import { PoolManager } from "../src/pool-manager.js";
 import { createRotatingStreamWrapper } from "../src/provider.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
 import { RateLimitHeaderParser } from "../src/rate-limit-headers.js";
-import { createDefaultMultiAuthState, getProviderState, MultiAuthStorage } from "../src/storage.js";
+import { createDefaultMultiAuthState, createEmptyProviderState, getProviderState, MultiAuthStorage } from "../src/storage.js";
 import { OAuthRefreshFailureError } from "../src/types-oauth.js";
+import { unregisterGlobalKeyDistributor } from "../src/balancer/index.js";
 import { selectBestCredential } from "../src/balancer/weighted-selector.js";
 import { UsageService } from "../src/usage/index.js";
 import type { StoredAuthCredential } from "../src/types.js";
@@ -1245,23 +1246,75 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 		new Map(),
 	);
 
-	const events = await collectAssistantEvents(
-		wrapper(model, createTestContext(), {
-			apiKey: "secret",
-			signal: abortController.signal,
-		}),
+	const stream = wrapper(model, createTestContext(), {
+		apiKey: "secret",
+		signal: abortController.signal,
+	});
+	const events = await collectAssistantEvents(stream);
+	const result = await stream.result();
+	const abortEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
 	);
-	assert.equal(events.length, 1);
-	assert.equal(events[0]?.type, "error");
-	if (events[0]?.type !== "error") {
-		assert.fail("Expected an aborted terminal error event.");
-	}
-	assert.equal(events[0].reason, "aborted");
-	assert.equal(events[0].error.stopReason, "aborted");
-	assert.match(events[0].error.errorMessage ?? "", /aborted/i);
-	assert.deepEqual(acquiredCredentialIds, ["credential-a"]);
-	assert.equal(callsByApiKey.get("secret-a"), 1);
+
+	assert.equal(abortEvent?.reason, "aborted");
+	assert.equal(result.stopReason, "aborted");
+	assert.deepEqual(acquiredCredentialIds, []);
+	assert.equal(callsByApiKey.get("secret-a"), undefined);
 	assert.equal(callsByApiKey.get("secret-b"), undefined);
+	assert.deepEqual(transientCooldowns, []);
+});
+
+test("rotating stream wrapper aborts even when the provider ignores the abort signal", async () => {
+	const model = createTestModel("openai");
+	const acquiredCredentialIds: string[] = [];
+	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
+	let providerCalls = 0;
+	const abortController = new AbortController();
+	const wrapper = createRotatingStreamWrapper(
+		"openai",
+		createRotatingTimeoutAccountManagerStub({
+			provider: "openai",
+			credentials: [
+				{ credentialId: "credential-a", secret: "secret-a" },
+				{ credentialId: "credential-b", secret: "secret-b" },
+			],
+			onAcquire: (credentialId) => {
+				acquiredCredentialIds.push(credentialId);
+			},
+			onTransientCooldown: (credentialId, message) => {
+				transientCooldowns.push({ credentialId, message });
+			},
+		}),
+		{
+			streamSimple: () => {
+				providerCalls += 1;
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessageForTest(model, []) });
+				});
+				return stream;
+			},
+		} as never,
+		new Map(),
+	);
+
+	const stream = wrapper(model, createTestContext(), {
+		apiKey: "secret",
+		signal: abortController.signal,
+	});
+	setTimeout(() => abortController.abort(), 10);
+
+	const events = await collectAssistantEvents(stream);
+	const result = await stream.result();
+	const abortEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+	);
+
+	assert.equal(events.some((event) => event.type === "start"), true);
+	assert.equal(abortEvent?.reason, "aborted");
+	assert.equal(result.stopReason, "aborted");
+	assert.deepEqual(acquiredCredentialIds, ["credential-a"]);
+	assert.equal(providerCalls, 1);
 	assert.deepEqual(transientCooldowns, []);
 });
 
@@ -2256,6 +2309,39 @@ test("account manager honors configured pools before default rotation", async (t
 		providers: Record<string, { poolState?: { activePoolId?: string } }>;
 	};
 	assert.equal(stored.providers[providerId]?.poolState?.activePoolId, "primary");
+});
+
+test("account manager aborts balancer credential acquisition when caller signal is cancelled", async (t) => {
+	unregisterGlobalKeyDistributor();
+	const providerId = "balancer-abort-provider";
+	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: { type: "api_key", key: "alpha" },
+		},
+	});
+
+	const state = createDefaultMultiAuthState();
+	state.providers[providerId] = {
+		...createEmptyProviderState("balancer"),
+		credentialIds: [providerId],
+	};
+	await writeFile(storagePath, JSON.stringify(state, null, 2), "utf-8");
+
+	await accountManager.getKeyDistributor().acquireForSubagent("held-session", providerId);
+	try {
+		const controller = new AbortController();
+		const acquisition = accountManager.acquireCredential(providerId, {
+			signal: controller.signal,
+		});
+
+		controller.abort();
+		await assert.rejects(acquisition, {
+			name: "AbortError",
+		});
+	} finally {
+		accountManager.getKeyDistributor().releaseFromSubagent("held-session");
+	}
 });
 
 test("account manager rotates across pools when provider pool failover strategy is configured", async (t) => {

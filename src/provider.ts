@@ -538,7 +538,10 @@ function createErrorAssistantMessage(model: Model<Api>, message: string): Assist
 	};
 }
 
-function createAbortedAssistantMessage(model: Model<Api>, message: string): AssistantMessage {
+function createAbortedAssistantMessage(
+	model: Model<Api>,
+	message: string = "Request was aborted.",
+): AssistantMessage {
 	return {
 		...createErrorAssistantMessage(model, message),
 		stopReason: "aborted",
@@ -609,6 +612,101 @@ function formatMultiAuthRotationFailureMessage(
 		`Action: ${describeCredentialErrorAction(classification.kind)}`,
 	);
 	return lines.join("\n");
+}
+
+function pushAbortedAssistantEvent(
+	stream: AssistantMessageEventStream,
+	model: Model<Api>,
+	message: string = "Request was aborted.",
+): void {
+	const abortedMessage = createAbortedAssistantMessage(model, message);
+	stream.push({
+		type: "error",
+		reason: "aborted",
+		error: abortedMessage,
+	});
+	stream.end(abortedMessage);
+}
+
+function createCallerAbortError(message: string = "Request was aborted."): Error {
+	const error = new Error(message);
+	error.name = "AbortError";
+	return error;
+}
+
+function resolveAbortReason(signal: AbortSignal): unknown {
+	const reason = signal.reason;
+	if (reason instanceof Error) {
+		return reason;
+	}
+	if (typeof reason === "string" && reason.trim().length > 0) {
+		return createCallerAbortError(reason);
+	}
+	return createCallerAbortError();
+}
+
+function isCallerAbortSignal(signal: AbortSignal | undefined, error?: unknown): boolean {
+	if (!signal?.aborted) {
+		return false;
+	}
+	if (error === undefined) {
+		return true;
+	}
+	if (error instanceof Error) {
+		return error.name === "AbortError" || /abort/i.test(error.message);
+	}
+	if (typeof error === "string") {
+		return /abort/i.test(error);
+	}
+	return true;
+}
+
+async function raceWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) {
+		return operation;
+	}
+	if (signal.aborted) {
+		throw resolveAbortReason(signal);
+	}
+
+	let abortListener: (() => void) | null = null;
+	let didAbort = false;
+	const abortPromise = new Promise<never>((_resolve, reject) => {
+		abortListener = () => {
+			didAbort = true;
+			reject(resolveAbortReason(signal));
+		};
+		signal.addEventListener("abort", abortListener, { once: true });
+	});
+
+	try {
+		return await Promise.race([operation, abortPromise]);
+	} finally {
+		if (abortListener) {
+			signal.removeEventListener("abort", abortListener);
+		}
+		if (didAbort) {
+			void operation.catch(() => undefined);
+		}
+	}
+}
+
+async function readNextStreamEventWithAbort(
+	iterator: AsyncIterator<AssistantMessageEvent>,
+	signal?: AbortSignal,
+): Promise<IteratorResult<AssistantMessageEvent>> {
+	return raceWithAbort(Promise.resolve(iterator.next()), signal);
+}
+
+function closeAsyncIterator(iterator: AsyncIterator<AssistantMessageEvent>): void {
+	try {
+		const closeResult = iterator.return?.();
+		if (closeResult) {
+			void Promise.resolve(closeResult).catch(() => undefined);
+		}
+	} catch {
+		// Ignore cleanup failures; the caller is already finishing the stream.
+	}
 }
 
 function resolveCredentialProviderId(
@@ -744,10 +842,12 @@ export function createRotatingStreamWrapper(
 				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected;
 				try {
+					if (options?.signal?.aborted) {
+						pushAbortedAssistantEvent(stream, activeModel);
+						return;
+					}
 					if (delegatedCredentialOverride) {
-						const providerCredentialIds = await accountManager.listProviderCredentialIds(
-							activeProviderId,
-						);
+						const providerCredentialIds = await accountManager.listProviderCredentialIds(activeProviderId);
 						if (!providerCredentialIds.includes(delegatedCredentialOverride.credentialId)) {
 							throw new Error(
 								`Delegated credential '${delegatedCredentialOverride.credentialId}' is not available for ${activeProviderId}.`,
@@ -761,29 +861,35 @@ export function createRotatingStreamWrapper(
 							}
 						}
 
-						selected = await accountManager.acquireCredential(activeProviderId, {
-							excludedCredentialIds: pinnedExcludedCredentialIds,
-							pinnedCredentialId: delegatedCredentialOverride.credentialId,
-							modelId: activeModel.id,
-							selectionCache,
-							signal: options?.signal,
-						});
+						selected = await raceWithAbort(
+							accountManager.acquireCredential(activeProviderId, {
+								excludedCredentialIds: pinnedExcludedCredentialIds,
+								pinnedCredentialId: delegatedCredentialOverride.credentialId,
+								modelId: activeModel.id,
+								selectionCache,
+								signal: options?.signal,
+							}),
+							options?.signal,
+						);
 						multiAuthDebugLogger.log("delegated_credential_override_applied", {
 							provider: activeProviderId,
 							credentialId: delegatedCredentialOverride.credentialId,
 							model: activeModel.id,
 						});
 					} else {
-						selected = await accountManager.acquireCredential(activeProviderId, {
-							excludedCredentialIds,
-							modelId: activeModel.id,
-							selectionCache,
-							signal: options?.signal,
-						});
+						selected = await raceWithAbort(
+							accountManager.acquireCredential(activeProviderId, {
+								excludedCredentialIds,
+								modelId: activeModel.id,
+								selectionCache,
+								signal: options?.signal,
+							}),
+							options?.signal,
+						);
 					}
 				} catch (error: unknown) {
-					if (options?.signal?.aborted && isAbortError(error)) {
-						emitAbortedTermination(options.signal.reason ?? error);
+					if (isCallerAbortSignal(options?.signal, error)) {
+						pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
 						return;
 					}
 					if (excludedCredentialIds.size > 0 && (await switchToFailoverProvider())) {
@@ -1008,15 +1114,15 @@ export function createRotatingStreamWrapper(
 						}
 						forwardedOptions.apiKey = selected.secret;
 						forwardedOptions.headers = requestHeaders;
-						forwardedOptions.signal = watchdog.signal;
+						forwardedOptions.signal = options?.signal;
 						innerStream = activeBaseProvider.streamSimple(
 							requestModel,
 							context,
 							forwardedOptions as SimpleStreamOptions,
 						);
 					} catch (error: unknown) {
-						if (isCallerAbort(options?.signal, error)) {
-							emitAbortedTermination(options?.signal?.reason ?? error);
+						if (isCallerAbortSignal(options?.signal, error)) {
+							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
@@ -1042,18 +1148,23 @@ export function createRotatingStreamWrapper(
 					let shouldRetrySameCredential = false;
 					let shouldRotateCredential = false;
 
+					const innerIterator = innerStream[Symbol.asyncIterator]();
 					try {
-						for await (const rawEvent of innerStream) {
+						while (true) {
+							const nextEvent = await readNextStreamEventWithAbort(innerIterator, options?.signal);
+							if (nextEvent.done) {
+								break;
+							}
 							const forwardedEvents = sanitizeOllamaThinkingEvent(
-								rawEvent,
+								nextEvent.value,
 								activeProviderId,
 								bufferedThinkingState,
 							);
 							for (const event of forwardedEvents) {
 								if (event.type === "error") {
 									const assistantErrorMessage = getAssistantErrorMessage(event.error);
-									if (isCallerAbortMessage(options?.signal, assistantErrorMessage)) {
-										emitAbortedTermination(options?.signal?.reason ?? event.error.errorMessage);
+									if (isCallerAbortSignal(options?.signal) && /abort/i.test(assistantErrorMessage)) {
+										pushAbortedAssistantEvent(stream, activeModel, assistantErrorMessage);
 										return;
 									}
 									const message = assistantErrorMessage;
@@ -1074,7 +1185,7 @@ export function createRotatingStreamWrapper(
 									}
 
 									stream.push(event);
-									stream.end();
+									stream.end(event.error);
 									return;
 								}
 
@@ -1128,7 +1239,7 @@ export function createRotatingStreamWrapper(
 										Date.now() - requestStartedAt,
 										requestModel.id,
 									);
-									stream.end();
+									stream.end(event.message);
 									return;
 								}
 							}
@@ -1138,8 +1249,8 @@ export function createRotatingStreamWrapper(
 							}
 						}
 					} catch (error: unknown) {
-						if (isCallerAbort(options?.signal, error)) {
-							emitAbortedTermination(options?.signal?.reason ?? error);
+						if (isCallerAbortSignal(options?.signal, error)) {
+							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
@@ -1157,6 +1268,8 @@ export function createRotatingStreamWrapper(
 						} else {
 							throw error;
 						}
+					} finally {
+						closeAsyncIterator(innerIterator);
 					}
 
 					if (shouldRetrySameCredential) {
@@ -1169,7 +1282,7 @@ export function createRotatingStreamWrapper(
 
 					if (!sawDoneEvent) {
 						if (options?.signal?.aborted) {
-							emitAbortedTermination(options.signal.reason);
+							pushAbortedAssistantEvent(stream, activeModel);
 							return;
 						}
 						const message = !forwardedAnyEvent
@@ -1204,6 +1317,11 @@ export function createRotatingStreamWrapper(
 				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${rotationAttemptLimit} attempt budget, all produced rotation-triggering errors.${lastDetail}`,
 			);
 		})().catch((error: unknown) => {
+			if (isCallerAbortSignal(options?.signal, error)) {
+				pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
+				return;
+			}
+
 			const errorMessage = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 			const assistantError: AssistantMessageEvent = {
 				type: "error",
@@ -1214,7 +1332,7 @@ export function createRotatingStreamWrapper(
 				),
 			};
 			stream.push(assistantError);
-			stream.end();
+			stream.end(assistantError.error);
 		});
 
 		return stream;
