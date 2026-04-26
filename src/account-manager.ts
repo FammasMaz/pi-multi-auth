@@ -4726,13 +4726,28 @@ export class AccountManager {
 			this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
 			await this.persistOAuthRefreshSchedule(provider);
 			return refreshedCredential;
-		} catch (error) {
-			if (
+		} catch (error: unknown) {
+			const isUnsupportedRefresh =
 				isOAuthRefreshFailureError(error) &&
-				shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error)
+				error.details.errorCode === UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE;
+			const isTransientRefresh =
+				isOAuthRefreshFailureError(error) && !error.details.permanent;
+
+			if (
+				isUnsupportedRefresh ||
+				isTransientRefresh ||
+				(isOAuthRefreshFailureError(error) &&
+					shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error))
 			) {
+				multiAuthDebugLogger.log("oauth_refresh_fallback_to_existing", {
+					provider,
+					credentialId,
+					reason: isUnsupportedRefresh ? "unsupported_refresh_provider" : "transient_refresh_failure",
+					error: error instanceof Error ? error.message : String(error),
+				});
 				return credential;
 			}
+
 			throw error;
 		}
 	}
