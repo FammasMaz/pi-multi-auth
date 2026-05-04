@@ -7,11 +7,14 @@ import {
 	resolveStateHistoryPersistencePaths,
 	type HistoryPersistenceConfig,
 } from "./config.js";
+import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import {
 	isRetryableFileAccessError,
 	readTextSnapshotWithRetries,
 	writeTextSnapshotWithRetries,
 } from "./file-retry.js";
+import { cloneJson } from "./json-utils.js";
+import { redactUsageCredentialIdentifier } from "./usage/usage-coordinator.js";
 import type { CascadeRetryState } from "./types-cascade.js";
 import type { MultiAuthState, ProviderRotationState } from "./types.js";
 import type { HealthMetricsHistory } from "./types-health.js";
@@ -33,13 +36,6 @@ export interface MultiAuthHistoryStoreOptions {
 	historyPersistence?: HistoryPersistenceConfig;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function cloneJson<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value)) as T;
-}
 
 function createEmptyHealthHistorySnapshot(): HealthHistorySnapshot {
 	return {
@@ -55,6 +51,96 @@ function createEmptyCascadeHistorySnapshot(): CascadeHistorySnapshot {
 	};
 }
 
+function resolveCredentialReference(
+	state: MultiAuthState,
+	providerId: string,
+	credentialReference: string,
+): string {
+	const trimmedReference = credentialReference.trim();
+	if (!trimmedReference) {
+		return credentialReference;
+	}
+
+	const providerState = state.providers[providerId];
+	if (!providerState) {
+		return trimmedReference;
+	}
+
+	if (providerState.credentialIds.includes(trimmedReference)) {
+		return trimmedReference;
+	}
+
+	for (const credentialId of providerState.credentialIds) {
+		if (redactUsageCredentialIdentifier(credentialId) === trimmedReference) {
+			return credentialId;
+		}
+	}
+
+	return trimmedReference;
+}
+
+function createRedactedHealthHistoryEntry(
+	credentialId: string,
+	history: HealthMetricsHistory,
+): [string, HealthMetricsHistory] {
+	const redactedCredentialId = redactUsageCredentialIdentifier(credentialId);
+	return [
+		redactedCredentialId,
+		cloneJson({
+			...history,
+			credentialId: redactedCredentialId,
+		}) as HealthMetricsHistory,
+	];
+}
+
+function createHydratedHealthHistoryEntry(
+	state: MultiAuthState,
+	providerId: string,
+	credentialReference: string,
+	history: HealthMetricsHistory,
+): [string, HealthMetricsHistory] {
+	const sourceCredentialId =
+		typeof history.credentialId === "string" && history.credentialId.trim().length > 0
+			? history.credentialId
+			: credentialReference;
+	const resolvedFromKey = resolveCredentialReference(state, providerId, credentialReference);
+	const resolvedCredentialId =
+		resolvedFromKey !== credentialReference.trim()
+			? resolvedFromKey
+			: resolveCredentialReference(state, providerId, sourceCredentialId);
+
+	return [
+		resolvedCredentialId,
+		cloneJson({
+			...history,
+			credentialId: resolvedCredentialId,
+		}) as HealthMetricsHistory,
+	];
+}
+
+function redactCascadeHistory(history: readonly CascadeRetryState[]): CascadeRetryState[] {
+	return history.map((entry) => ({
+		...cloneJson(entry),
+		cascadePath: entry.cascadePath.map((attempt) => ({
+			...attempt,
+			credentialId: redactUsageCredentialIdentifier(attempt.credentialId),
+		})),
+	})) as CascadeRetryState[];
+}
+
+function hydrateCascadeHistory(
+	state: MultiAuthState,
+	history: readonly CascadeRetryState[],
+): CascadeRetryState[] {
+	return history.map((entry) => ({
+		...cloneJson(entry),
+		cascadePath: entry.cascadePath.map((attempt) => ({
+			...attempt,
+			credentialId: resolveCredentialReference(state, attempt.providerId, attempt.credentialId),
+		})),
+	})) as CascadeRetryState[];
+}
+
 function parseHealthHistorySnapshot(content: string | undefined): HealthHistorySnapshot {
 	if (!content || content.trim() === "") {
 		return createEmptyHealthHistorySnapshot();
@@ -65,7 +151,7 @@ function parseHealthHistorySnapshot(content: string | undefined): HealthHistoryS
 		parsed = JSON.parse(content);
 	} catch (error) {
 		throw new Error(
-			`Invalid JSON in extracted health history snapshot: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in extracted health history snapshot: ${getErrorMessage(error)}`,
 		);
 	}
 
@@ -126,7 +212,7 @@ function parseCascadeHistorySnapshot(content: string | undefined): CascadeHistor
 		parsed = JSON.parse(content);
 	} catch (error) {
 		throw new Error(
-			`Invalid JSON in extracted cascade history snapshot: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in extracted cascade history snapshot: ${getErrorMessage(error)}`,
 		);
 	}
 
@@ -228,7 +314,19 @@ function extractHealthHistory(state: MultiAuthState): HealthHistorySnapshot {
 		if (!history || Object.keys(history).length === 0) {
 			continue;
 		}
-		providers[providerId] = cloneJson(history) as Record<string, HealthMetricsHistory>;
+
+		const providerHistory: Record<string, HealthMetricsHistory> = {};
+		for (const [credentialId, historyEntry] of Object.entries(history)) {
+			const [redactedCredentialId, redactedHistoryEntry] = createRedactedHealthHistoryEntry(
+				credentialId,
+				historyEntry,
+			);
+			providerHistory[redactedCredentialId] = redactedHistoryEntry;
+		}
+
+		if (Object.keys(providerHistory).length > 0) {
+			providers[providerId] = providerHistory;
+		}
 	}
 
 	return {
@@ -249,7 +347,7 @@ function extractCascadeHistory(state: MultiAuthState): CascadeHistorySnapshot {
 			if (!cascadeState || cascadeState.history.length === 0) {
 				continue;
 			}
-			providerHistory[cascadeProviderId] = cloneJson(cascadeState.history) as CascadeRetryState[];
+			providerHistory[cascadeProviderId] = redactCascadeHistory(cascadeState.history);
 		}
 
 		if (Object.keys(providerHistory).length > 0) {
@@ -313,8 +411,19 @@ function mergeExtractedHealthHistory(state: MultiAuthState, snapshot: HealthHist
 		}
 
 		const embeddedHistory = providerState.healthState?.history;
+		const hydratedExtractedHistory: Record<string, HealthMetricsHistory> = {};
+		for (const [credentialReference, historyEntry] of Object.entries(extractedHistory)) {
+			const [credentialId, hydratedHistoryEntry] = createHydratedHealthHistoryEntry(
+				state,
+				providerId,
+				credentialReference,
+				historyEntry,
+			);
+			hydratedExtractedHistory[credentialId] = hydratedHistoryEntry;
+		}
+
 		const mergedHistory = {
-			...(cloneJson(extractedHistory) as Record<string, HealthMetricsHistory>),
+			...hydratedExtractedHistory,
 			...(embeddedHistory ? (cloneJson(embeddedHistory) as Record<string, HealthMetricsHistory>) : {}),
 		};
 		if (Object.keys(mergedHistory).length === 0) {
@@ -345,7 +454,7 @@ function mergeExtractedCascadeHistory(state: MultiAuthState, snapshot: CascadeHi
 				history:
 					currentHistory && currentHistory.length > 0
 						? (cloneJson(currentHistory) as CascadeRetryState[])
-						: (cloneJson(extractedHistory) as CascadeRetryState[]),
+						: hydrateCascadeHistory(state, extractedHistory),
 			};
 		}
 

@@ -46,6 +46,13 @@ const CONTEXT_LIMIT_PATTERNS: RegExp[] = [
 	/num_ctx/i,
 ];
 
+const AUTH_TOKEN_INVALIDATED_PATTERNS: RegExp[] = [
+	/(?:auth(?:entication)?|access|oauth)\s+token[^\n.]*invalidated/i,
+	/invalidated[^\n.]*\b(?:auth(?:entication)?|access|oauth)\s+token\b/i,
+	/(?:^|[^\p{L}\p{N}])token[_-]?(?:revoked|invalidated)(?:$|[^\p{L}\p{N}])/iu,
+	/try\s+signing\s+in\s+again/i,
+];
+
 const AUTH_PATTERNS: RegExp[] = [
 	/invalid[_-]?api[_-]?key/i,
 	/incorrect\s+api\s+key/i,
@@ -106,6 +113,10 @@ const QUOTA_PATTERNS: RegExp[] = [
 	/credit balance/i,
 	/out of credits?/i,
 	/monthly (?:spend|usage) limit/i,
+	/daily\s+free\s+allocation/i,
+	/used\s+up\s+your\s+daily/i,
+	/neurons?\s+per\s+day/i,
+	/\b10,?000\s+neurons\b/i,
 	/resource\s*exhausted/i,
 	/RESOURCE_EXHAUSTED/,
 	/limit[_\s-]?reached/i,
@@ -125,6 +136,8 @@ const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
 	/outstanding[_\s-]?balance/i,
 	/balance[_\s-]?too[_\s-]?low/i,
 	/insufficient[_\s-]?balance/i,
+	/account[^\n.]*balance[^\n.]*insufficient/i,
+	/balance[^\n.]*insufficient/i,
 	/no[_\s-]?credits?[_\s-]?(?:remaining|left)/i,
 	/account[_\s-]?has[_\s-]?no[_\s-]?credits/i,
 	/credits?[_\s-]?depleted/i,
@@ -155,6 +168,19 @@ const REQUEST_TIMEOUT_PATTERNS: RegExp[] = [
 	/request timed out/i,
 ];
 
+/**
+ * Host/runtime initiated cancellations must remain terminal so Pi can stop the request
+ * immediately on user escape/cancel input. Multi-auth only retries its own explicit
+ * watchdog timeouts above, which are normalized into REQUEST_TIMEOUT_PATTERNS.
+ */
+const CANCELLATION_PATTERNS: RegExp[] = [
+	/request was aborted/i,
+	/operation was aborted/i,
+	/\bAbortError\b/i,
+	/\brequest aborted\b/i,
+	/\boperation aborted\b/i,
+];
+
 const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/\b5\d\d\b/i,
 	/internal[_\s-]?server[_\s-]?error/i,
@@ -173,9 +199,6 @@ const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/socket hang up/i,
 	/network error/i,
 	/fetch failed/i,
-	/request was aborted/i,
-	/operation was aborted/i,
-	/\bAbortError\b/i,
 	/ended (?:before|without) completion/i,
 	/without completion event/i,
 	/stream ended unexpectedly/i,
@@ -189,6 +212,14 @@ const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
 	/unsupported model/i,
 	/model[^\n]*(?:not found|not supported)/i,
 	/unknown model/i,
+];
+
+const CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS: RegExp[] = [
+	/model[^\n]*(?:not found|not supported|not available|not enabled)/i,
+	/not supported when using codex with a chatgpt account/i,
+	/(?:do not|don't|does not|doesn't) have access[^\n]*(?:model|gpt)/i,
+	/(?:account|plan|subscription)[^\n]*(?:cannot|can't|does not|doesn't|not allowed|not permitted)[^\n]*(?:access|use)/i,
+	/requires[^\n]*(?:plus|pro|team|business|enterprise|paid)/i,
 ];
 
 function matchesAny(message: string, patterns: readonly RegExp[]): boolean {
@@ -219,6 +250,22 @@ function withQuotaClassification(
 	};
 }
 
+export function isCredentialModelIncompatibilityError(
+	errorText: string,
+	context?: CredentialErrorContext,
+): boolean {
+	const message = errorText.trim();
+	const providerId = (context?.providerId ?? "").trim().toLowerCase();
+	const rawModelId = (context?.modelId ?? "").trim().toLowerCase();
+	const separatorIndex = rawModelId.indexOf("/");
+	const modelId = separatorIndex >= 0 ? rawModelId.slice(separatorIndex + 1).trim() : rawModelId;
+	if (!message || providerId !== "openai-codex" || !modelId.startsWith("gpt-")) {
+		return false;
+	}
+
+	return matchesAny(message, CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+}
+
 export function isRetryableModelAvailabilityError(
 	errorText: string,
 	context?: CredentialErrorContext,
@@ -226,6 +273,10 @@ export function isRetryableModelAvailabilityError(
 	const message = errorText.trim();
 	if (!message) {
 		return false;
+	}
+
+	if (isCredentialModelIncompatibilityError(message, context)) {
+		return true;
 	}
 
 	if ((context?.providerId ?? "").trim().toLowerCase() !== "vivgrid") {
@@ -259,6 +310,17 @@ export function classifyCredentialError(
 			shouldApplyCooldown: false,
 			shouldDisableCredential: false,
 			reason: "Context/token limit error detected",
+		};
+	}
+
+	if (matchesAny(message, AUTH_TOKEN_INVALIDATED_PATTERNS)) {
+		return {
+			kind: "authentication",
+			shouldRotateCredential: true,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: true,
+			reason: "Authentication token invalidated - credential disabled until re-authenticated",
 		};
 	}
 
@@ -357,6 +419,17 @@ export function classifyCredentialError(
 				? "Quota or spend exhaustion pattern detected"
 				: "Rate-limit pattern detected",
 		});
+	}
+
+	if (matchesAny(message, CANCELLATION_PATTERNS)) {
+		return {
+			kind: "unknown",
+			shouldRotateCredential: false,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: false,
+			reason: "Cancellation or abort detected; preserving caller-owned termination semantics",
+		};
 	}
 
 	if (matchesAny(message, REQUEST_TIMEOUT_PATTERNS)) {

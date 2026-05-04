@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
 import {
 	createAssistantMessageEventStream,
+	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
@@ -15,6 +16,13 @@ import {
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import { AccountManager } from "../src/account-manager.js";
+import {
+	formatOAuthRefreshFailureSummary,
+	getErrorMessage,
+	inferOAuthRefreshFailureMetadata,
+	isRecord,
+} from "../src/auth-error-utils.js";
+import { AsyncBufferedLogWriter } from "../src/async-buffered-log-writer.js";
 import { AuthWriter } from "../src/auth-writer.js";
 import {
 	DEFAULT_MULTI_AUTH_CONFIG,
@@ -25,11 +33,18 @@ import { multiAuthDebugLogger } from "../src/debug-logger.js";
 import { classifyCredentialError } from "../src/error-classifier.js";
 import { isRetryableFileAccessError, writeTextSnapshotWithRetries } from "../src/file-retry.js";
 import { HealthScorer } from "../src/health-scorer.js";
+import { refreshOAuthCredential, registerOAuthProvider, resetOAuthProviders } from "../src/oauth-compat.js";
+import { registerClineOAuthProvider } from "../src/oauth-cline.js";
 import { OAuthRefreshScheduler, determineTokenExpiration, extractJwtExpiration } from "../src/oauth-refresh-scheduler.js";
+import {
+	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_AGENT_ROUTER_SUBAGENT_ENV,
+} from "../src/runtime-context.js";
 import { PoolManager } from "../src/pool-manager.js";
 import { createRotatingStreamWrapper } from "../src/provider.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
-import { StreamAttemptTimeoutError } from "../src/stream-watchdog.js";
 import { RateLimitHeaderParser } from "../src/rate-limit-headers.js";
 import { createDefaultMultiAuthState, createEmptyProviderState, getProviderState, MultiAuthStorage } from "../src/storage.js";
 import { OAuthRefreshFailureError } from "../src/types-oauth.js";
@@ -38,6 +53,52 @@ import { selectBestCredential } from "../src/balancer/weighted-selector.js";
 import { UsageService } from "../src/usage/index.js";
 import type { StoredAuthCredential } from "../src/types.js";
 import type { UsageAuth, UsageSnapshot } from "../src/usage/types.js";
+
+const PI_AGENT_ROUTER_ENV_KEYS = [
+	PI_AGENT_ROUTER_SUBAGENT_ENV,
+	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+] as const;
+
+type PiAgentRouterEnvKey = (typeof PI_AGENT_ROUTER_ENV_KEYS)[number];
+
+function capturePiAgentRouterEnv(): Record<PiAgentRouterEnvKey, string | undefined> {
+	return Object.fromEntries(
+		PI_AGENT_ROUTER_ENV_KEYS.map((key) => [key, process.env[key]]),
+	) as Record<PiAgentRouterEnvKey, string | undefined>;
+}
+
+function restorePiAgentRouterEnv(env: Record<PiAgentRouterEnvKey, string | undefined>): void {
+	for (const key of PI_AGENT_ROUTER_ENV_KEYS) {
+		const value = env[key];
+		if (typeof value === "string") {
+			process.env[key] = value;
+		} else {
+			delete process.env[key];
+		}
+	}
+}
+
+function clearPiAgentRouterEnv(): void {
+	for (const key of PI_AGENT_ROUTER_ENV_KEYS) {
+		delete process.env[key];
+	}
+}
+
+const piAgentRouterEnvStack: Array<Record<PiAgentRouterEnvKey, string | undefined>> = [];
+
+test.beforeEach(() => {
+	piAgentRouterEnvStack.push(capturePiAgentRouterEnv());
+	clearPiAgentRouterEnv();
+});
+
+test.afterEach(() => {
+	const originalEnv = piAgentRouterEnvStack.pop();
+	if (originalEnv) {
+		restorePiAgentRouterEnv(originalEnv);
+	}
+});
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
@@ -100,6 +161,28 @@ function createJwtWithExp(expiresAtSeconds: number): string {
 	].join(".");
 }
 
+function createCodexIdentityJwt(options: {
+	expiresAtSeconds: number;
+	accountId: string;
+	accountUserId: string;
+	email: string;
+}): string {
+	return [
+		createBase64UrlJson({ alg: "none", typ: "JWT" }),
+		createBase64UrlJson({
+			exp: options.expiresAtSeconds,
+			"https://api.openai.com/auth": {
+				chatgpt_account_id: options.accountId,
+				chatgpt_account_user_id: options.accountUserId,
+			},
+			"https://api.openai.com/profile": {
+				email: options.email,
+			},
+		}),
+		"signature",
+	].join(".");
+}
+
 function cloneExtensionConfig(): MultiAuthExtensionConfig {
 	return {
 		...DEFAULT_MULTI_AUTH_CONFIG,
@@ -110,8 +193,10 @@ function cloneExtensionConfig(): MultiAuthExtensionConfig {
 			weights: { ...DEFAULT_MULTI_AUTH_CONFIG.health.weights },
 		},
 		historyPersistence: { ...DEFAULT_MULTI_AUTH_CONFIG.historyPersistence },
-		oauthRefresh: { ...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh },
-		streamTimeouts: { ...DEFAULT_MULTI_AUTH_CONFIG.streamTimeouts },
+		oauthRefresh: {
+			...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh,
+			excludedProviders: [...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh.excludedProviders],
+		},
 	};
 }
 
@@ -151,7 +236,7 @@ async function createAccountManagerHarness(
 		debugDir,
 		historyPersistence: extensionConfig.historyPersistence,
 	});
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	if (options.usageFetcher) {
 		usageService.register({
 			id: options.providerId,
@@ -174,7 +259,7 @@ async function createAccountManagerHarness(
 	);
 
 	t.after(async () => {
-		accountManager.shutdown();
+		await accountManager.shutdown();
 		await rm(tempRoot, { recursive: true, force: true });
 	});
 
@@ -238,7 +323,7 @@ function createAssistantUsage(): AssistantMessage["usage"] {
 }
 
 function createAssistantMessageForTest(
-	model: Model<"openai-completions">,
+	model: Model<Api>,
 	content: AssistantMessage["content"],
 	overrides: Partial<AssistantMessage> = {},
 ): AssistantMessage {
@@ -311,6 +396,66 @@ function createStreamingBaseProvider(
 					partial: partialText,
 				});
 				stream.push({ type: "done", reason: "stop", message: finalMessage });
+				stream.end();
+			});
+			return stream;
+		},
+	};
+}
+
+function createEmptyCompletionThenSuccessProvider(
+	model: Model<"openai-completions">,
+	options: {
+		text: string;
+		onCall?: (callNumber: number) => void;
+	},
+): {
+	streamSimple: () => ReturnType<typeof createAssistantMessageEventStream>;
+} {
+	let callCount = 0;
+
+	return {
+		streamSimple: () => {
+			const stream = createAssistantMessageEventStream();
+			const currentCall = callCount;
+			callCount += 1;
+			options.onCall?.(callCount);
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessageForTest(model, []) });
+				if (currentCall === 0) {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [], {
+							usage: {
+								...createAssistantUsage(),
+								output: 0,
+								totalTokens: 1,
+							},
+							responseId: "empty-completion-response",
+						}),
+					});
+					stream.end();
+					return;
+				}
+
+				const partialText = createAssistantMessageForTest(model, [
+					{ type: "text", text: options.text },
+				]);
+				stream.push({ type: "text_start", contentIndex: 0, partial: partialText });
+				stream.push({
+					type: "text_delta",
+					contentIndex: 0,
+					delta: options.text,
+					partial: partialText,
+				});
+				stream.push({
+					type: "text_end",
+					contentIndex: 0,
+					content: options.text,
+					partial: partialText,
+				});
+				stream.push({ type: "done", reason: "stop", message: partialText });
 				stream.end();
 			});
 			return stream;
@@ -452,6 +597,58 @@ function createAbortAwareTimeoutProvider(
 	};
 }
 
+test("rotating stream wrapper redacts request auth debug secrets", async (t) => {
+	const provider = "openai-codex";
+	const model = createTestModel(provider);
+	const secret = "sensitive-oauth-token-prefix-1234567890";
+	const capturedLogs: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	const originalLog = multiAuthDebugLogger.log.bind(multiAuthDebugLogger);
+	multiAuthDebugLogger.log = (event: string, payload: Record<string, unknown> = {}) => {
+		capturedLogs.push({ event, payload });
+	};
+	t.after(() => {
+		multiAuthDebugLogger.log = originalLog;
+	});
+
+	const wrapper = createRotatingStreamWrapper(
+		provider,
+		{
+			listProviderCredentialIds: async () => [`${provider}-credential`],
+			acquireCredential: async () => ({
+				provider,
+				credentialId: `${provider}-credential`,
+				credential: {
+					type: "oauth",
+					access: secret,
+					refresh: "refresh-token",
+					expires: Date.now() + 60_000,
+				},
+				secret,
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		createStreamingBaseProvider(model, {
+			thinking: "No secret should be logged.",
+			text: "Validated output.",
+		}) as never,
+	);
+
+	await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "caller-key" }));
+
+	const authLog = capturedLogs.find((entry) => entry.event === "stream_request_auth");
+	assert.ok(authLog);
+	assert.equal(Object.hasOwn(authLog.payload, "secretPrefix"), false);
+	assert.equal(Object.hasOwn(authLog.payload, "secretStartsWithWorkos"), false);
+	assert.equal(authLog.payload.secretKind, "oauth");
+	assert.equal(authLog.payload.hasSecret, true);
+	assert.equal(JSON.stringify(authLog.payload).includes(secret.slice(0, 12)), false);
+});
+
 test("rotating stream wrapper suppresses malformed ollama thinking blocks", async () => {
 	const model = createTestModel("ollama");
 	const malformedThinking =
@@ -522,185 +719,494 @@ test("rotating stream wrapper preserves readable ollama thinking blocks", async 
 	assert.deepEqual(doneEvent.message.content.map((block) => block.type), ["thinking", "text"]);
 });
 
-test("rotating stream wrapper aborts silent attempts after idle timeout and rotates credentials", async () => {
-	const model = createTestModel("openai");
-	const acquiredCredentialIds: string[] = [];
-	const succeededCredentialIds: string[] = [];
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const callsByApiKey = new Map<string, number>();
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onAcquire: (credentialId) => {
-				acquiredCredentialIds.push(credentialId);
-			},
-			onSuccess: (credentialId) => {
-				succeededCredentialIds.push(credentialId);
-			},
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "hang_silently",
-				"secret-b": "success",
-			},
-			successText: "Recovered after idle timeout.",
-			onCall: (apiKey) => {
-				callsByApiKey.set(apiKey, (callsByApiKey.get(apiKey) ?? 0) + 1);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after idle timeout.",
-	);
-	assert.deepEqual(succeededCredentialIds, ["credential-b"]);
-	assert.equal(callsByApiKey.get("secret-a"), 3);
-	assert.equal(callsByApiKey.get("secret-b"), 1);
-	assert.deepEqual(acquiredCredentialIds, ["credential-a", "credential-b"]);
-	assert.deepEqual(transientCooldowns, [
-		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
-		},
-	]);
-	assert.equal(events.some((event) => event.type === "error"), false);
-});
-
-test("rotating stream wrapper aborts started streams after the hard attempt timeout", async () => {
-	const model = createTestModel("openai");
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const callsByApiKey = new Map<string, number>();
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "start_then_hang",
-				"secret-b": "success",
-			},
-			successText: "Recovered after hard timeout.",
-			onCall: (apiKey) => {
-				callsByApiKey.set(apiKey, (callsByApiKey.get(apiKey) ?? 0) + 1);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 40,
-			idleTimeoutMs: 200,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after hard timeout.",
-	);
-	assert.equal(callsByApiKey.get("secret-a"), 3);
-	assert.equal(callsByApiKey.get("secret-b"), 1);
-	assert.deepEqual(transientCooldowns, [
-		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (attempt_timeout): provider=openai: credential=credential-a: model=glm-5: exceeded the per-attempt deadline of 40ms without completion",
-		},
-	]);
-	assert.equal(events.some((event) => event.type === "error"), false);
-});
-
-test("rotating stream wrapper preserves watchdog timeout identity across generic abort surfaces", async () => {
-	const model = createTestModel("openai");
-	const observedAbortReasons: unknown[] = [];
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "hang_silently",
-				"secret-b": "success",
-			},
-			abortMessage: "Operation aborted",
-			successText: "Recovered after generic abort timeout.",
-			onAbort: (_apiKey, reason) => {
-				observedAbortReasons.push(reason);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after generic abort timeout.",
-	);
-	assert.equal(observedAbortReasons.length, 3);
-	for (const reason of observedAbortReasons) {
-		if (!(reason instanceof StreamAttemptTimeoutError)) {
-			assert.fail(`Expected StreamAttemptTimeoutError, received ${String(reason)}`);
-		}
-		assert.equal(reason.timeoutKind, "idle_timeout");
-		assert.equal(
-			reason.message,
-			"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
+for (const providerId of ["ollama", "vivgrid"] as const) {
+	test(`rotating stream wrapper retries empty ${providerId} stop completions before succeeding`, async () => {
+		const model = createTestModel(providerId);
+		let successCount = 0;
+		let providerCallCount = 0;
+		const wrapper = createRotatingStreamWrapper(
+			providerId,
+			createAccountManagerStreamStub({
+				provider: providerId,
+				onSuccess: () => {
+					successCount += 1;
+				},
+			}),
+			createEmptyCompletionThenSuccessProvider(model, {
+				text: "Recovered output.",
+				onCall: () => {
+					providerCallCount += 1;
+				},
+			}) as never,
 		);
-	}
-	assert.deepEqual(transientCooldowns, [
+
+		const events = await collectAssistantEvents(
+			wrapper(model, createTestContext(), { apiKey: "secret" }),
+		);
+		const doneEvents = events.filter(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+
+		assert.equal(providerCallCount, 2);
+		assert.equal(successCount, 1);
+		assert.equal(doneEvents.length, 1);
+		assert.deepEqual(doneEvents[0].message.content.map((block) => block.type), ["text"]);
+		assert.equal((doneEvents[0].message.content[0] as { text: string }).text, "Recovered output.");
+		assert.equal(
+			events.some((event) => event.type === "done" && event.message.content.length === 0),
+			false,
+		);
+		assert.equal(events.some((event) => event.type === "error"), false);
+	});
+}
+
+test("provider registry restores Cline OAuth capability after OAuth registry resets", () => {
+	resetOAuthProviders();
+	const registry = new ProviderRegistry();
+
+	assert.equal(registry.getProviderCapabilities("cline").supportsOAuth, true);
+	assert.ok(registry.listAvailableOAuthProviders().some((provider) => provider.provider === "cline"));
+
+	resetOAuthProviders();
+});
+
+test("Cline stream wrapper attaches Cline client headers to model requests", async () => {
+	const model = createTestModel("cline");
+	const observedHeaders: Record<string, string | undefined> = {};
+	const wrapper = createRotatingStreamWrapper(
+		"cline",
 		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
+			acquireCredential: async () => ({
+				provider: "cline",
+				credentialId: "cline",
+				credential: { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 },
+				secret: "workos:token",
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const headers = options?.headers as Record<string, string> | undefined;
+				observedHeaders["User-Agent"] = headers?.["User-Agent"];
+				observedHeaders["X-CLIENT-TYPE"] = headers?.["X-CLIENT-TYPE"];
+				observedHeaders["X-TASK-ID"] = headers?.["X-TASK-ID"];
+				return createStreamingBaseProvider(model, { thinking: "headers", text: "ok" }).streamSimple();
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "unused" }));
+
+	assert.equal(events.some((event) => event.type === "done"), true);
+	assert.match(observedHeaders["User-Agent"] ?? "", /^Cline\//);
+	assert.equal(observedHeaders["X-CLIENT-TYPE"], "VSCode Extension");
+	assert.ok(observedHeaders["X-TASK-ID"] && observedHeaders["X-TASK-ID"].length > 0);
+});
+
+
+test("Kilo stream wrapper attaches Kilo editor headers to model requests", async () => {
+	const model = createTestModel("kilo");
+	const observedHeaders: Record<string, string | undefined> = {};
+	const wrapper = createRotatingStreamWrapper(
+		"kilo",
+		{
+			acquireCredential: async () => ({
+				provider: "kilo",
+				credentialId: "kilo",
+				credential: { type: "oauth", access: "kilo-token", refresh: "kilo-token", expires: Date.now() + 3_600_000 },
+				secret: "kilo-token",
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const headers = options?.headers as Record<string, string> | undefined;
+				observedHeaders["X-KILOCODE-EDITORNAME"] = headers?.["X-KILOCODE-EDITORNAME"];
+				observedHeaders["X-EXISTING"] = headers?.["X-EXISTING"];
+				return createStreamingBaseProvider(model, { thinking: "headers", text: "ok" }).streamSimple();
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "stale", headers: { "X-EXISTING": "kept" } }),
+	);
+
+	assert.equal(events.some((event) => event.type === "done"), true);
+	assert.equal(observedHeaders["X-KILOCODE-EDITORNAME"], "Pi");
+	assert.equal(observedHeaders["X-EXISTING"], "kept");
+});
+
+test("OpenAI Codex invalidated authentication tokens are disabled while rotating through the full eligible pool", async () => {
+	const model: Model<"openai-codex-responses"> = {
+		id: "gpt-5.5",
+		name: "GPT 5.5",
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 128_000,
+		maxTokens: 16_000,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
 		},
+	};
+	const workingToken = "paid-codex-token";
+	const credentialIds = Array.from({ length: 12 }, (_, index) =>
+		index === 11 ? "codex-paid" : `codex-invalidated-${index + 1}`,
+	);
+	const tokenByCredentialId = new Map<string, string>(
+		credentialIds.map((credentialId) => [
+			credentialId,
+			credentialId === "codex-paid"
+				? workingToken
+				: `invalidated-codex-token-${credentialId}`,
+		]),
+	);
+	const expectedApiKeys = credentialIds.map((credentialId) => {
+		const token = tokenByCredentialId.get(credentialId);
+		assert.ok(token);
+		return token;
+	});
+	const acquiredCredentialIds: string[] = [];
+	const disabledCredentialIds: string[] = [];
+	const disabledErrorKinds: string[] = [];
+	const quotaCredentialIds: string[] = [];
+	const requestedModelIds: Array<string | undefined> = [];
+	const apiKeysSeen: string[] = [];
+
+	const wrapper = createRotatingStreamWrapper(
+		"openai-codex",
+		{
+			listProviderCredentialIds: async () => credentialIds,
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string>; modelId?: string },
+			) => {
+				requestedModelIds.push(requestOptions?.modelId);
+				const excludedCredentialIds = requestOptions?.excludedCredentialIds ?? new Set<string>();
+				const credentialId = credentialIds.find(
+					(candidate) => !excludedCredentialIds.has(candidate),
+				);
+				if (!credentialId) {
+					throw new Error("No Codex credential remained available for GPT 5.5.");
+				}
+				const token = tokenByCredentialId.get(credentialId);
+				assert.ok(token);
+				acquiredCredentialIds.push(credentialId);
+				return {
+					provider: "openai-codex",
+					credentialId,
+					credential: {
+						type: "oauth",
+						access: token,
+						refresh: `refresh-${credentialId}`,
+						expires: Date.now() + 3_600_000,
+						provider: "openai-codex",
+					},
+					secret: token,
+					index: credentialIds.indexOf(credentialId),
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async (
+				_provider: string,
+				credentialId: string,
+				_errorMessage: string,
+				errorKind: string,
+			) => {
+				disabledCredentialIds.push(credentialId);
+				disabledErrorKinds.push(errorKind);
+			},
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async (_provider: string, credentialId: string) => {
+				quotaCredentialIds.push(credentialId);
+			},
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-codex-responses">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				apiKeysSeen.push(apiKey);
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (apiKey !== workingToken) {
+						stream.push({
+							type: "error",
+							reason: "error",
+							error: createAssistantMessageForTest(model, [], {
+								stopReason: "error",
+								errorMessage:
+									"Encountered invalidated oauth token for user, failing request",
+							}),
+						});
+						stream.end();
+						return;
+					}
+
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "Codex rotation recovered." },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "[REDACTED]" }));
+
+	assert.deepEqual(acquiredCredentialIds, credentialIds);
+	assert.deepEqual(requestedModelIds, credentialIds.map(() => "gpt-5.5"));
+	assert.deepEqual(apiKeysSeen, expectedApiKeys);
+	assert.deepEqual(disabledCredentialIds, credentialIds.slice(0, -1));
+	assert.deepEqual(disabledErrorKinds, credentialIds.slice(0, -1).map(() => "authentication"));
+	assert.deepEqual(quotaCredentialIds, []);
+	assert.equal(events.some((event) => event.type === "error"), false);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.deepEqual(doneEvent.message.content, [
+		{ type: "text", text: "Codex rotation recovered." },
 	]);
+});
+
+test("OpenAI Codex model access errors rotate and record model incompatibility", async () => {
+	const model: Model<"openai-completions"> = {
+		...createTestModel("openai-codex"),
+		id: "gpt-5.4",
+		name: "GPT 5.4",
+	};
+	const credentials = [
+		{ credentialId: "codex-free", secret: "free-codex-token" },
+		{ credentialId: "codex-plus", secret: "plus-codex-token" },
+	];
+	const acquiredCredentialIds: string[] = [];
+	const modelIncompatibilities: Array<{ credentialId: string; modelId: string; message: string }> = [];
+
+	const wrapper = createRotatingStreamWrapper(
+		"openai-codex",
+		{
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string>; modelId?: string },
+			) => {
+				assert.equal(requestOptions?.modelId, "gpt-5.4");
+				const excludedCredentialIds = requestOptions?.excludedCredentialIds ?? new Set<string>();
+				const selected = credentials.find(
+					(credential) => !excludedCredentialIds.has(credential.credentialId),
+				);
+				if (!selected) {
+					throw new Error("No Codex credential remained available.");
+				}
+				acquiredCredentialIds.push(selected.credentialId);
+				return {
+					provider: "openai-codex",
+					credentialId: selected.credentialId,
+					credential: { type: "api_key", key: selected.secret },
+					secret: selected.secret,
+					index: credentials.indexOf(selected),
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markCredentialModelIncompatible: async (
+				_provider: string,
+				credentialId: string,
+				modelId: string,
+				message: string,
+			) => {
+				modelIncompatibilities.push({ credentialId, modelId, message });
+				return Date.now() + 60_000;
+			},
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (apiKey === "free-codex-token") {
+						stream.push({
+							type: "error",
+							reason: "error",
+							error: createAssistantMessageForTest(model, [], {
+								stopReason: "error",
+								errorMessage:
+									"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+							}),
+						});
+						stream.end();
+						return;
+					}
+
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "paid-codex-account-ok" },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "[REDACTED]" }));
+
+	assert.deepEqual(acquiredCredentialIds, ["codex-free", "codex-plus"]);
+	assert.equal(modelIncompatibilities.length, 1);
+	assert.equal(modelIncompatibilities[0].credentialId, "codex-free");
+	assert.equal(modelIncompatibilities[0].modelId, "gpt-5.4");
+	assert.match(modelIncompatibilities[0].message, /not supported/i);
+	assert.equal(events.some((event) => event.type === "error"), false);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.deepEqual(doneEvent.message.content, [
+		{ type: "text", text: "paid-codex-account-ok" },
+	]);
+});
+
+test("OpenAI Codex token_revoked OAuth errors classify as disabling authentication failures", () => {
+	const classification = classifyCredentialError(
+		"Encountered invalidated oauth token for user, failing request (code: token_revoked, status: 401)",
+		{ providerId: "openai-codex", modelId: "gpt-5.4" },
+	);
+
+	assert.equal(classification.kind, "authentication");
+	assert.equal(classification.shouldRotateCredential, true);
+	assert.equal(classification.shouldDisableCredential, true);
+	assert.equal(classification.shouldApplyCooldown, false);
+});
+
+test("delegated credential overrides pin the delegated credential through account-manager selection", async (t) => {
+	const model = createTestModel("cline");
+	const delegatedCredentialId = "cline";
+	const acquiredCredentialSelections: string[][] = [];
+
+	process.env[PI_AGENT_ROUTER_SUBAGENT_ENV] = "1";
+	process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV] = "cline";
+	process.env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV] = delegatedCredentialId;
+	process.env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV] = "workos:stale-token";
+
+	const wrapper = createRotatingStreamWrapper(
+		"cline",
+		{
+			listProviderCredentialIds: async () => [delegatedCredentialId, "cline-1"],
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string> },
+			) => {
+				const excludedCredentialIds = [...(requestOptions?.excludedCredentialIds ?? new Set<string>())].sort();
+				acquiredCredentialSelections.push(excludedCredentialIds);
+				assert.deepEqual(excludedCredentialIds, ["cline-1"]);
+				return {
+					provider: "cline",
+					credentialId: delegatedCredentialId,
+					credential: {
+						type: "oauth",
+						access: "fresh-token",
+						refresh: "refresh-token",
+						expires: Date.now() + 3_600_000,
+						provider: "cline",
+					},
+					secret: "workos:fresh-token",
+					index: 0,
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				if (apiKey === "workos:fresh-token") {
+					return createStreamingBaseProvider(model, {
+						thinking: "Pinned delegated credential.",
+						text: "Delegated credential pinned successfully.",
+					}).streamSimple();
+				}
+
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: createAssistantMessageForTest(model, [], {
+							stopReason: "error",
+							errorMessage:
+								'401 "Unauthorized: Please make sure you\'re using the latest version of Cline and re-authenticate your Cline account."',
+						}),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "unused" }),
+	);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.equal(acquiredCredentialSelections.length, 1);
+	const textBlock = doneEvent.message.content.find(
+		(block): block is Extract<(typeof doneEvent.message.content)[number], { type: "text" }> =>
+			block.type === "text",
+	);
+	assert.ok(textBlock);
+	assert.equal(textBlock.text, "Delegated credential pinned successfully.");
 	assert.equal(events.some((event) => event.type === "error"), false);
 });
 
@@ -738,10 +1244,6 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 			},
 		}) as never,
 		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
 	);
 
 	const stream = wrapper(model, createTestContext(), {
@@ -794,10 +1296,6 @@ test("rotating stream wrapper aborts even when the provider ignores the abort si
 			},
 		} as never,
 		new Map(),
-		{
-			attemptTimeoutMs: 10_000,
-			idleTimeoutMs: 10_000,
-		},
 	);
 
 	const stream = wrapper(model, createTestContext(), {
@@ -918,6 +1416,227 @@ test("account manager batch deletes multiple credentials and re-syncs provider s
 	assert.deepEqual(status.credentials.map((credential) => credential.credentialId), [`${providerId}-1`]);
 });
 
+test("account manager deduplicates Cline OAuth credentials by account identity", async (t) => {
+	const now = Date.now();
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId: "cline",
+		authData: {
+			cline: {
+				type: "oauth",
+				access: "older-access",
+				refresh: "older-refresh",
+				expires: now + 60_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+			"cline-1": {
+				type: "oauth",
+				access: "newer-access",
+				refresh: "newer-refresh",
+				expires: now + 120_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	assert.deepEqual(await accountManager.listProviderCredentialIds("cline"), ["cline-1"]);
+});
+
+test("account manager keeps Codex OAuth credentials separate across account plan contexts", async (t) => {
+	const expiresAtSeconds = Math.floor(Date.now() / 1_000) + 3_600;
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId: "openai-codex",
+		authData: {
+			"openai-codex": {
+				type: "oauth",
+				access: createCodexIdentityJwt({
+					expiresAtSeconds,
+					accountId: "acct-personal",
+					accountUserId: "user-same",
+					email: "same@example.com",
+				}),
+				refresh: "refresh-personal",
+				expires: Date.now() + 60_000,
+				provider: "openai-codex",
+				accountId: "acct-personal",
+			},
+			"openai-codex-1": {
+				type: "oauth",
+				access: createCodexIdentityJwt({
+					expiresAtSeconds,
+					accountId: "acct-business-team",
+					accountUserId: "user-same",
+					email: "same@example.com",
+				}),
+				refresh: "refresh-business-team",
+				expires: Date.now() + 120_000,
+				provider: "openai-codex",
+				accountId: "acct-business-team",
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const credentialIds = await accountManager.listProviderCredentialIds("openai-codex");
+	const providerStatus = await accountManager.getProviderStatus("openai-codex");
+	const status = await accountManager.getStatus();
+	const codexStatus = status.find((entry) => entry.provider === "openai-codex");
+
+	assert.deepEqual(credentialIds, ["openai-codex", "openai-codex-1"]);
+	assert.deepEqual(
+		providerStatus.credentials.map((credential) => credential.credentialId),
+		["openai-codex", "openai-codex-1"],
+	);
+	assert.deepEqual(
+		codexStatus?.credentials.map((credential) => credential.credentialId),
+		["openai-codex", "openai-codex-1"],
+	);
+});
+
+test("account manager preserves Codex direct-login credential ids when identities match", async (t) => {
+	const expiresAtSeconds = Math.floor(Date.now() / 1_000) + 3_600;
+	const baseExpires = Date.now() + 180_000;
+	const backupExpires = Date.now() + 60_000;
+	const baseCredential = {
+		type: "oauth" as const,
+		["access"]: createCodexIdentityJwt({
+			expiresAtSeconds,
+			accountId: "acct-direct-login",
+			accountUserId: "user-same",
+			email: "same@example.com",
+		}),
+		refresh: "base-refresh",
+		expires: baseExpires,
+		provider: "openai-codex",
+		accountId: "acct-direct-login",
+	};
+	const backupCredential = {
+		type: "oauth" as const,
+		["access"]: createCodexIdentityJwt({
+			expiresAtSeconds,
+			accountId: "acct-direct-login",
+			accountUserId: "user-same",
+			email: "same@example.com",
+		}),
+		refresh: "backup-refresh",
+		expires: backupExpires,
+		provider: "openai-codex",
+		accountId: "acct-direct-login",
+	};
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "openai-codex",
+		authData: {
+			"openai-codex": baseCredential,
+			"openai-codex-17": backupCredential,
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const credentialIds = await accountManager.listProviderCredentialIds("openai-codex");
+	const providerStatusCredentialIds = (await accountManager.getProviderStatus("openai-codex")).credentials.map(
+		(credential) => credential.credentialId,
+	);
+	const allStatusCredentialIds = (await accountManager.getStatus())
+		.find((entry) => entry.provider === "openai-codex")
+		?.credentials.map((credential) => credential.credentialId);
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<
+		string,
+		{ expires?: number }
+	>;
+
+	assert.deepEqual(credentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(providerStatusCredentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(allStatusCredentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(Object.keys(authData).sort(), ["openai-codex", "openai-codex-17"]);
+	assert.equal(authData["openai-codex"]?.expires, baseExpires);
+	assert.equal(authData["openai-codex-17"]?.expires, backupExpires);
+});
+
+test("account manager updates an existing Cline OAuth credential instead of adding a duplicate login", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	registerOAuthProvider({
+		id: "cline",
+		name: "Cline",
+		usesCallbackServer: false,
+		login: async () => ({
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 3_600_000,
+			provider: "cline",
+			accountId: "acct-same",
+			userInfo: { email: "same@example.com" },
+		}),
+		refreshToken: async (credentials) => credentials,
+		getApiKey: (credentials) => `workos:${credentials.access}`,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "cline",
+		authData: {
+			cline: {
+				type: "oauth",
+				access: "old-access",
+				refresh: "old-refresh",
+				expires: Date.now() + 60_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+		},
+	});
+
+	const result = await accountManager.loginProvider("cline", {
+		onAuth: () => {},
+		onPrompt: async () => "unused",
+	});
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+
+	assert.equal(result.credentialId, "cline");
+	assert.deepEqual(result.credentialIds, ["cline"]);
+	assert.deepEqual(Object.keys(authData), ["cline"]);
+	assert.equal(authData.cline?.type, "oauth");
+	assert.equal(authData.cline?.type === "oauth" ? authData.cline.access : undefined, "new-access");
+});
+
+test("account manager keeps the recovered round-robin credential active after retry selection", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const primaryCredentialId = providerId;
+	const secondaryCredentialId = `${providerId}-1`;
+	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[primaryCredentialId]: { type: "api_key", key: "alpha" },
+			[secondaryCredentialId]: { type: "api_key", key: "beta" },
+		},
+	});
+
+	await accountManager.ensureInitialized();
+	const first = await accountManager.acquireCredential(providerId);
+	assert.equal(first.credentialId, primaryCredentialId);
+
+	const second = await accountManager.acquireCredential(providerId, {
+		excludedCredentialIds: new Set([first.credentialId]),
+	});
+	assert.equal(second.credentialId, secondaryCredentialId);
+
+	const storageData = JSON.parse(await readFile(storagePath, "utf-8")) as {
+		providers: Record<string, { credentialIds: string[]; activeIndex: number }>;
+	};
+	assert.equal(storageData.providers[providerId]?.activeIndex, 1);
+});
+
 test("account manager validates batch deletion requests", async (t) => {
 	const providerId = "batch-delete-validation-provider";
 	const { accountManager } = await createAccountManagerHarness(t, {
@@ -965,7 +1684,7 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	usageService.register({
 		id: providerId,
 		displayName: providerId,
@@ -987,8 +1706,8 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 
-	t.after(() => {
-		accountManager.shutdown();
+	t.after(async () => {
+		await accountManager.shutdown();
 	});
 
 	const first = await accountManager.getCredentialUsageSnapshot(providerId, providerId, {
@@ -1011,6 +1730,57 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 	assert.equal(second.error, null);
 	assert.equal(second.fromCache, true);
 	assert.equal(fetchCount, 1);
+});
+
+test("provider registry lists pi-mono API-key, models.json, and credential-known providers", async (t) => {
+	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-api-key-providers-"));
+	const authPath = join(tempRoot, "auth.json");
+	const modelsPath = join(tempRoot, "models.json");
+
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	await writeFile(
+		authPath,
+		JSON.stringify(
+			{
+				"credential-known-provider": { type: "api_key", key: "credential-key" },
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
+	await writeFile(
+		modelsPath,
+		JSON.stringify(
+			{
+				providers: {
+					"custom-model-provider": {
+						api: "openai",
+						baseUrl: "https://example.test/v1",
+						models: [{ id: "custom-model", name: "Custom Model" }],
+					},
+				},
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
+
+	const registry = new ProviderRegistry(new AuthWriter(authPath), modelsPath, []);
+	const providers = await registry.listAvailableApiKeyProviders();
+	const providerIds = providers.map((provider) => provider.provider);
+
+	assert.ok(providerIds.includes("openrouter"), "expected mirrored pi-mono API-key provider");
+	assert.ok(providerIds.includes("custom-model-provider"), "expected models.json provider");
+	assert.ok(providerIds.includes("credential-known-provider"), "expected auth.json provider");
+	assert.equal(
+		providers.find((provider) => provider.provider === "openrouter")?.name,
+		"OpenRouter",
+	);
 });
 
 test("provider registry refreshes models metadata after models.json changes", async (t) => {
@@ -1124,13 +1894,13 @@ test("cascade retry state persists across account-manager restarts and clears on
 			debugDir: harness.debugDir,
 			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
 		}),
-		new UsageService(),
+		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(harness.authPath), harness.modelsPath, [providerId]),
 		undefined,
 		cloneExtensionConfig(),
 	);
-	t.after(() => {
-		restarted.shutdown();
+	t.after(async () => {
+		await restarted.shutdown();
 	});
 
 	await restarted.ensureInitialized();
@@ -1266,13 +2036,14 @@ test("account manager applies configured health scoring thresholds", async (t) =
 			Record<string, { requests?: Array<{ success: boolean }> }>
 		>;
 	};
+	const extractedHealthEntry = Object.values(healthHistory.providers?.[providerId] ?? {})[0];
 	const score = stored.providers[providerId]?.healthState?.scores?.[providerId];
 	assert.ok(score);
 	assert.ok(score.score > 0.6);
 	assert.equal(score.isStale, false);
 	assert.equal(stored.providers[providerId]?.healthState?.history, undefined);
-	assert.equal(healthHistory.providers?.[providerId]?.[providerId]?.requests?.length, 1);
-	assert.equal(healthHistory.providers?.[providerId]?.[providerId]?.requests?.[0]?.success, true);
+	assert.equal(extractedHealthEntry?.requests?.length, 1);
+	assert.equal(extractedHealthEntry?.requests?.[0]?.success, true);
 	assert.match(stored.providers[providerId]?.healthState?.configHash ?? "", /"minRequests":1/);
 });
 
@@ -1287,13 +2058,14 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 
 	try {
 		const providerId = "migration-provider";
+		const credentialRef = "migration-credential-ref";
 		const state = createDefaultMultiAuthState([providerId]);
 		const providerState = getProviderState(state, providerId);
-		providerState.credentialIds = [providerId];
+		providerState.credentialIds = [credentialRef];
 		providerState.healthState = {
 			scores: {
-				[providerId]: {
-					credentialId: providerId,
+				[credentialRef]: {
+					credentialId: credentialRef,
 					score: 0.82,
 					calculatedAt: 1_717_000_000_000,
 					components: {
@@ -1306,8 +2078,8 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 				},
 			},
 			history: {
-				[providerId]: {
-					credentialId: providerId,
+				[credentialRef]: {
+					credentialId: credentialRef,
 					requests: [{ timestamp: 1_717_000_000_000, success: true, latencyMs: 42 }],
 					cooldowns: [],
 					lastScore: 0.82,
@@ -1324,7 +2096,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 						cascadePath: [
 							{
 								providerId,
-								credentialId: providerId,
+								credentialId: credentialRef,
 								attemptedAt: 1_717_000_000_100,
 								errorKind: "provider_transient",
 								errorMessage: "legacy embedded history",
@@ -1348,7 +2120,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 		});
 		const hydrated = await storage.read();
 		assert.equal(
-			hydrated.providers[providerId]?.healthState?.history?.[providerId]?.requests.length,
+			hydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
 			1,
 		);
 		assert.equal(
@@ -1358,7 +2130,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 
 		await storage.withLock((current) => {
 			const currentProviderState = getProviderState(current, providerId);
-			currentProviderState.lastUsedAt[providerId] = 1_717_000_002_000;
+			currentProviderState.lastUsedAt[credentialRef] = 1_717_000_002_000;
 			return { result: undefined, next: current };
 		});
 
@@ -1371,27 +2143,34 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 				}
 			>;
 		};
-		const extractedHealthHistory = JSON.parse(await readFile(historyPaths.healthPath, "utf-8")) as {
-			providers?: Record<string, Record<string, { requests?: Array<unknown> }>>;
+		const extractedHealthHistoryContent = await readFile(historyPaths.healthPath, "utf-8");
+		const extractedCascadeHistoryContent = await readFile(historyPaths.cascadePath, "utf-8");
+		const extractedHealthHistory = JSON.parse(extractedHealthHistoryContent) as {
+			providers?: Record<string, Record<string, { credentialId?: string; requests?: Array<unknown> }>>;
 		};
-		const extractedCascadeHistory = JSON.parse(await readFile(historyPaths.cascadePath, "utf-8")) as {
-			providers?: Record<string, Record<string, Array<{ cascadePath: Array<{ errorMessage: string }> }>>>;
+		const extractedCascadeHistory = JSON.parse(extractedCascadeHistoryContent) as {
+			providers?: Record<
+				string,
+				Record<string, Array<{ cascadePath: Array<{ credentialId?: string; errorMessage: string }> }>>
+			>;
 		};
+		const extractedProviderHealth = extractedHealthHistory.providers?.[providerId] ?? {};
+		const extractedHealthEntry = Object.values(extractedProviderHealth)[0];
+		const extractedCascadeAttempt =
+			extractedCascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.cascadePath[0];
 		const rehydrated = await storage.read();
 
 		assert.equal(compactState.providers[providerId]?.healthState?.history, undefined);
 		assert.equal(compactState.providers[providerId]?.cascadeState, undefined);
+		assert.equal(Object.hasOwn(extractedProviderHealth, credentialRef), false);
+		assert.notEqual(extractedHealthEntry?.credentialId, credentialRef);
+		assert.equal(extractedHealthEntry?.requests?.length, 1);
+		assert.notEqual(extractedCascadeAttempt?.credentialId, credentialRef);
+		assert.equal(extractedCascadeAttempt?.errorMessage, "legacy embedded history");
+		assert.equal(extractedHealthHistoryContent.includes(credentialRef), false);
+		assert.equal(extractedCascadeHistoryContent.includes(credentialRef), false);
 		assert.equal(
-			extractedHealthHistory.providers?.[providerId]?.[providerId]?.requests?.length,
-			1,
-		);
-		assert.equal(
-			extractedCascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.cascadePath[0]
-				?.errorMessage,
-			"legacy embedded history",
-		);
-		assert.equal(
-			rehydrated.providers[providerId]?.healthState?.history?.[providerId]?.requests.length,
+			rehydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
 			1,
 		);
 		assert.equal(
@@ -1896,6 +2675,87 @@ test("richer quota classification drives cooldown duration and persisted quota s
 	assert.equal(stored.providers[providerId]?.quotaStates?.[providerId]?.recoveryAction.action, "wait");
 });
 
+test("account manager skips expired JWT-backed Cline API-key credentials during selection", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const expiredJwt = createJwtWithExp(Math.floor(Date.now() / 1000) - 60);
+	const validJwt = createJwtWithExp(Math.floor(Date.now() / 1000) + 3_600);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "api_key",
+				key: `workos:${expiredJwt}`,
+			},
+			[`${providerId}-1`]: {
+				type: "api_key",
+				key: `workos:${validJwt}`,
+			},
+		},
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.credentialId, `${providerId}-1`);
+
+	const status = await accountManager.getProviderStatus(providerId);
+	assert.equal(status.credentials[0]?.credentialId, providerId);
+	assert.equal(status.credentials[0]?.isExpired, true);
+	assert.ok((status.credentials[0]?.expiresAt ?? 0) <= Date.now());
+	assert.equal(status.credentials[1]?.credentialId, `${providerId}-1`);
+	assert.equal(status.credentials[1]?.isExpired, false);
+});
+
+test("manual active expired JWT-backed Cline API-key credentials raise a clear re-authentication error", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const expiredJwt = createJwtWithExp(Math.floor(Date.now() / 1000) - 60);
+	const validJwt = createJwtWithExp(Math.floor(Date.now() / 1000) + 3_600);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "api_key",
+				key: `workos:${expiredJwt}`,
+			},
+			[`${providerId}-1`]: {
+				type: "api_key",
+				key: `workos:${validJwt}`,
+			},
+		},
+	});
+
+	await accountManager.switchActiveCredential(providerId, 0);
+	await assert.rejects(
+		accountManager.acquireCredential(providerId),
+		/expired WorkOS token|re-authenticate/i,
+	);
+});
+
+test("acquireCredential prefixes Cline OAuth access tokens for request auth", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "oauth",
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 3_600_000,
+				accountId: "usr_123",
+				provider: "cline",
+				userInfo: {
+					email: "person@example.com",
+					displayName: "Person Example",
+				},
+			},
+		},
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.secret, "workos:access-token");
+});
+
 test("oauth helpers prefer JWT expiration and scheduler refreshes credentials pre-emptively", async () => {
 	const expiresAtSeconds = Math.floor((Date.now() + 60_000) / 1_000);
 	const jwt = createJwtWithExp(expiresAtSeconds);
@@ -1971,6 +2831,101 @@ test("oauth refresh scheduler defers excess due work until concurrency is availa
 	assert.deepEqual(refreshCalls, ["oauth-a", "oauth-b"]);
 });
 
+test("shared auth error helpers normalize structured refresh failures safely", () => {
+	assert.equal(getErrorMessage(new Error("boom")), "boom");
+	assert.equal(getErrorMessage("string failure"), "string failure");
+	assert.equal(
+		getErrorMessage({ code: "boom" }, { preserveStructuredData: true }),
+		'{"code":"boom"}',
+	);
+	const circular: Record<string, unknown> = {};
+	circular.self = circular;
+	assert.equal(getErrorMessage(circular, { preserveStructuredData: true }), "[object Object]");
+	assert.equal(isRecord({ ok: true }), true);
+	assert.equal(isRecord(["nope"]), false);
+	assert.equal(isRecord(null), false);
+	assert.deepEqual(inferOAuthRefreshFailureMetadata("invalid_grant: refresh token expired"), {
+		errorCode: "invalid_grant",
+		reason: "token_rejected",
+		permanent: true,
+	});
+	assert.equal(
+		formatOAuthRefreshFailureSummary({
+			providerLabel: "OpenAI Codex",
+			status: 400,
+			errorCode: "invalid_grant",
+			reason: "token_rejected",
+			permanent: true,
+			source: "extension",
+		}),
+		"OpenAI Codex refresh rejected permanently (HTTP 400, code=invalid_grant)",
+	);
+});
+
+test("async buffered log writer hardens debug log permissions after append", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-debug-log-"));
+	t.after(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	const logPath = join(tempDir, "debug.log");
+	await writeFile(logPath, "existing\n", "utf-8");
+	if (process.platform !== "win32") {
+		await chmod(logPath, 0o644);
+	}
+
+	const writer = new AsyncBufferedLogWriter({
+		enabled: true,
+		logPath,
+		ensureDirectory: () => undefined,
+		flushIntervalMs: 60_000,
+	});
+
+	assert.equal(writer.writeLine("appended"), undefined);
+	await writer.flush();
+
+	assert.equal(await readFile(logPath, "utf-8"), "existing\nappended\n");
+	if (process.platform !== "win32") {
+		assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+	}
+});
+
+test("openai codex refresh failures omit raw response bodies from error details and messages", async (t) => {
+	const originalFetch = globalThis.fetch;
+	t.after(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	globalThis.fetch = async () =>
+		new Response(
+			JSON.stringify({
+				unexpected: "access_token=raw-secret-token",
+				note: "refresh_token=raw-refresh-token",
+			}),
+			{
+				status: 400,
+				headers: { "Content-Type": "application/json" },
+			},
+		);
+
+	await assert.rejects(
+		() =>
+			refreshOAuthCredential("openai-codex", {
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() - 60_000,
+			}),
+		(error: unknown) => {
+			assert.ok(error instanceof OAuthRefreshFailureError);
+			assert.equal(error.details.status, 400);
+			assert.equal(error.details.reason, "http_error");
+			assert.equal(error.details.errorCode, undefined);
+			assert.doesNotMatch(error.message, /raw-secret-token|raw-refresh-token|access_token|refresh_token/i);
+			return true;
+		},
+	);
+});
+
 test("oauth refresh scheduler stops retrying after permanent refresh failures", async () => {
 	let attempts = 0;
 	const scheduler = new OAuthRefreshScheduler(
@@ -2002,7 +2957,96 @@ test("oauth refresh scheduler stops retrying after permanent refresh failures", 
 	assert.equal(scheduler.getPendingRefreshes().size, 0);
 });
 
-test("account manager handles permanent Codex refresh failures without console noise", async (t) => {
+test("account manager refreshCredential only updates the selected OAuth credential", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	const providerId = "refresh-scope-provider";
+	const primaryCredentialId = providerId;
+	const backupCredentialId = `${providerId}-1`;
+	const refreshCalls: string[] = [];
+	const primaryExpires = Date.now() + 90_000;
+	const backupExpires = Date.now() + 120_000;
+
+	registerOAuthProvider({
+		id: providerId,
+		name: "Refresh Scope Provider",
+		usesCallbackServer: false,
+		login: async () => {
+			throw new Error("Login is not used in this test.");
+		},
+		refreshToken: async (credentials) => {
+			refreshCalls.push(String(credentials.accountId ?? "unknown"));
+			return {
+				...credentials,
+				["access"]: `refreshed-access-${credentials.accountId}`,
+				["refresh"]: `refreshed-refresh-${credentials.accountId}`,
+				expires: Date.now() + 3_600_000,
+			};
+		},
+		getApiKey: () => "unused-api-key",
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[primaryCredentialId]: {
+				type: "oauth",
+				["access"]: "test-access-primary",
+				["refresh"]: "test-refresh-primary",
+				expires: primaryExpires,
+				provider: providerId,
+				accountId: "acct-primary",
+			},
+			[backupCredentialId]: {
+				type: "oauth",
+				["access"]: "test-access-backup",
+				["refresh"]: "test-refresh-backup",
+				expires: backupExpires,
+				provider: providerId,
+				accountId: "acct-backup",
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const refreshResult = await accountManager.refreshCredential(providerId, backupCredentialId);
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+	const primaryCredential = authData[primaryCredentialId];
+	const refreshedCredential = authData[backupCredentialId];
+
+	assert.deepEqual(refreshCalls, ["acct-backup"]);
+	assert.equal(refreshResult.disposition, "refreshed");
+	assert.equal(refreshResult.credential.accountId, "acct-backup");
+	assert.equal(primaryCredential?.type, "oauth");
+	assert.equal(
+		primaryCredential?.type === "oauth" ? primaryCredential.access : undefined,
+		"test-access-primary",
+	);
+	assert.equal(
+		primaryCredential?.type === "oauth" ? primaryCredential.refresh : undefined,
+		"test-refresh-primary",
+	);
+	assert.equal(primaryCredential?.type === "oauth" ? primaryCredential.expires : undefined, primaryExpires);
+	assert.equal(refreshedCredential?.type, "oauth");
+	assert.equal(
+		refreshedCredential?.type === "oauth" ? refreshedCredential.access : undefined,
+		"refreshed-access-acct-backup",
+	);
+	assert.equal(
+		refreshedCredential?.type === "oauth" ? refreshedCredential.refresh : undefined,
+		"refreshed-refresh-acct-backup",
+	);
+	assert.ok(
+		(refreshedCredential?.type === "oauth" ? refreshedCredential.expires : 0) > backupExpires,
+		"expected selected credential expiry to move forward after refresh",
+	);
+});
+
+test("account manager disables permanently invalid Codex refresh credentials without console noise", async (t) => {
 	const providerId = "openai-codex";
 	const expiredJwt = createJwtWithExp(Math.floor((Date.now() - 60_000) / 1_000));
 	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
@@ -2034,7 +3078,8 @@ test("account manager handles permanent Codex refresh failures without console n
 		new Response(
 			JSON.stringify({
 				error: "invalid_grant",
-				error_description: "Refresh token has expired or was revoked.",
+				error_description: "Refresh token raw-refresh-token-123 has expired or was revoked.",
+				access_token: "raw-access-token-123",
 			}),
 			{
 				status: 400,
@@ -2068,23 +3113,34 @@ test("account manager handles permanent Codex refresh failures without console n
 	const quotaExhaustedUntil = stored.providers[providerId]?.quotaExhaustedUntil?.[providerId];
 	const lastQuotaError = stored.providers[providerId]?.lastQuotaError?.[providerId];
 	const refreshFailureLog = debugEntries.find((entry) => entry.event === "oauth_refresh_failed");
-	const cooldownLog = debugEntries.find(
-		(entry) => entry.event === "oauth_refresh_codex_cooldown",
+	const disabledLog = debugEntries.find(
+		(entry) => entry.event === "oauth_refresh_codex_disabled",
+	);
+	const providerStatus = await accountManager.getProviderStatus(providerId);
+	const statusCredential = providerStatus.credentials.find(
+		(credential) => credential.credentialId === providerId,
 	);
 
-	// OpenAI Codex permanent refresh failures no longer auto-disable.
-	// Instead, they set a long cooldown (24h) so users can manually re-login.
 	assert.equal(consoleErrorCalls, 0);
 	assert.ok(refreshFailureLog);
 	assert.equal(refreshFailureLog?.payload.permanent, true);
 	assert.equal(refreshFailureLog?.payload.status, 400);
 	assert.equal(refreshFailureLog?.payload.errorCode, "invalid_grant");
-	assert.ok(cooldownLog);
-	assert.ok(typeof quotaExhaustedUntil === "number");
-	assert.ok(quotaExhaustedUntil > Date.now());
-	assert.match(lastQuotaError ?? "", /invalid_grant/);
-	// Credential should NOT be disabled for openai-codex
-	assert.equal(disabledEntry, undefined);
+	assert.equal(refreshFailureLog?.payload.reason, "token_rejected");
+	assert.equal("errorDescription" in (refreshFailureLog?.payload ?? {}), false);
+	assert.equal("responseBody" in (refreshFailureLog?.payload ?? {}), false);
+	assert.ok(disabledLog);
+	assert.equal(disabledLog?.payload.errorCode, "invalid_grant");
+	assert.equal(quotaExhaustedUntil, undefined);
+	assert.equal(lastQuotaError, undefined);
+	assert.ok(disabledEntry);
+	assert.match(disabledEntry?.error ?? "", /invalid_grant/);
+	assert.doesNotMatch(disabledEntry?.error ?? "", /raw-refresh-token-123|raw-access-token-123|revoked/i);
+	assert.equal(statusCredential?.disabledError, disabledEntry?.error);
+	assert.doesNotMatch(
+		String(refreshFailureLog?.payload.message ?? ""),
+		/raw-refresh-token-123|raw-access-token-123|revoked/i,
+	);
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
 });
 
@@ -2140,6 +3196,55 @@ test("account manager disables background oauth scheduling when configured", asy
 		providers: Record<string, { oauthRefreshScheduled?: Record<string, number> }>;
 	};
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
+});
+
+test("account manager schedules cline oauth refresh and clears stale refresh disable state", async (t) => {
+	const providerId = "cline";
+	const expiresAt = Date.now() + 10 * 60_000;
+	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
+	const { accountManager, authPath, storagePath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "oauth",
+				access: jwt,
+				refresh: "refresh-token",
+				expires: expiresAt,
+				provider: providerId,
+			},
+		},
+	});
+	const staleState = createDefaultMultiAuthState([providerId]);
+	const clineState = getProviderState(staleState, providerId);
+	clineState.credentialIds = [providerId];
+	clineState.disabledCredentials[providerId] = {
+		error: "Failed to refresh OAuth token for cline: cline refresh rejected permanently (HTTP 400, code=failed_to_refresh_token)",
+		disabledAt: Date.now(),
+	};
+	clineState.oauthRefreshScheduled = {
+		[providerId]: Date.now() + 60_000,
+	};
+	await writeFile(storagePath, JSON.stringify(staleState, null, 2), "utf-8");
+
+	await accountManager.ensureInitialized();
+
+	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
+		providers: Record<
+			string,
+			{
+				disabledCredentials?: Record<string, { error: string; disabledAt: number }>;
+				oauthRefreshScheduled?: Record<string, number>;
+			}
+		>;
+	};
+	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
+	const scheduledAt = stored.providers[providerId]?.oauthRefreshScheduled?.[providerId];
+	assert.ok(typeof scheduledAt === "number");
+	assert.ok(scheduledAt <= expiresAt - 5 * 60_000 + 1_000);
+	assert.ok(scheduledAt >= Date.now());
+
+	const authAfterInitialization = await readFile(authPath, "utf-8");
+	assert.match(authAfterInitialization, /refresh-token/);
 });
 
 test("account manager getProviderStatus avoids rewriting unchanged multi-auth state", async (t) => {

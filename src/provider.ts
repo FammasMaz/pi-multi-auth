@@ -15,27 +15,32 @@ import {
 	AccountManager,
 	createCredentialSelectionCache,
 } from "./account-manager.js";
+import { getErrorMessage, isAbortError } from "./auth-error-utils.js";
 import {
 	classifyCredentialError,
+	isCredentialModelIncompatibilityError,
 	isRetryableModelAvailabilityError,
 	type CredentialErrorKind,
 } from "./error-classifier.js";
+import { buildClineClientHeaders } from "./cline-compat.js";
+import { isCloudflareCredentialManagedAuthProvider } from "./cloudflare-provider.js";
+import { buildKiloRequestHeaders } from "./kilo-compat.js";
+import { describeCredentialErrorAction } from "./credential-error-formatting.js";
+import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
+import {
+	enrichProviderStatusOnlyErrorMessage,
+	formatEnrichedProviderResponseBrief,
+	parseEnrichedProviderResponse,
+} from "./provider-error-details.js";
 import { ProviderRegistry } from "./provider-registry.js";
-import {
-	createStreamAttemptWatchdog,
-	type StreamAttemptWatchdog,
-} from "./stream-watchdog.js";
-import {
-	DEFAULT_STREAM_TIMEOUT_CONFIG,
-	type StreamTimeoutConfig,
-} from "./types-stream-timeout.js";
+import { resolveDelegatedCredentialOverride } from "./runtime-context.js";
 import type {
 	ProviderRegistrationMetadata,
 	SupportedProviderId,
 } from "./types.js";
 
-const MAX_ROTATION_RETRIES = 10;
+const MIN_ROTATION_ATTEMPT_LIMIT = 11;
 const MAX_TRANSIENT_RETRIES_PER_CREDENTIAL = 2;
 const PROVIDER_REGISTRATION_CHURN_WINDOW_MS = 100;
 
@@ -64,39 +69,29 @@ const providerRegistrationMetrics = {
 	providers: new Map<string, ProviderRegistrationMetricState>(),
 };
 
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	if (typeof error === "string") {
-		return error;
-	}
-	try {
-		return JSON.stringify(error);
-	} catch {
-		return String(error);
-	}
-}
+const STRUCTURED_ERROR_MESSAGE_OPTIONS = {
+	preserveStructuredData: true,
+} as const;
 
 function getAssistantErrorMessage(error: AssistantMessage): string {
 	if (typeof error.errorMessage === "string" && error.errorMessage.trim().length > 0) {
 		return error.errorMessage;
 	}
-	return getErrorMessage(error);
+	return getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 }
 
-function resolveAttemptFailureError(
-	watchdog: StreamAttemptWatchdog,
-	failure: unknown,
-): unknown {
-	return watchdog.getTimeoutError() ?? failure;
+function isCallerAbort(parentSignal: AbortSignal | undefined, error?: unknown): boolean {
+	if (!parentSignal?.aborted) {
+		return false;
+	}
+	if (error === undefined) {
+		return true;
+	}
+	return isAbortError(error);
 }
 
-function resolveAttemptFailureMessage(
-	watchdog: StreamAttemptWatchdog,
-	failure: unknown,
-): string {
-	return getErrorMessage(resolveAttemptFailureError(watchdog, failure));
+function isCallerAbortMessage(parentSignal: AbortSignal | undefined, message: string): boolean {
+	return Boolean(parentSignal?.aborted) && isAbortError(message);
 }
 
 function getOrCreateProviderRegistrationMetricState(
@@ -199,6 +194,66 @@ function stripAnsi(text: string): string {
 
 function isOllamaProvider(provider: SupportedProviderId): boolean {
 	return provider.trim().toLowerCase() === "ollama";
+}
+
+const CREDENTIAL_MANAGED_AUTH_HEADER_NAMES = new Set([
+	"authorization",
+	"x-api-key",
+	"api-key",
+]);
+
+function shouldStripCallerAuthHeaders(provider: SupportedProviderId): boolean {
+	return isCloudflareCredentialManagedAuthProvider(provider);
+}
+
+function stripCallerAuthHeaders(
+	provider: SupportedProviderId,
+	headers: SimpleStreamOptions["headers"],
+): SimpleStreamOptions["headers"] {
+	if (!headers || !shouldStripCallerAuthHeaders(provider)) {
+		return headers;
+	}
+
+	const sanitizedHeaders: Record<string, string> = {};
+	const strippedHeaderNames: string[] = [];
+	for (const [headerName, headerValue] of Object.entries(headers)) {
+		const normalizedHeaderName = headerName.trim().toLowerCase();
+		if (CREDENTIAL_MANAGED_AUTH_HEADER_NAMES.has(normalizedHeaderName)) {
+			strippedHeaderNames.push(headerName);
+			continue;
+		}
+		sanitizedHeaders[headerName] = headerValue;
+	}
+
+	if (strippedHeaderNames.length === 0) {
+		return headers;
+	}
+
+	multiAuthDebugLogger.log("caller_auth_headers_stripped", {
+		provider,
+		headers: strippedHeaderNames,
+	});
+	return sanitizedHeaders;
+}
+
+function resolveProviderRequestHeaders(
+	provider: SupportedProviderId,
+	headers: SimpleStreamOptions["headers"],
+): SimpleStreamOptions["headers"] {
+	const credentialSafeHeaders = stripCallerAuthHeaders(provider, headers);
+	if (provider === "cline") {
+		return {
+			...credentialSafeHeaders,
+			...buildClineClientHeaders({ includeRequestTracking: true }),
+		};
+	}
+	if (provider === "kilo") {
+		return {
+			...credentialSafeHeaders,
+			...buildKiloRequestHeaders(),
+		};
+	}
+	return credentialSafeHeaders;
 }
 
 function isMalformedThinkingText(text: string): boolean {
@@ -317,6 +372,56 @@ function createBufferedThinkingState(): BufferedThinkingGuardState {
 		forwardedCurrentThinking: false,
 		isDroppingCurrentThinking: false,
 	};
+}
+
+function hasMeaningfulAssistantContent(message: AssistantMessage): boolean {
+	return message.content.some((block) => {
+		switch (block.type) {
+			case "text":
+				return block.text.trim().length > 0;
+			case "thinking":
+				return block.thinking.trim().length > 0;
+			case "toolCall":
+				return true;
+			default:
+				return true;
+		}
+	});
+}
+
+function getAssistantOutputTokens(message: AssistantMessage): number | null {
+	return typeof message.usage.output === "number" && Number.isFinite(message.usage.output)
+		? message.usage.output
+		: null;
+}
+
+function isRetryableEmptyCompletion(
+	event: Extract<AssistantMessageEvent, { type: "done" }>,
+	hasForwardedSubstantiveEvent: boolean,
+): boolean {
+	return (
+		!hasForwardedSubstantiveEvent &&
+		event.reason === "stop" &&
+		event.message.stopReason === "stop" &&
+		!hasMeaningfulAssistantContent(event.message)
+	);
+}
+
+function createEmptyCompletionErrorMessage(
+	provider: SupportedProviderId,
+	credentialId: string,
+	message: AssistantMessage,
+): string {
+	const metadata: string[] = [];
+	if (typeof message.responseId === "string" && message.responseId.trim().length > 0) {
+		metadata.push(`responseId=${message.responseId.trim()}`);
+	}
+	const outputTokens = getAssistantOutputTokens(message);
+	if (outputTokens !== null) {
+		metadata.push(`outputTokens=${outputTokens}`);
+	}
+
+	return `Provider stream ended unexpectedly with empty completion for ${provider} (credential ${credentialId}, model ${message.model})${metadata.length > 0 ? ` [${metadata.join(", ")}]` : ""}.`;
 }
 
 function flushBufferedThinkingEvents(
@@ -443,6 +548,72 @@ function createAbortedAssistantMessage(
 	};
 }
 
+interface RotationFailureDetails {
+	credentialCount?: number;
+	lastCredentialError?: string;
+	providerStatus?: number;
+	providerCode?: string;
+	providerMessage?: string;
+}
+
+function parseRotationFailureDetails(errorMessage: string): RotationFailureDetails {
+	const details: RotationFailureDetails = {};
+	const credentialCountMatch = /All\s+(\d+)\s+rotated credential\(s\)/i.exec(errorMessage);
+	if (credentialCountMatch?.[1]) {
+		details.credentialCount = Number.parseInt(credentialCountMatch[1], 10);
+	}
+
+	const lastCredentialErrorMatch = /Last (?:credential )?error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage);
+	if (lastCredentialErrorMatch?.[1]?.trim()) {
+		details.lastCredentialError = lastCredentialErrorMatch[1].trim();
+	}
+
+	const providerResponse = parseEnrichedProviderResponse(errorMessage);
+	details.providerStatus = providerResponse.status;
+	details.providerCode = providerResponse.code;
+	details.providerMessage = providerResponse.message;
+
+	return details;
+}
+
+function formatMultiAuthRotationFailureMessage(
+	providerId: SupportedProviderId,
+	model: Model<Api>,
+	errorMessage: string,
+): string {
+	if (/^(?:All credentials are unavailable|Delegated credential)\b/i.test(errorMessage.trim())) {
+		return errorMessage;
+	}
+
+	const details = parseRotationFailureDetails(errorMessage);
+	const classifiedMessage = details.providerMessage ?? details.lastCredentialError ?? errorMessage;
+	const classification = classifyCredentialError(classifiedMessage, {
+		providerId,
+		modelId: model.id,
+	});
+	const reason =
+		formatEnrichedProviderResponseBrief({
+			status: details.providerStatus,
+			code: details.providerCode,
+			message: details.providerMessage,
+		}) ??
+		details.lastCredentialError ??
+		"Provider request failed after credential rotation was exhausted.";
+	const lines = [
+		"Multi-auth rotation failed",
+		`Provider: ${providerId}`,
+		`Model: ${model.id}`,
+	];
+	if (typeof details.credentialCount === "number" && Number.isFinite(details.credentialCount)) {
+		lines.push(`Credentials tried: ${details.credentialCount}`);
+	}
+	lines.push(
+		`Reason: ${reason}`,
+		`Action: ${describeCredentialErrorAction(classification.kind)}`,
+	);
+	return lines.join("\n");
+}
+
 function pushAbortedAssistantEvent(
 	stream: AssistantMessageEventStream,
 	model: Model<Api>,
@@ -522,9 +693,9 @@ async function raceWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Pr
 
 async function readNextStreamEventWithAbort(
 	iterator: AsyncIterator<AssistantMessageEvent>,
-	watchdog: StreamAttemptWatchdog,
+	signal?: AbortSignal,
 ): Promise<IteratorResult<AssistantMessageEvent>> {
-	return raceWithAbort(Promise.resolve(iterator.next()), watchdog.signal);
+	return raceWithAbort(Promise.resolve(iterator.next()), signal);
 }
 
 function closeAsyncIterator(iterator: AsyncIterator<AssistantMessageEvent>): void {
@@ -547,6 +718,23 @@ function resolveCredentialProviderId(
 	return providerFromModel.length > 0 ? providerFromModel : fallbackProvider;
 }
 
+async function resolveRotationAttemptLimit(
+	accountManager: AccountManager,
+	providerId: SupportedProviderId,
+): Promise<number> {
+	try {
+		const credentialIds = await accountManager.listProviderCredentialIds(providerId);
+		return Math.max(MIN_ROTATION_ATTEMPT_LIMIT, credentialIds.length);
+	} catch (error: unknown) {
+		multiAuthDebugLogger.log("rotation_attempt_limit_fallback", {
+			provider: providerId,
+			minimumAttemptLimit: MIN_ROTATION_ATTEMPT_LIMIT,
+			error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+		});
+		return MIN_ROTATION_ATTEMPT_LIMIT;
+	}
+}
+
 /**
  * Builds an API wrapper that injects rotated credentials and retries on quota/rate-limit errors.
  * Credential namespace is resolved from model.provider at request time.
@@ -556,7 +744,6 @@ export function createRotatingStreamWrapper(
 	accountManager: AccountManager,
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
-	streamTimeoutConfig: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -580,10 +767,30 @@ export function createRotatingStreamWrapper(
 
 		(async () => {
 			let excludedCredentialIds = new Set<string>();
-			let lastRetryableMessage: string | null = null;
+			let lastCredentialErrorMessage: string | null = null;
 			let lastFailoverTrigger: CredentialErrorKind | null = null;
 			const selectionCache = createCredentialSelectionCache();
 			const bufferedThinkingState = createBufferedThinkingState();
+			const emitAbortedTermination = (reason?: unknown): void => {
+				const fallbackMessage = `multi-auth request aborted for ${activeProviderId}.`;
+				const message = reason === undefined
+					? fallbackMessage
+					: getErrorMessage(reason, STRUCTURED_ERROR_MESSAGE_OPTIONS) || fallbackMessage;
+				const assistantAbort: AssistantMessageEvent = {
+					type: "error",
+					reason: "aborted",
+					error: createAbortedAssistantMessage(activeModel, message),
+				};
+				stream.push(assistantAbort);
+				stream.end(assistantAbort.error);
+			};
+			let rotationAttemptLimit = MIN_ROTATION_ATTEMPT_LIMIT;
+			const refreshRotationAttemptLimit = async (): Promise<void> => {
+				rotationAttemptLimit = await resolveRotationAttemptLimit(
+					accountManager,
+					activeProviderId,
+				);
+			};
 
 			const switchToFailoverProvider = async (): Promise<boolean> => {
 				if (!lastFailoverTrigger) {
@@ -623,27 +830,63 @@ export function createRotatingStreamWrapper(
 				};
 				activeBaseProvider = failoverBaseProvider;
 				excludedCredentialIds = new Set<string>();
-				lastRetryableMessage = null;
+				lastCredentialErrorMessage = null;
 				lastFailoverTrigger = null;
+				await refreshRotationAttemptLimit();
 				return true;
 			};
 
-			for (let attempt = 0; attempt <= MAX_ROTATION_RETRIES; attempt += 1) {
+			await refreshRotationAttemptLimit();
+			for (let attempt = 0; attempt < rotationAttemptLimit; attempt += 1) {
+				const delegatedCredentialOverride = resolveDelegatedCredentialOverride(activeProviderId);
+				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected;
 				try {
 					if (options?.signal?.aborted) {
 						pushAbortedAssistantEvent(stream, activeModel);
 						return;
 					}
-					selected = await raceWithAbort(
-						accountManager.acquireCredential(activeProviderId, {
-							excludedCredentialIds,
-							modelId: activeModel.id,
-							selectionCache,
-							signal: options?.signal,
-						}),
-						options?.signal,
-					);
+					if (delegatedCredentialOverride) {
+						const providerCredentialIds = await accountManager.listProviderCredentialIds(activeProviderId);
+						if (!providerCredentialIds.includes(delegatedCredentialOverride.credentialId)) {
+							throw new Error(
+								`Delegated credential '${delegatedCredentialOverride.credentialId}' is not available for ${activeProviderId}.`,
+							);
+						}
+
+						const pinnedExcludedCredentialIds = new Set(excludedCredentialIds);
+						for (const credentialId of providerCredentialIds) {
+							if (credentialId !== delegatedCredentialOverride.credentialId) {
+								pinnedExcludedCredentialIds.add(credentialId);
+							}
+						}
+
+						selected = await raceWithAbort(
+							accountManager.acquireCredential(activeProviderId, {
+								excludedCredentialIds: pinnedExcludedCredentialIds,
+								pinnedCredentialId: delegatedCredentialOverride.credentialId,
+								modelId: activeModel.id,
+								selectionCache,
+								signal: options?.signal,
+							}),
+							options?.signal,
+						);
+						multiAuthDebugLogger.log("delegated_credential_override_applied", {
+							provider: activeProviderId,
+							credentialId: delegatedCredentialOverride.credentialId,
+							model: activeModel.id,
+						});
+					} else {
+						selected = await raceWithAbort(
+							accountManager.acquireCredential(activeProviderId, {
+								excludedCredentialIds,
+								modelId: activeModel.id,
+								selectionCache,
+								signal: options?.signal,
+							}),
+							options?.signal,
+						);
+					}
 				} catch (error: unknown) {
 					if (isCallerAbortSignal(options?.signal, error)) {
 						pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
@@ -653,9 +896,9 @@ export function createRotatingStreamWrapper(
 						continue;
 					}
 					if (excludedCredentialIds.size > 0) {
-						const lastDetail = lastRetryableMessage
-							? ` Last retryable error: ${lastRetryableMessage}`
-							: ` Credential acquisition error: ${getErrorMessage(error)}`;
+						const lastDetail = lastCredentialErrorMessage
+							? ` Last credential error: ${lastCredentialErrorMessage}`
+							: ` Credential acquisition error: ${getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS)}`;
 						throw new Error(
 							`All ${excludedCredentialIds.size} rotated credential(s) for ${activeProviderId} failed.${lastDetail}`,
 						);
@@ -664,13 +907,29 @@ export function createRotatingStreamWrapper(
 				}
 
 				const resolveRetryDecision = async (
-					message: string,
+					rawMessage: string,
 					hasForwardedSubstantiveEvent: boolean,
 					transientAttempt: number,
+					requestModel: Model<Api>,
+					requestHeaders: SimpleStreamOptions["headers"],
 				): Promise<"fail" | "retry_same_credential" | "rotate_credential"> => {
+					const message = await enrichProviderStatusOnlyErrorMessage(rawMessage, {
+						model: requestModel,
+						apiKey: selected.secret,
+						headers: requestHeaders,
+						signal: options?.signal,
+					});
+					if (message !== rawMessage) {
+						multiAuthDebugLogger.log("provider_error_body_enriched", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							model: requestModel.id,
+							errorMessage: message.slice(0, 200),
+						});
+					}
 					const classification = classifyCredentialError(message, {
 						providerId: activeProviderId,
-						modelId: activeModel.id,
+						modelId: requestModel.id,
 					});
 					multiAuthDebugLogger.log("error_classified", {
 						provider: activeProviderId,
@@ -688,6 +947,7 @@ export function createRotatingStreamWrapper(
 								activeProviderId,
 								selected.credentialId,
 								message,
+								classification.kind,
 							);
 							multiAuthDebugLogger.log("credential_disabled", {
 								provider: activeProviderId,
@@ -699,7 +959,7 @@ export function createRotatingStreamWrapper(
 							multiAuthDebugLogger.log("credential_disable_failed", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
-								error: getErrorMessage(error),
+								error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
 							});
 						}
 					}
@@ -712,7 +972,7 @@ export function createRotatingStreamWrapper(
 						classification.shouldRetrySameCredential &&
 						transientAttempt < MAX_TRANSIENT_RETRIES_PER_CREDENTIAL
 					) {
-						lastRetryableMessage = message;
+						lastCredentialErrorMessage = message;
 						return "retry_same_credential";
 					}
 
@@ -720,8 +980,12 @@ export function createRotatingStreamWrapper(
 						(classification.kind === "provider_transient" ||
 							classification.kind === "request_timeout") &&
 						!hasForwardedSubstantiveEvent &&
-						attempt < MAX_ROTATION_RETRIES
+						attempt + 1 < rotationAttemptLimit
 					) {
+						lastCredentialErrorMessage = message;
+						if (useDelegatedCredentialOverride) {
+							return "fail";
+						}
 						const cooldownMs = await accountManager.markTransientProviderError(
 							activeProviderId,
 							selected.credentialId,
@@ -734,14 +998,17 @@ export function createRotatingStreamWrapper(
 							reason: message.slice(0, 200),
 						});
 						excludedCredentialIds.add(selected.credentialId);
-						lastRetryableMessage = message;
 						return "rotate_credential";
 					}
 
 					if (
 						classification.shouldRotateCredential &&
-						attempt < MAX_ROTATION_RETRIES
+						attempt + 1 < rotationAttemptLimit
 					) {
+						lastCredentialErrorMessage = message;
+						if (useDelegatedCredentialOverride) {
+							return "fail";
+						}
 						if (classification.shouldApplyCooldown) {
 							await accountManager.markQuotaExceeded(
 								activeProviderId,
@@ -753,6 +1020,25 @@ export function createRotatingStreamWrapper(
 									recommendedCooldownMs: classification.recommendedCooldownMs,
 								},
 							);
+						} else if (
+							isCredentialModelIncompatibilityError(message, {
+								providerId: activeProviderId,
+								modelId: requestModel.id,
+							})
+						) {
+							const blockedUntil = await accountManager.markCredentialModelIncompatible(
+								activeProviderId,
+								selected.credentialId,
+								requestModel.id,
+								message,
+							);
+							multiAuthDebugLogger.log("credential_model_incompatibility_recorded", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+								modelId: requestModel.id,
+								blockedUntil,
+								reason: message.slice(0, 200),
+							});
 						} else if (
 							isRetryableModelAvailabilityError(message, {
 								providerId: activeProviderId,
@@ -773,7 +1059,6 @@ export function createRotatingStreamWrapper(
 						}
 						lastFailoverTrigger = classification.kind;
 						excludedCredentialIds.add(selected.credentialId);
-						lastRetryableMessage = message;
 						return "rotate_credential";
 					}
 
@@ -787,17 +1072,38 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
-					const watchdog = createStreamAttemptWatchdog({
-						providerId: activeProviderId,
+					const providerRequestHeaders = resolveProviderRequestHeaders(
+						activeProviderId,
+						options?.headers,
+					);
+					const {
+						model: requestModel,
+						headers: requestHeaders,
+					} = applyCredentialRequestOverrides({
+						provider: activeProviderId,
 						credentialId: selected.credentialId,
-						modelId: activeModel.id,
-						timeoutConfig: streamTimeoutConfig,
-						parentSignal: options?.signal,
+						credential: selected.credential,
+						model: activeModel,
+						headers: providerRequestHeaders,
 					});
 					let innerStream: AssistantMessageEventStream;
 					try {
-						// Build forwarded options, omitting keys with undefined values
-						// to prevent the OpenAI SDK from rejecting undefined timeout/maxRetries.
+						const credentialType = useDelegatedCredentialOverride
+							? "delegated"
+							: selected.credential?.type ?? "unknown";
+						const secretKind = selected.secret.startsWith("workos:")
+							? "workos"
+							: credentialType;
+						multiAuthDebugLogger.log("stream_request_auth", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							credentialType,
+							secretKind,
+							hasSecret: selected.secret.length > 0,
+							model: requestModel.id,
+							baseUrl: requestModel.baseUrl,
+							api: requestModel.api,
+						});
 						const forwardedOptions: Record<string, unknown> = {};
 						if (options) {
 							for (const [key, value] of Object.entries(options)) {
@@ -807,24 +1113,25 @@ export function createRotatingStreamWrapper(
 							}
 						}
 						forwardedOptions.apiKey = selected.secret;
-						forwardedOptions.signal = watchdog.signal;
+						forwardedOptions.headers = requestHeaders;
+						forwardedOptions.signal = options?.signal;
 						innerStream = activeBaseProvider.streamSimple(
-							activeModel,
+							requestModel,
 							context,
 							forwardedOptions as SimpleStreamOptions,
 						);
 					} catch (error: unknown) {
-						watchdog.dispose();
-						if (watchdog.isCallerAbort(error)) {
+						if (isCallerAbortSignal(options?.signal, error)) {
 							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
 							return;
 						}
-						const retryError = resolveAttemptFailureError(watchdog, error);
-						const message = getErrorMessage(retryError);
+						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 						const decision = await resolveRetryDecision(
 							message,
 							false,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							continue;
@@ -832,7 +1139,7 @@ export function createRotatingStreamWrapper(
 						if (decision === "rotate_credential") {
 							break;
 						}
-						throw retryError;
+						throw error;
 					}
 
 					let forwardedAnyEvent = false;
@@ -844,12 +1151,10 @@ export function createRotatingStreamWrapper(
 					const innerIterator = innerStream[Symbol.asyncIterator]();
 					try {
 						while (true) {
-							const nextEvent = await readNextStreamEventWithAbort(innerIterator, watchdog);
+							const nextEvent = await readNextStreamEventWithAbort(innerIterator, options?.signal);
 							if (nextEvent.done) {
 								break;
 							}
-
-							watchdog.touch();
 							const forwardedEvents = sanitizeOllamaThinkingEvent(
 								nextEvent.value,
 								activeProviderId,
@@ -857,24 +1162,18 @@ export function createRotatingStreamWrapper(
 							);
 							for (const event of forwardedEvents) {
 								if (event.type === "error") {
-									if (
-										watchdog.isCallerAbortMessage(getAssistantErrorMessage(event.error))
-									) {
-										pushAbortedAssistantEvent(
-											stream,
-											activeModel,
-											getAssistantErrorMessage(event.error),
-										);
+									const assistantErrorMessage = getAssistantErrorMessage(event.error);
+									if (isCallerAbortSignal(options?.signal) && /abort/i.test(assistantErrorMessage)) {
+										pushAbortedAssistantEvent(stream, activeModel, assistantErrorMessage);
 										return;
 									}
-									const message = resolveAttemptFailureMessage(
-										watchdog,
-										getAssistantErrorMessage(event.error),
-									);
+									const message = assistantErrorMessage;
 									const decision = await resolveRetryDecision(
 										message,
 										hasForwardedSubstantiveEvent,
 										transientAttempt,
+										requestModel,
+										requestHeaders,
 									);
 									if (decision === "retry_same_credential") {
 										shouldRetrySameCredential = true;
@@ -890,6 +1189,45 @@ export function createRotatingStreamWrapper(
 									return;
 								}
 
+								if (
+									event.type === "done" &&
+									isRetryableEmptyCompletion(
+										event,
+										hasForwardedSubstantiveEvent,
+									)
+								) {
+									const message = createEmptyCompletionErrorMessage(
+										activeProviderId,
+										selected.credentialId,
+										event.message,
+									);
+									multiAuthDebugLogger.log("empty_completion_detected", {
+										provider: activeProviderId,
+										credentialId: selected.credentialId,
+										model: event.message.model,
+										responseId: event.message.responseId,
+										outputTokens: getAssistantOutputTokens(event.message),
+										contentBlockCount: event.message.content.length,
+										stopReason: event.message.stopReason,
+									});
+									const decision = await resolveRetryDecision(
+										message,
+										hasForwardedSubstantiveEvent,
+										transientAttempt,
+										requestModel,
+										requestHeaders,
+									);
+									if (decision === "retry_same_credential") {
+										shouldRetrySameCredential = true;
+										break;
+									}
+									if (decision === "rotate_credential") {
+										shouldRotateCredential = true;
+										break;
+									}
+									throw new Error(message);
+								}
+
 								forwardedAnyEvent = true;
 								hasForwardedSubstantiveEvent ||= isSubstantiveEvent(event);
 								stream.push(event);
@@ -899,6 +1237,7 @@ export function createRotatingStreamWrapper(
 										activeProviderId,
 										selected.credentialId,
 										Date.now() - requestStartedAt,
+										requestModel.id,
 									);
 									stream.end(event.message);
 									return;
@@ -910,27 +1249,27 @@ export function createRotatingStreamWrapper(
 							}
 						}
 					} catch (error: unknown) {
-						if (watchdog.isCallerAbort(error)) {
+						if (isCallerAbortSignal(options?.signal, error)) {
 							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
 							return;
 						}
-						const retryError = resolveAttemptFailureError(watchdog, error);
-						const message = getErrorMessage(retryError);
+						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 						const decision = await resolveRetryDecision(
 							message,
 							hasForwardedSubstantiveEvent,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							shouldRetrySameCredential = true;
 						} else if (decision === "rotate_credential") {
 							shouldRotateCredential = true;
 						} else {
-							throw retryError;
+							throw error;
 						}
 					} finally {
 						closeAsyncIterator(innerIterator);
-						watchdog.dispose();
 					}
 
 					if (shouldRetrySameCredential) {
@@ -942,20 +1281,19 @@ export function createRotatingStreamWrapper(
 					}
 
 					if (!sawDoneEvent) {
-						if (options?.signal?.aborted && !watchdog.getTimeoutError()) {
+						if (options?.signal?.aborted) {
 							pushAbortedAssistantEvent(stream, activeModel);
 							return;
 						}
-						const message = resolveAttemptFailureMessage(
-							watchdog,
-							!forwardedAnyEvent
-								? `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}) without emitting any events.`
-								: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`,
-						);
+						const message = !forwardedAnyEvent
+							? `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}) without emitting any events.`
+							: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`;
 						const decision = await resolveRetryDecision(
 							message,
 							hasForwardedSubstantiveEvent,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							continue;
@@ -972,11 +1310,11 @@ export function createRotatingStreamWrapper(
 			}
 
 			const triedCount = excludedCredentialIds.size;
-			const lastDetail = lastRetryableMessage
-				? ` Last error: ${lastRetryableMessage}`
+			const lastDetail = lastCredentialErrorMessage
+				? ` Last error: ${lastCredentialErrorMessage}`
 				: "";
 			throw new Error(
-				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${MAX_ROTATION_RETRIES + 1} attempts, all appear quota-limited or rate-limited.${lastDetail}`,
+				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${rotationAttemptLimit} attempt budget, all produced rotation-triggering errors.${lastDetail}`,
 			);
 		})().catch((error: unknown) => {
 			if (isCallerAbortSignal(options?.signal, error)) {
@@ -984,12 +1322,13 @@ export function createRotatingStreamWrapper(
 				return;
 			}
 
+			const errorMessage = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 			const assistantError: AssistantMessageEvent = {
 				type: "error",
 				reason: "error",
 				error: createErrorAssistantMessage(
 					activeModel,
-					`multi-auth rotation failed for ${activeProviderId}: ${getErrorMessage(error)}`,
+					formatMultiAuthRotationFailureMessage(activeProviderId, activeModel, errorMessage),
 				),
 			};
 			stream.push(assistantError);
@@ -1019,7 +1358,6 @@ export async function registerMultiAuthProviders(
 	options?: {
 		excludeProviders?: string[];
 		includeProviders?: string[];
-		streamTimeouts?: StreamTimeoutConfig;
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
@@ -1136,7 +1474,6 @@ export async function registerMultiAuthProviders(
 			accountManager,
 			baseProvider,
 			baseProvidersByApi,
-			options?.streamTimeouts,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

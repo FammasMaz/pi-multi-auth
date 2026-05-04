@@ -1,6 +1,12 @@
 import { constants as fsConstants } from "node:fs";
+import { sleep } from "./async-utils.js";
 import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import {
+	getErrorMessage,
+	isRecord,
+	toError,
+} from "./auth-error-utils.js";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
@@ -11,6 +17,7 @@ import {
 } from "./file-retry.js";
 import type {
 	BackupAndStoreResult,
+	CredentialRequestOverrides,
 	StoredApiKeyCredential,
 	StoredAuthCredential,
 	StoredOAuthCredential,
@@ -52,24 +59,6 @@ type LockOptions = {
 	onCompromised?: (error: Error) => void;
 };
 
-function toError(error: unknown): Error {
-	if (error instanceof Error) {
-		return error;
-	}
-
-	return new Error(String(error));
-}
-
-function sleep(ms: number): Promise<void> {
-	if (ms <= 0) {
-		return Promise.resolve();
-	}
-
-	return new Promise((resolve) => {
-		setTimeout(resolve, ms);
-	});
-}
-
 function lockDirPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
@@ -95,8 +84,10 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 		} catch (error) {
 			const lockError = toError(error);
 			const maybeCode = (lockError as Error & { code?: unknown }).code;
+			const isExistingLockError = maybeCode === "EEXIST";
+			const isRetryableAccessError = isRetryableFileAccessError(lockError);
 
-			if (maybeCode !== "EEXIST") {
+			if (!isExistingLockError && !isRetryableAccessError) {
 				multiAuthDebugLogger.log("auth_lock_error", {
 					authPath: filePath,
 					lockPath,
@@ -105,6 +96,16 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 					error: lockError.message,
 				});
 				throw lockError;
+			}
+
+			if (!isExistingLockError) {
+				multiAuthDebugLogger.log("auth_lock_retryable_access_error", {
+					authPath: filePath,
+					lockPath,
+					attempt,
+					maxAttempts,
+					error: lockError.message,
+				});
 			}
 
 			try {
@@ -140,8 +141,11 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 					attempt,
 					maxAttempts,
 					staleMs: options.stale,
+					error: lockError.message,
 				});
-				throw new Error(`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s).`);
+				throw new Error(
+					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
+				);
 			}
 
 			const baseDelay = Math.min(
@@ -196,10 +200,6 @@ function getDefaultAuthPath(): string {
 	return resolveAgentRuntimePath("auth.json");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function parseAuthData(content: string | undefined): RawAuthFileData {
 	if (!content || content.trim() === "") {
 		return {};
@@ -209,9 +209,7 @@ function parseAuthData(content: string | undefined): RawAuthFileData {
 	try {
 		parsed = JSON.parse(content);
 	} catch (error) {
-		throw new Error(
-			`Invalid JSON in auth.json: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		throw new Error(`Invalid JSON in auth.json: ${getErrorMessage(error)}`);
 	}
 
 	if (!isRecord(parsed)) {
@@ -349,20 +347,25 @@ function escapeRegex(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function getNextBackupSuffix(provider: SupportedProviderId, data: RawAuthFileData): number {
+function getFirstAvailableBackupSuffix(provider: SupportedProviderId, data: RawAuthFileData): number {
 	const expression = new RegExp(`^${escapeRegex(provider)}-(\\d+)$`);
-	let maxSuffix = 0;
+	const usedSuffixes = new Set<number>();
 	for (const key of Object.keys(data)) {
 		const match = expression.exec(key);
 		if (!match) {
 			continue;
 		}
 		const suffix = Number.parseInt(match[1], 10);
-		if (Number.isInteger(suffix) && suffix > maxSuffix) {
-			maxSuffix = suffix;
+		if (Number.isInteger(suffix) && suffix > 0) {
+			usedSuffixes.add(suffix);
 		}
 	}
-	return maxSuffix + 1;
+
+	let suffix = 1;
+	while (usedSuffixes.has(suffix)) {
+		suffix += 1;
+	}
+	return suffix;
 }
 
 function cloneStoredCredential(credential: StoredAuthCredential): StoredAuthCredential {
@@ -538,6 +541,42 @@ export class AuthWriter {
 	}
 
 	/**
+	 * Persists credential-scoped request overrides, preserving the credential secret.
+	 */
+	async setCredentialRequestOverrides(
+		credentialId: string,
+		request: CredentialRequestOverrides,
+	): Promise<StoredAuthCredential> {
+		const normalizedCredentialId = credentialId.trim();
+		if (!normalizedCredentialId) {
+			throw new Error("Credential ID cannot be empty.");
+		}
+
+		return this.withLock((data) => {
+			const existing = data[normalizedCredentialId];
+			if (!isStoredCredential(existing)) {
+				throw new Error(
+					`Credential ${normalizedCredentialId} is missing from auth.json. Open /multi-auth and add the account again if needed.`,
+				);
+			}
+
+			const nextCredential: StoredAuthCredential = {
+				...cloneStoredCredential(existing),
+				request: {
+					...existing.request,
+					...request,
+				},
+			};
+			const next = cloneAuthData(data);
+			next[normalizedCredentialId] = nextCredential;
+			return {
+				result: cloneStoredCredential(nextCredential),
+				next,
+			};
+		});
+	}
+
+	/**
 	 * Stores OAuth credentials in provider slot (first account) or provider-N backup slot.
 	 */
 	async setOAuthCredentialAsBackup(
@@ -570,6 +609,7 @@ export class AuthWriter {
 	async setApiKeyCredentialAsBackup(
 		provider: SupportedProviderId,
 		key: string,
+		request?: CredentialRequestOverrides,
 	): Promise<BackupAndStoreResult> {
 		const normalized = key.trim();
 		if (!normalized) {
@@ -607,8 +647,20 @@ export class AuthWriter {
 				uniqueCredentials.push({
 					type: "api_key",
 					key: normalized,
+					...(request && { request }),
 				});
 				firstIndexByApiKey.set(normalized, targetIndex);
+			} else if (request && targetIndex !== undefined) {
+				const existingCredential = uniqueCredentials[targetIndex];
+				if (existingCredential?.type === "api_key") {
+					uniqueCredentials[targetIndex] = {
+						...existingCredential,
+						request: {
+							...existingCredential.request,
+							...request,
+						},
+					};
+				}
 			}
 
 			const existingCredentialIds = existingEntries.map((entry) => entry.credentialId);
@@ -697,16 +749,21 @@ export class AuthWriter {
 				delete next[credentialId];
 			}
 
+			const shouldRenumberCredentialIds = retainedEntries.every(
+				(entry) => entry.credential.type === "api_key",
+			);
 			const normalizedCredentialIds: string[] = [];
 			const credentialIdMap: Record<string, string> = {};
 			for (const [index, entry] of retainedEntries.entries()) {
-				const credentialId = getExpectedProviderCredentialId(provider, index);
+				const credentialId = shouldRenumberCredentialIds
+					? getExpectedProviderCredentialId(provider, index)
+					: entry.credentialId;
 				next[credentialId] = entry.credential;
 				normalizedCredentialIds.push(credentialId);
 				credentialIdMap[entry.credentialId] = credentialId;
 			}
 
-			const renumberedCredentialIds = retainedEntries.some(
+			const renumberedCredentialIds = shouldRenumberCredentialIds && retainedEntries.some(
 				(entry, index) => entry.credentialId !== getExpectedProviderCredentialId(provider, index),
 			);
 
@@ -731,7 +788,7 @@ export class AuthWriter {
 	}
 
 	/**
-	 * Renumbers provider credential IDs sequentially and deduplicates API-key entries.
+	 * Deduplicates API-key entries and renumbers only API-key-only provider slots.
 	 */
 	async normalizeProviderCredentials(
 		seedProviders: readonly string[] = [],
@@ -902,7 +959,7 @@ export class AuthWriter {
 			};
 		}
 
-		const nextSuffix = getNextBackupSuffix(provider, data);
+		const nextSuffix = getFirstAvailableBackupSuffix(provider, data);
 		return {
 			credentialId: `${provider}-${nextSuffix}`,
 			isBackup: true,

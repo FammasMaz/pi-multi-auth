@@ -19,10 +19,19 @@ export interface CredentialModelEligibility {
 	appliesConstraint: boolean;
 	eligibleCredentialIds: readonly string[];
 	ineligibleCredentialIds: readonly string[];
+	/** Credential IDs that should be attempted before other eligible credentials. */
+	preferredCredentialIds?: readonly string[];
 	failureMessage?: string;
 }
 
-const OPENAI_CODEX_PAID_MODEL_IDS = new Set(["gpt-5.4", "gpt-5.3-codex", "gpt-5-mini"]);
+const OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS = new Set([
+	"gpt-5-mini",
+	"gpt-5.3-codex",
+	"gpt-5.5",
+]);
+const OPENAI_CODEX_FREE_BLOCKED_MODEL_PATTERNS: readonly RegExp[] = [
+	/^gpt-(?:[6-9]|\d{2,})(?:[.-][a-z0-9]+)*$/,
+];
 const OPENAI_CODEX_PAID_PLAN_TYPES = new Set<CodexPlanType>([
 	"plus",
 	"pro",
@@ -59,6 +68,17 @@ export function formatModelReference(
 	modelId: string,
 ): string {
 	return `${normalizeProviderId(providerId)}/${modelId}`;
+}
+
+function isCodexGptModel(normalizedModelId: string): boolean {
+	return normalizedModelId.startsWith("gpt-");
+}
+
+function isCodexFreeBlockedModel(normalizedModelId: string): boolean {
+	return (
+		OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS.has(normalizedModelId) ||
+		OPENAI_CODEX_FREE_BLOCKED_MODEL_PATTERNS.some((pattern) => pattern.test(normalizedModelId))
+	);
 }
 
 /**
@@ -104,7 +124,24 @@ export function modelRequiresEntitlement(
 		return false;
 	}
 
-	return OPENAI_CODEX_PAID_MODEL_IDS.has(normalizedModelId);
+	return isCodexFreeBlockedModel(normalizedModelId);
+}
+
+/**
+ * Indicates whether eligible free Codex credentials should be prioritized for a model.
+ */
+export function modelPrefersFreePlan(
+	providerId: SupportedProviderId,
+	modelId: string | undefined,
+): boolean {
+	if (normalizeProviderId(providerId) !== "openai-codex") {
+		return false;
+	}
+
+	const normalizedModelId = normalizeModelId(modelId);
+	return normalizedModelId !== null &&
+		isCodexGptModel(normalizedModelId) &&
+		!isCodexFreeBlockedModel(normalizedModelId);
 }
 
 /**

@@ -1,17 +1,31 @@
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { join } from "node:path";
 
-function normalizeRuntimeRoot(value: unknown): string | null {
-	if (typeof value !== "string") {
-		return null;
-	}
+export const PI_MULTI_AUTH_RUNTIME_DIR_ENV = "PI_MULTI_AUTH_RUNTIME_DIR";
+const PI_CODING_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 
-	const trimmed = value.trim();
-	return trimmed ? resolve(trimmed) : null;
+function normalizeEnvPath(value: string | undefined): string | undefined {
+	const normalized = value?.trim();
+	return normalized ? normalized : undefined;
 }
 
 export function getAgentRuntimeRoot(): string {
-	return normalizeRuntimeRoot(process.env.PI_CODING_AGENT_DIR) ?? join(homedir(), ".pi", "agent");
+	const delegatedRuntimeDir = normalizeEnvPath(process.env[PI_MULTI_AUTH_RUNTIME_DIR_ENV]);
+	if (delegatedRuntimeDir) {
+		return delegatedRuntimeDir;
+	}
+
+	const configuredAgentDir = normalizeEnvPath(process.env[PI_CODING_AGENT_DIR_ENV]);
+	if (configuredAgentDir) {
+		return configuredAgentDir;
+	}
+
+	const homeDir = normalizeEnvPath(process.env.HOME) ?? normalizeEnvPath(process.env.USERPROFILE);
+	if (homeDir) {
+		return join(homeDir, ".pi", "agent");
+	}
+
+	return getAgentDir();
 }
 
 export function resolveAgentRuntimePath(...segments: string[]): string {

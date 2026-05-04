@@ -1,7 +1,14 @@
 import { readFile, stat } from "node:fs/promises";
-import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+import { getModels, getProviders, type Api, type Model } from "@mariozechner/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
+import { registerClineOAuthProvider } from "./oauth-cline.js";
+import { registerKiloOAuthProvider } from "./oauth-kilo.js";
 import { AuthWriter } from "./auth-writer.js";
+import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
+import {
+	resolveProviderRotationClassification,
+	type ProviderRotationProfile,
+} from "./provider-rotation-profile.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import {
 	LEGACY_SUPPORTED_PROVIDERS,
@@ -9,6 +16,7 @@ import {
 	type ProviderRegistrationMetadata,
 	type SupportedProviderId,
 } from "./types.js";
+import { isRecord } from "./auth-error-utils.js";
 
 interface ModelsProviderEntry {
 	api: Api;
@@ -31,6 +39,8 @@ export interface ProviderCapabilities {
 	provider: SupportedProviderId;
 	supportsApiKey: boolean;
 	supportsOAuth: boolean;
+	hasExternalAccountState: boolean;
+	rotationProfile: ProviderRotationProfile;
 }
 
 export interface AvailableOAuthProvider {
@@ -38,13 +48,67 @@ export interface AvailableOAuthProvider {
 	name: string;
 }
 
+export interface AvailableApiKeyProvider {
+	provider: SupportedProviderId;
+	name: string;
+}
+
+const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+	anthropic: "Anthropic",
+	"amazon-bedrock": "Amazon Bedrock",
+	"azure-openai-responses": "Azure OpenAI Responses",
+	cerebras: "Cerebras",
+	cloudflare: "Cloudflare Workers AI",
+	"cloudflare-workers-ai": "Cloudflare Workers AI",
+	"cloudflare-ai-gateway": "Cloudflare AI Gateway",
+	deepseek: "DeepSeek",
+	fireworks: "Fireworks",
+	google: "Google Gemini",
+	"google-vertex": "Google Vertex AI",
+	groq: "Groq",
+	huggingface: "Hugging Face",
+	"kimi-coding": "Kimi For Coding",
+	mistral: "Mistral",
+	minimax: "MiniMax",
+	"minimax-cn": "MiniMax (China)",
+	opencode: "OpenCode Zen",
+	"opencode-go": "OpenCode Go",
+	openai: "OpenAI",
+	openrouter: "OpenRouter",
+	"vercel-ai-gateway": "Vercel AI Gateway",
+	xai: "xAI",
+	xiaomi: "Xiaomi MiMo",
+	zai: "ZAI",
+};
+
+const BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS = new Set(
+	Object.keys(API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES),
+);
+
 const EMPTY_MODELS_FILE: ModelsFileData = {
 	providers: {},
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Record<string, () => void> = {
+	cline: registerClineOAuthProvider,
+	kilo: registerKiloOAuthProvider,
+};
+
+const THINKING_LEVEL_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+function ensureProviderOAuthRegistration(provider: SupportedProviderId): void {
+	const registerProvider = FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS[provider];
+	if (registerProvider && !getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0])) {
+		registerProvider();
+	}
 }
+
+function ensureFirstClassOAuthRegistrations(): void {
+	for (const provider of Object.keys(FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS)) {
+		ensureProviderOAuthRegistration(provider);
+	}
+}
+
 
 function toNumberOrDefault(value: unknown, fallback: number): number {
 	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -58,6 +122,25 @@ function toBooleanOrDefault(value: unknown, fallback: boolean): boolean {
 		return value;
 	}
 	return fallback;
+}
+
+function toThinkingLevelMap(value: unknown): ProviderModelDefinition["thinkingLevelMap"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const normalized: NonNullable<ProviderModelDefinition["thinkingLevelMap"]> = {};
+	let hasEntries = false;
+
+	for (const key of THINKING_LEVEL_KEYS) {
+		const mapped = value[key];
+		if (typeof mapped === "string" || mapped === null) {
+			normalized[key] = mapped;
+			hasEntries = true;
+		}
+	}
+
+	return hasEntries ? normalized : undefined;
 }
 
 function toInputList(value: unknown): ("text" | "image")[] {
@@ -100,6 +183,7 @@ function normalizeModelRecord(model: unknown, providerApi: Api, providerCompat?:
 	const compat = providerCompat || modelCompat
 		? { ...(providerCompat ?? {}), ...(modelCompat ?? {}) }
 		: undefined;
+	const baseUrl = typeof model.baseUrl === "string" && model.baseUrl.trim() ? model.baseUrl.trim() : undefined;
 	const headers = isRecord(model.headers)
 		? Object.fromEntries(
 				Object.entries(model.headers)
@@ -107,12 +191,15 @@ function normalizeModelRecord(model: unknown, providerApi: Api, providerCompat?:
 					.map(([key, value]) => [key, value]),
 			)
 		: undefined;
+	const thinkingLevelMap = toThinkingLevelMap(model.thinkingLevelMap);
 
 	return {
 		id: modelId,
 		name: typeof model.name === "string" && model.name.trim() ? model.name.trim() : modelId,
 		api: typeof model.api === "string" && model.api.trim() ? (model.api.trim() as Api) : providerApi,
+		baseUrl,
 		reasoning: toBooleanOrDefault(model.reasoning, false),
+		thinkingLevelMap,
 		input: toInputList(model.input),
 		cost: toCost(model.cost),
 		contextWindow: toNumberOrDefault(model.contextWindow, 128_000),
@@ -131,7 +218,9 @@ function mapBuiltInModel(model: Model<Api>): ProviderModelDefinition {
 		id: model.id,
 		name: model.name,
 		api: model.api,
+		baseUrl: model.baseUrl,
 		reasoning: model.reasoning,
+		thinkingLevelMap: model.thinkingLevelMap ? { ...model.thinkingLevelMap } : undefined,
 		input: [...model.input],
 		cost: {
 			input: model.cost.input,
@@ -165,7 +254,7 @@ function normalizeModelsFileData(parsed: unknown): ModelsFileData {
 
 	const providers: Record<string, ModelsProviderEntry> = {};
 	for (const [providerId, rawProvider] of Object.entries(parsed.providers)) {
-		if (!isRecord(rawProvider)) {
+		if (isRemovedLegacyGoogleProvider(providerId) || !isRecord(rawProvider)) {
 			continue;
 		}
 
@@ -217,6 +306,24 @@ function isMissingFileError(error: unknown): boolean {
 	);
 }
 
+function isPiMonoApiKeyLoginProvider(
+	providerId: string,
+	oauthProviderIds: ReadonlySet<string>,
+	builtInProviderIds: ReadonlySet<string>,
+): boolean {
+	if (BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS.has(providerId)) {
+		return true;
+	}
+	if (builtInProviderIds.has(providerId)) {
+		return false;
+	}
+	return !oauthProviderIds.has(providerId);
+}
+
+function getApiKeyProviderDisplayName(providerId: string): string {
+	return API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES[providerId] ?? providerId;
+}
+
 export class ProviderRegistry {
 	private modelsFileCache: ModelsFileCacheEntry | null = null;
 	private modelsFileLoadPromise: Promise<ModelsFileData> | null = null;
@@ -236,7 +343,7 @@ export class ProviderRegistry {
 		const seenProviders = new Set<string>();
 		const pushUnique = (provider: string): void => {
 			const normalized = provider.trim();
-			if (!normalized || seenProviders.has(normalized)) {
+			if (!normalized || isRemovedLegacyGoogleProvider(normalized) || seenProviders.has(normalized)) {
 				return;
 			}
 			seenProviders.add(normalized);
@@ -257,21 +364,39 @@ export class ProviderRegistry {
 	}
 
 	getProviderCapabilities(provider: SupportedProviderId): ProviderCapabilities {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return {
+				provider,
+				supportsApiKey: false,
+				supportsOAuth: false,
+				hasExternalAccountState: false,
+				rotationProfile: "lightweight",
+			};
+		}
+
+		ensureProviderOAuthRegistration(provider);
+		const supportsOAuth = Boolean(
+			getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
+		);
+		const classification = resolveProviderRotationClassification(provider, {
+			supportsOAuth,
+		});
 		return {
 			provider,
 			supportsApiKey: true,
-			supportsOAuth: Boolean(
-				getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
-			),
+			supportsOAuth,
+			hasExternalAccountState: classification.hasExternalAccountState,
+			rotationProfile: classification.rotationProfile,
 		};
 	}
 
 	listAvailableOAuthProviders(): AvailableOAuthProvider[] {
+		ensureFirstClassOAuthRegistrations();
 		const seenProviders = new Set<SupportedProviderId>();
 		const providers: AvailableOAuthProvider[] = [];
 		for (const provider of getOAuthProviders()) {
 			const providerId = provider.id.trim();
-			if (!providerId || seenProviders.has(providerId)) {
+			if (!providerId || isRemovedLegacyGoogleProvider(providerId) || seenProviders.has(providerId)) {
 				continue;
 			}
 			seenProviders.add(providerId);
@@ -283,10 +408,54 @@ export class ProviderRegistry {
 		return providers;
 	}
 
+	async listAvailableApiKeyProviders(): Promise<AvailableApiKeyProvider[]> {
+		const modelsFile = await this.readModelsFile();
+		const modelProviderIds = Object.keys(modelsFile.providers);
+		const authProviderIds = await this.authWriter.listProviderIds([
+			...this.legacyProviders,
+			...modelProviderIds,
+		]);
+		const builtInProviderIds = new Set<string>(getProviders());
+		const oauthProviderIds = new Set(
+			this.listAvailableOAuthProviders().map((provider) => provider.provider),
+		);
+		const providers: AvailableApiKeyProvider[] = [];
+		const seenProviders = new Set<SupportedProviderId>();
+		const pushUnique = (provider: string): void => {
+			const providerId = provider.trim();
+			if (!providerId || isRemovedLegacyGoogleProvider(providerId) || seenProviders.has(providerId)) {
+				return;
+			}
+			seenProviders.add(providerId);
+			providers.push({
+				provider: providerId,
+				name: getApiKeyProviderDisplayName(providerId),
+			});
+		};
+
+		for (const provider of BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS) {
+			pushUnique(provider);
+		}
+		for (const provider of modelProviderIds) {
+			if (isPiMonoApiKeyLoginProvider(provider, oauthProviderIds, builtInProviderIds)) {
+				pushUnique(provider);
+			}
+		}
+		for (const provider of authProviderIds) {
+			pushUnique(provider);
+		}
+
+		return providers;
+	}
+
 	/**
 	 * Returns true when provider has model metadata from built-in registry or models.json.
 	 */
 	async hasModelMetadata(provider: SupportedProviderId): Promise<boolean> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return false;
+		}
+
 		const builtInModels = getModels(provider as Parameters<typeof getModels>[0]);
 		if (builtInModels.length > 0) {
 			return true;
@@ -301,11 +470,16 @@ export class ProviderRegistry {
 	 * such as integrations used by non-chat features.
 	 */
 	async isCredentialOnlyOAuthProvider(provider: SupportedProviderId): Promise<boolean> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return false;
+		}
+
 		const hasMetadata = await this.hasModelMetadata(provider);
 		if (hasMetadata) {
 			return false;
 		}
 
+		ensureProviderOAuthRegistration(provider);
 		const supportsOAuth = Boolean(
 			getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
 		);
@@ -327,6 +501,10 @@ export class ProviderRegistry {
 	async resolveProviderRegistrationMetadata(
 		provider: SupportedProviderId,
 	): Promise<ProviderRegistrationMetadata | null> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return null;
+		}
+
 		const builtInModels = getModels(provider as Parameters<typeof getModels>[0]);
 		if (builtInModels.length > 0) {
 			const firstModel = builtInModels[0];

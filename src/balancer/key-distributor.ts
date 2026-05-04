@@ -1,19 +1,32 @@
 import type { CredentialModelEligibility } from "../model-entitlements.js";
 import { AuthWriter } from "../auth-writer.js";
-import { getCredentialSecret } from "../credential-display.js";
+import {
+	getCredentialRequestSecret,
+	isExpiredApiKeyCredential,
+} from "../credential-display.js";
 import { multiAuthDebugLogger } from "../debug-logger.js";
+import { LightweightRotationState } from "../lightweight-rotation-state.js";
+import { getRoundRobinCandidateIndex, getUsageBasedCandidateIndex } from "../rotation-selection.js";
 import { getProviderState, MultiAuthStorage } from "../storage.js";
-import type { SupportedProviderId } from "../types.js";
+import type { ProviderRotationState, SupportedProviderId } from "../types.js";
 import { RollingMetricSeries } from "../performance-metrics.js";
 import type {
 	BalancerCredentialState,
 	CooldownInfo,
 	CredentialLease,
+	DelegatedCredentialRequest,
+	DelegatedRoutingCapabilities,
 	KeyDistributorMetrics,
 	KeyDistributorProviderMetrics,
 	SelectionContext,
 } from "./types.js";
 import { selectBestCredential } from "./weighted-selector.js";
+import type { ProviderCapabilities } from "../provider-registry.js";
+import {
+	createAbortError,
+	isRecord,
+	throwFixedAbortErrorIfAborted,
+} from "../auth-error-utils.js";
 
 const DEFAULT_CONFIG = {
 	waitTimeoutMs: 30_000,
@@ -24,6 +37,8 @@ const DEFAULT_CONFIG = {
 } as const;
 
 const LEASE_TTL_MS = 24 * 60 * 60 * 1000;
+const LIGHTWEIGHT_SESSION_LEASE_TTL_MS = 5 * 60 * 1000;
+const LIGHTWEIGHT_SESSION_LEASE_SCOPE_PREFIX = "lightweight-session";
 const TRANSIENT_COOLDOWN_REASON_PATTERN = /transient/i;
 
 type KeyDistributorConfig = {
@@ -35,9 +50,13 @@ type KeyDistributorConfig = {
 };
 
 type AcquireWaitOptions = {
+	timeoutMs?: number;
 	signal?: AbortSignal;
 	excludedIds?: readonly string[];
 	modelId?: string;
+	modelRef?: string;
+	api?: string;
+	parentSessionId?: string;
 };
 
 type InternalLease = CredentialLease & {
@@ -66,6 +85,7 @@ type ModelEligibilityResolver = (
 	providerId: SupportedProviderId,
 	credentialIds: readonly string[],
 	modelId: string | undefined,
+	signal?: AbortSignal,
 ) => Promise<CredentialModelEligibility> | CredentialModelEligibility;
 
 /**
@@ -77,10 +97,22 @@ export class KeyDistributor {
 	private readonly leasesBySessionId = new Map<string, InternalLease>();
 	private readonly leasesByCredentialId = new Map<string, InternalLease>();
 	private readonly providerByCredentialId = new Map<string, SupportedProviderId>();
+	private readonly lightweightLeaseScopeBySubagentSessionId = new Map<string, string>();
+	private readonly lightweightSubagentSessionIdsByScopeKey = new Map<string, Set<string>>();
+	private readonly lightweightParentSessionIdByScopeKey = new Map<string, string>();
+	private readonly lightweightLeaseScopeKeysByParentSessionId = new Map<string, Set<string>>();
 	private readonly waitersByProvider = new Map<SupportedProviderId, Set<Waiter>>();
 	private readonly wakeTimerByProvider = new Map<SupportedProviderId, ReturnType<typeof setTimeout>>();
 	private readonly metricsByProvider = new Map<SupportedProviderId, ProviderMetricState>();
+	private readonly acquireLocksByProvider = new Map<
+		SupportedProviderId,
+		{ locked: boolean; waiters: Array<() => void> }
+	>();
 	private modelEligibilityResolver?: ModelEligibilityResolver;
+	private providerCapabilitiesResolver?: (
+		providerId: SupportedProviderId,
+	) => ProviderCapabilities;
+	private lightweightRotationState?: LightweightRotationState;
 
 	constructor(
 		private readonly storage: MultiAuthStorage = new MultiAuthStorage(),
@@ -106,67 +138,170 @@ export class KeyDistributor {
 		this.modelEligibilityResolver = resolver;
 	}
 
+	setProviderCapabilitiesResolver(
+		resolver: (providerId: SupportedProviderId) => ProviderCapabilities,
+	): void {
+		this.providerCapabilitiesResolver = resolver;
+	}
+
+	setLightweightRotationState(state: LightweightRotationState): void {
+		this.lightweightRotationState = state;
+	}
+
 	/**
 	 * Acquires an exclusive credential lease for one subagent session.
 	 */
 	async acquireForSubagent(
+		request: DelegatedCredentialRequest,
+	): Promise<{ credentialId: string; apiKey: string }>;
+	async acquireForSubagent(
 		sessionId: string,
 		providerId: SupportedProviderId,
+		options?: AcquireWaitOptions,
+	): Promise<{ credentialId: string; apiKey: string }>;
+	async acquireForSubagent(
+		sessionIdOrRequest: string | DelegatedCredentialRequest,
+		providerId?: SupportedProviderId,
 		options: AcquireWaitOptions = {},
 	): Promise<{ credentialId: string; apiKey: string }> {
+		const request = normalizeDelegatedCredentialRequest(
+			sessionIdOrRequest,
+			providerId,
+			options,
+		);
 		const startedAt = Date.now();
-		const providerMetrics = this.getOrCreateProviderMetrics(providerId);
+		const providerMetrics = this.getOrCreateProviderMetrics(request.providerId);
 		providerMetrics.acquisitionCount += 1;
-		const normalizedSessionId = normalizeSessionId(sessionId);
-		assertNotAborted(options.signal, providerId);
-		const existingLease = this.getActiveLeaseForSession(normalizedSessionId);
-		if (existingLease && existingLease.providerId === providerId) {
-			if (!(options.excludedIds ?? []).includes(existingLease.credentialId)) {
-				const resolvedLease = await this.resolveActiveLease(existingLease);
-				this.recordAcquireSuccess(providerId, Date.now() - startedAt);
-				return resolvedLease;
-			}
-			this.unregisterLease(normalizedSessionId);
-		}
+		const normalizedSessionId = normalizeSessionId(request.sessionId);
+		const normalizedParentSessionId = normalizeOptionalSessionId(request.parentSessionId);
+		const lightweightLeaseScopeKey = this.getLightweightLeaseScopeKey(
+			request.providerId,
+			normalizedParentSessionId,
+		);
+		const effectiveLeaseSessionId = lightweightLeaseScopeKey ?? normalizedSessionId;
+		const isLightweightSessionLease = effectiveLeaseSessionId === lightweightLeaseScopeKey;
 
 		try {
-			const credentialId = await this.acquireCredentialId(
-				{
-					providerId,
-					excludedIds: [...(options.excludedIds ?? [])],
-					requestingSessionId: normalizedSessionId,
-					modelId: options.modelId,
-				},
-				options.signal,
-			);
-			assertNotAborted(options.signal, providerId);
-			const lease: InternalLease = {
-				sessionId: normalizedSessionId,
-				providerId,
-				credentialId,
-				acquiredAt: Date.now(),
-				expiresAt: Date.now() + LEASE_TTL_MS,
-			};
-
-			this.registerLease(lease);
-			try {
-				assertNotAborted(options.signal, providerId);
-				const resolvedLease = await this.resolveActiveLease(lease);
-				this.recordAcquireSuccess(providerId, Date.now() - startedAt);
-				return resolvedLease;
-			} catch (error) {
-				if (isAbortError(error)) {
+			const resolvedLease = await this.withProviderAcquireLock(request.providerId, async () => {
+				throwFixedAbortErrorIfAborted(
+					request.signal,
+					createCredentialAvailabilityAbortMessage(request.providerId),
+				);
+				const existingLease = this.getActiveLeaseForSession(normalizedSessionId);
+				if (existingLease && existingLease.providerId === request.providerId) {
+					if (!(options.excludedIds ?? []).includes(existingLease.credentialId)) {
+						this.refreshLeaseExpiration(existingLease, lightweightLeaseScopeKey !== undefined);
+						return this.resolveActiveLease(existingLease);
+					}
 					this.unregisterLease(normalizedSessionId);
 				}
-				throw error;
-			}
+
+				if (lightweightLeaseScopeKey && normalizedParentSessionId) {
+					const existingLightweightLease = this.getActiveLeaseForSession(lightweightLeaseScopeKey);
+					if (existingLightweightLease && existingLightweightLease.providerId === request.providerId) {
+						if (!(options.excludedIds ?? []).includes(existingLightweightLease.credentialId)) {
+							this.registerLightweightLeaseAssociation(
+								normalizedSessionId,
+								lightweightLeaseScopeKey,
+								normalizedParentSessionId,
+							);
+							this.refreshLeaseExpiration(existingLightweightLease, true);
+							return this.resolveActiveLease(existingLightweightLease);
+						}
+						this.unregisterLease(lightweightLeaseScopeKey);
+					}
+				}
+
+				const credentialId = await this.acquireCredentialId(
+					{
+						providerId: request.providerId,
+						excludedIds: [...(options.excludedIds ?? [])],
+						requestingSessionId: effectiveLeaseSessionId,
+						modelId: request.modelId,
+					},
+					request.signal,
+				);
+				throwFixedAbortErrorIfAborted(
+					request.signal,
+					createCredentialAvailabilityAbortMessage(request.providerId),
+				);
+				const acquiredAt = Date.now();
+				const lease: InternalLease = {
+					sessionId: effectiveLeaseSessionId,
+					providerId: request.providerId,
+					credentialId,
+					acquiredAt,
+					expiresAt:
+						acquiredAt +
+						(isLightweightSessionLease ? LIGHTWEIGHT_SESSION_LEASE_TTL_MS : LEASE_TTL_MS),
+				};
+
+				this.registerLease(lease);
+				if (isLightweightSessionLease && normalizedParentSessionId) {
+					this.registerLightweightLeaseAssociation(
+						normalizedSessionId,
+						effectiveLeaseSessionId,
+						normalizedParentSessionId,
+					);
+				}
+				return this.resolveActiveLease(lease);
+			});
+			this.recordAcquireSuccess(request.providerId, Date.now() - startedAt);
+			return resolvedLease;
 		} catch (error) {
-			this.recordAcquireFailure(providerId, Date.now() - startedAt, error, options.signal);
+			if (isNamedAbortError(error)) {
+				this.unregisterLease(effectiveLeaseSessionId);
+			}
+			this.recordAcquireFailure(request.providerId, Date.now() - startedAt, error, request.signal);
 			throw error;
 		}
 	}
 
+	async shouldBypassDelegatedSubagentAcquisition(
+		providerId: SupportedProviderId,
+		options: { modelId?: string; modelRef?: string; api?: string; signal?: AbortSignal } = {},
+	): Promise<boolean> {
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
+		await this.clearExpiredCooldowns();
+		const now = Date.now();
+		const snapshot = await this.buildSnapshot(providerId, now);
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
+		if (snapshot.credentialIds.length === 0) {
+			return false;
+		}
+
+		const effectiveContext = await this.resolveEffectiveSelectionContext(
+			{
+				providerId,
+				excludedIds: [],
+				requestingSessionId: `delegation-bypass:${providerId}`,
+				modelId: options.modelId,
+			},
+			snapshot.credentialIds,
+			options.signal,
+		);
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
+		const eligibleCredentialIds = await this.getStructurallyEligibleCredentialIds(
+			providerId,
+			effectiveContext,
+			snapshot,
+			now,
+			options.signal,
+		);
+		return eligibleCredentialIds.length === 1;
+	}
+
 	private async resolveCredentialLease(
+		providerId: string,
 		credentialId: string,
 	): Promise<{ credentialId: string; apiKey: string }> {
 		const credential = await this.authWriter.getCredential(credentialId);
@@ -176,7 +311,7 @@ export class KeyDistributor {
 			);
 		}
 
-		const apiKey = getCredentialSecret(credential).trim();
+		const apiKey = getCredentialRequestSecret(providerId, credential).trim();
 		if (!apiKey) {
 			throw new Error(
 				`Credential '${credentialId}' does not contain a usable secret for subagent lease.`,
@@ -200,7 +335,7 @@ export class KeyDistributor {
 			};
 		}
 
-		const resolvedLease = await this.resolveCredentialLease(lease.credentialId);
+		const resolvedLease = await this.resolveCredentialLease(lease.providerId, lease.credentialId);
 		const currentLease = this.leasesBySessionId.get(lease.sessionId);
 		if (
 			currentLease &&
@@ -219,6 +354,33 @@ export class KeyDistributor {
 	releaseFromSubagent(sessionId: string): void {
 		const normalizedSessionId = normalizeSessionId(sessionId);
 		this.unregisterLease(normalizedSessionId);
+	}
+
+	/**
+	 * Releases cached lightweight session leases for one parent session.
+	 */
+	releaseLightweightSessionLeases(
+		parentSessionId: string,
+		providerId?: SupportedProviderId,
+	): void {
+		const normalizedParentSessionId = normalizeSessionId(parentSessionId);
+		const scopeKeys = this.lightweightLeaseScopeKeysByParentSessionId.get(normalizedParentSessionId);
+		if (!scopeKeys || scopeKeys.size === 0) {
+			return;
+		}
+
+		const filteredProviderId = providerId?.trim();
+		for (const scopeKey of [...scopeKeys]) {
+			const lease = this.leasesBySessionId.get(scopeKey);
+			if (!lease) {
+				this.unregisterLease(scopeKey);
+				continue;
+			}
+			if (filteredProviderId && lease.providerId !== filteredProviderId) {
+				continue;
+			}
+			this.unregisterLease(scopeKey);
+		}
 	}
 
 	/**
@@ -292,6 +454,7 @@ export class KeyDistributor {
 
 		const providerState = this.getOrCreateState(resolvedProviderId);
 		providerState.cooldowns[normalizedCredentialId] = cooldown;
+		this.unregisterLeaseByCredentialId(normalizedCredentialId);
 		this.scheduleWake(resolvedProviderId);
 
 		await this.storage.withLock((state) => {
@@ -538,16 +701,336 @@ export class KeyDistributor {
 		return { providers };
 	}
 
+	async getDelegatedCredentialRoutingCapabilities(
+		request: DelegatedCredentialRequest,
+	): Promise<DelegatedRoutingCapabilities> {
+		const normalizedRequest = normalizeDelegatedCredentialRequest(request, undefined, {});
+		throwFixedAbortErrorIfAborted(
+			normalizedRequest.signal,
+			createCredentialAvailabilityAbortMessage(normalizedRequest.providerId),
+		);
+		await this.clearExpiredCooldowns();
+		const now = Date.now();
+		const snapshot = await this.buildSnapshot(normalizedRequest.providerId, now);
+		throwFixedAbortErrorIfAborted(
+			normalizedRequest.signal,
+			createCredentialAvailabilityAbortMessage(normalizedRequest.providerId),
+		);
+		const selectionContext: SelectionContext = {
+			providerId: normalizedRequest.providerId,
+			excludedIds: [],
+			requestingSessionId: normalizedRequest.sessionId,
+			modelId: normalizedRequest.modelId,
+		};
+		const structurallyEligibleCredentialIds = await this.getStructurallyEligibleCredentialIds(
+			normalizedRequest.providerId,
+			selectionContext,
+			snapshot,
+			now,
+			normalizedRequest.signal,
+		);
+
+		let modelEligibleCredentialCount = structurallyEligibleCredentialIds.length;
+		let modelConstraintApplied = false;
+		let preferredCredentialCount: number | undefined;
+		let failureMessage: string | undefined;
+		if (normalizedRequest.modelId && this.modelEligibilityResolver) {
+			const eligibility = await this.modelEligibilityResolver(
+				normalizedRequest.providerId,
+				structurallyEligibleCredentialIds,
+				normalizedRequest.modelId,
+				normalizedRequest.signal,
+			);
+			modelConstraintApplied = eligibility.appliesConstraint;
+			if (eligibility.appliesConstraint) {
+				modelEligibleCredentialCount = eligibility.eligibleCredentialIds.length;
+				preferredCredentialCount = eligibility.preferredCredentialIds?.length;
+				failureMessage = eligibility.failureMessage;
+			}
+		}
+
+		return {
+			providerId: normalizedRequest.providerId,
+			modelId: normalizedRequest.modelId,
+			modelRef: normalizedRequest.modelRef,
+			api: normalizedRequest.api,
+			credentialCounts: {
+				total: snapshot.credentialIds.length,
+				structurallyEligible: structurallyEligibleCredentialIds.length,
+				modelEligible: modelEligibleCredentialCount,
+			},
+			modelConstraintApplied,
+			preferredCredentialCount,
+			failureMessage,
+		};
+	}
+
+	private isLightweightRotationProvider(providerId: SupportedProviderId): boolean {
+		return this.providerCapabilitiesResolver?.(providerId).rotationProfile === "lightweight";
+	}
+
+	private applyLightweightRotationState(
+		providerId: SupportedProviderId,
+		providerState: ProviderRotationState,
+	): ProviderRotationState {
+		if (!this.isLightweightRotationProvider(providerId) || !this.lightweightRotationState) {
+			return providerState;
+		}
+		return this.lightweightRotationState.applyToProviderState(providerId, providerState);
+	}
+
+	private recordLightweightSelection(
+		providerId: SupportedProviderId,
+		credentialIds: readonly string[],
+		credentialId: string,
+		selectedAt: number,
+		nextActiveIndex: number,
+	): void {
+		if (!this.isLightweightRotationProvider(providerId) || !this.lightweightRotationState) {
+			return;
+		}
+		const selectedIndex = credentialIds.indexOf(credentialId);
+		if (selectedIndex < 0) {
+			throw new Error(
+				`Cannot record lightweight balancer selection for ${providerId}: credential '${credentialId}' is not part of the provider state.`,
+			);
+		}
+		this.lightweightRotationState.recordSelection({
+			providerId,
+			credentialIds,
+			credentialId,
+			selectedIndex,
+			nextActiveIndex,
+			selectedAt,
+		});
+	}
+
+	private async getStructurallyEligibleCredentialIds(
+		providerId: SupportedProviderId,
+		context: SelectionContext,
+		snapshot: {
+			providerState: ProviderRotationState;
+			credentialIds: readonly string[];
+			balancerState: Readonly<BalancerCredentialState>;
+			leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
+		},
+		now: number,
+		signal?: AbortSignal,
+	): Promise<readonly string[]> {
+		const excludedCredentialIds =
+			context.excludedIds.length > 0 ? new Set(context.excludedIds) : null;
+		const expiredCredentialIds = await this.getExpiredApiKeyCredentialIds(
+			providerId,
+			snapshot.credentialIds,
+			signal,
+		);
+		const eligibleCredentialIds: string[] = [];
+
+		for (const credentialId of snapshot.credentialIds) {
+			if (excludedCredentialIds?.has(credentialId)) {
+				continue;
+			}
+			if (snapshot.providerState.disabledCredentials?.[credentialId]) {
+				continue;
+			}
+			if (expiredCredentialIds.has(credentialId)) {
+				continue;
+			}
+			const cooldown = snapshot.balancerState.cooldowns[credentialId];
+			if (cooldown && cooldown.until > now) {
+				continue;
+			}
+			eligibleCredentialIds.push(credentialId);
+		}
+
+		return eligibleCredentialIds;
+	}
+
+	private async getExpiredApiKeyCredentialIds(
+		providerId: SupportedProviderId,
+		credentialIds: readonly string[],
+		signal?: AbortSignal,
+	): Promise<ReadonlySet<string>> {
+		if (providerId !== "cline" || credentialIds.length === 0) {
+			return new Set<string>();
+		}
+
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
+		const credentialSnapshot = await this.authWriter.getCredentials(credentialIds);
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
+		const expiredCredentialIds = new Set<string>();
+		const expirationCheckTimestamp = Date.now();
+		for (const credentialId of credentialIds) {
+			const credential = credentialSnapshot.get(credentialId);
+			if (credential && isExpiredApiKeyCredential(providerId, credential, expirationCheckTimestamp)) {
+				expiredCredentialIds.add(credentialId);
+			}
+		}
+		return expiredCredentialIds;
+	}
+
+	private async buildAvailableCredentialSet(
+		context: SelectionContext,
+		snapshot: {
+			providerState: ProviderRotationState;
+			credentialIds: readonly string[];
+			balancerState: Readonly<BalancerCredentialState>;
+			leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
+		},
+		now: number,
+		signal?: AbortSignal,
+	): Promise<Set<string>> {
+		const available = new Set(
+			await this.getStructurallyEligibleCredentialIds(
+				context.providerId,
+				context,
+				snapshot,
+				now,
+				signal,
+			),
+		);
+
+		for (const credentialId of [...available]) {
+			const lease = snapshot.leasesByCredentialId[credentialId];
+			if (lease && lease.expiresAt > now && lease.sessionId !== context.requestingSessionId) {
+				available.delete(credentialId);
+				continue;
+			}
+			const activeRequests = snapshot.balancerState.activeRequests[credentialId] ?? 0;
+			if (activeRequests >= this.config.maxConcurrentPerKey) {
+				available.delete(credentialId);
+			}
+		}
+
+		return available;
+	}
+
+	private async selectConfiguredCredentialId(
+		context: SelectionContext,
+		snapshot: {
+			providerState: ProviderRotationState;
+			credentialIds: readonly string[];
+			usageCount: Readonly<Record<string, number>>;
+			balancerState: Readonly<BalancerCredentialState>;
+			leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
+		},
+		now: number,
+		signal?: AbortSignal,
+	): Promise<string | null> {
+		const available = await this.buildAvailableCredentialSet(context, snapshot, now, signal);
+		if (available.size === 0) {
+			return null;
+		}
+
+		const manualCredentialId = snapshot.providerState.manualActiveCredentialId?.trim();
+		if (manualCredentialId) {
+			return available.has(manualCredentialId) ? manualCredentialId : null;
+		}
+
+		switch (snapshot.providerState.rotationMode) {
+			case "round-robin": {
+				const selectedIndex = getRoundRobinCandidateIndex(snapshot.providerState, available);
+				return selectedIndex === undefined
+					? null
+					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
+			}
+			case "usage-based": {
+				const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, available);
+				return selectedIndex === undefined
+					? null
+					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
+			}
+			case "balancer":
+			default:
+				return selectBestCredential(context, snapshot, {
+					waitTimeoutMs: this.config.waitTimeoutMs,
+					defaultCooldownMs: this.config.defaultCooldownMs,
+					maxConcurrentPerKey: this.config.maxConcurrentPerKey,
+					tolerance: this.config.tolerance,
+				});
+		}
+	}
+
+	private resolveNextActiveIndex(
+		providerState: Pick<ProviderRotationState, "credentialIds" | "rotationMode" | "manualActiveCredentialId">,
+		selectedIndex: number,
+	): number {
+		if (providerState.manualActiveCredentialId || selectedIndex < 0) {
+			return Math.max(0, selectedIndex);
+		}
+		if (providerState.rotationMode !== "round-robin") {
+			return selectedIndex;
+		}
+		if (providerState.credentialIds.length === 0) {
+			return 0;
+		}
+		return (selectedIndex + 1) % providerState.credentialIds.length;
+	}
+
+	private async recordProviderSelection(
+		providerId: SupportedProviderId,
+		providerState: ProviderRotationState,
+		credentialIds: readonly string[],
+		credentialId: string,
+		selectedAt: number,
+	): Promise<void> {
+		const selectedIndex = credentialIds.indexOf(credentialId);
+		if (selectedIndex < 0) {
+			throw new Error(
+				`Cannot record delegated credential selection for ${providerId}: credential '${credentialId}' is not part of the provider state.`,
+			);
+		}
+		const nextActiveIndex = this.resolveNextActiveIndex(providerState, selectedIndex);
+		if (this.isLightweightRotationProvider(providerId)) {
+			this.recordLightweightSelection(
+				providerId,
+				credentialIds,
+				credentialId,
+				selectedAt,
+				nextActiveIndex,
+			);
+			return;
+		}
+
+		await this.storage.withLock((state) => {
+			const storedProviderState = getProviderState(state, providerId);
+			const storedSelectedIndex = storedProviderState.credentialIds.indexOf(credentialId);
+			if (storedSelectedIndex < 0) {
+				return { result: false };
+			}
+			storedProviderState.usageCount[credentialId] =
+				(storedProviderState.usageCount[credentialId] ?? 0) + 1;
+			storedProviderState.lastUsedAt[credentialId] = selectedAt;
+			storedProviderState.activeIndex = this.resolveNextActiveIndex(
+				storedProviderState,
+				storedSelectedIndex,
+			);
+			return { result: true, next: state };
+		});
+	}
+
 	private async acquireCredentialId(
 		context: SelectionContext,
 		signal?: AbortSignal,
 	): Promise<string> {
-		assertNotAborted(signal, context.providerId);
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(context.providerId),
+		);
 		await this.clearExpiredCooldowns();
 		const waitDeadline = Date.now() + this.config.waitTimeoutMs;
 
 		while (true) {
-			assertNotAborted(signal, context.providerId);
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
 			const now = Date.now();
 			const changedProviders = new Set<SupportedProviderId>();
 			this.clearExpiredLeases(now, changedProviders);
@@ -558,7 +1041,10 @@ export class KeyDistributor {
 			}
 
 			const snapshot = await this.buildSnapshot(context.providerId, now);
-			assertNotAborted(signal, context.providerId);
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
 			if (snapshot.credentialIds.length === 0) {
 				throw new Error(
 					`No credentials available for ${context.providerId} in balancer mode. Open /multi-auth and add an account.`,
@@ -568,15 +1054,27 @@ export class KeyDistributor {
 			const effectiveContext = await this.resolveEffectiveSelectionContext(
 				context,
 				snapshot.credentialIds,
+				signal,
 			);
-			assertNotAborted(signal, context.providerId);
-			const selectedCredentialId = selectBestCredential(effectiveContext, snapshot, {
-				waitTimeoutMs: this.config.waitTimeoutMs,
-				defaultCooldownMs: this.config.defaultCooldownMs,
-				maxConcurrentPerKey: this.config.maxConcurrentPerKey,
-				tolerance: this.config.tolerance,
-			});
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
+			const selectedCredentialId = await this.selectConfiguredCredentialId(
+				effectiveContext,
+				snapshot,
+				now,
+				signal,
+			);
 			if (selectedCredentialId) {
+				const selectedAt = Date.now();
+				await this.recordProviderSelection(
+					context.providerId,
+					snapshot.providerState,
+					snapshot.credentialIds,
+					selectedCredentialId,
+					selectedAt,
+				);
 				return selectedCredentialId;
 			}
 
@@ -594,6 +1092,7 @@ export class KeyDistributor {
 	private async resolveEffectiveSelectionContext(
 		context: SelectionContext,
 		credentialIds: readonly string[],
+		signal?: AbortSignal,
 	): Promise<SelectionContext> {
 		if (!context.modelId || !this.modelEligibilityResolver) {
 			return context;
@@ -603,6 +1102,7 @@ export class KeyDistributor {
 			context.providerId,
 			credentialIds,
 			context.modelId,
+			signal,
 		);
 		if (!eligibility.appliesConstraint) {
 			return context;
@@ -627,12 +1127,16 @@ export class KeyDistributor {
 	}
 
 	private async buildSnapshot(providerId: SupportedProviderId, now: number): Promise<{
+		providerState: ProviderRotationState;
 		credentialIds: readonly string[];
 		usageCount: Readonly<Record<string, number>>;
 		balancerState: Readonly<BalancerCredentialState>;
 		leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
 	}> {
-		const providerState = await this.storage.readProviderState(providerId);
+		const providerState = this.applyLightweightRotationState(
+			providerId,
+			await this.storage.readProviderState(providerId),
+		);
 		const credentialIds = [...providerState.credentialIds];
 		const validCredentialIds = new Set(credentialIds);
 		const balancerState = this.getOrCreateState(providerId);
@@ -705,6 +1209,7 @@ export class KeyDistributor {
 
 		this.scheduleWake(providerId);
 		return {
+			providerState,
 			credentialIds,
 			usageCount: providerState.usageCount,
 			balancerState,
@@ -719,9 +1224,26 @@ export class KeyDistributor {
 		this.notifyAvailability(lease.providerId);
 	}
 
+	private registerLightweightLeaseAssociation(
+		sessionId: string,
+		scopeKey: string,
+		parentSessionId: string,
+	): void {
+		this.unregisterLease(sessionId);
+		this.lightweightLeaseScopeBySubagentSessionId.set(sessionId, scopeKey);
+		const sessionIds = this.lightweightSubagentSessionIdsByScopeKey.get(scopeKey) ?? new Set<string>();
+		sessionIds.add(sessionId);
+		this.lightweightSubagentSessionIdsByScopeKey.set(scopeKey, sessionIds);
+		this.lightweightParentSessionIdByScopeKey.set(scopeKey, parentSessionId);
+		const scopeKeys = this.lightweightLeaseScopeKeysByParentSessionId.get(parentSessionId) ?? new Set<string>();
+		scopeKeys.add(scopeKey);
+		this.lightweightLeaseScopeKeysByParentSessionId.set(parentSessionId, scopeKeys);
+	}
+
 	private unregisterLease(sessionId: string): void {
 		const existingLease = this.leasesBySessionId.get(sessionId);
 		if (!existingLease) {
+			this.unregisterLightweightLeaseAssociation(sessionId);
 			return;
 		}
 
@@ -730,6 +1252,7 @@ export class KeyDistributor {
 		if (mappedLease?.sessionId === sessionId) {
 			this.leasesByCredentialId.delete(existingLease.credentialId);
 		}
+		this.unregisterLightweightScopeMetadata(sessionId);
 		this.notifyAvailability(existingLease.providerId);
 	}
 
@@ -738,13 +1261,64 @@ export class KeyDistributor {
 		if (!lease) {
 			return;
 		}
+		this.unregisterLease(lease.sessionId);
+	}
 
-		this.leasesBySessionId.delete(lease.sessionId);
-		this.leasesByCredentialId.delete(credentialId);
-		this.notifyAvailability(lease.providerId);
+	private unregisterLightweightLeaseAssociation(sessionId: string): void {
+		const scopeKey = this.lightweightLeaseScopeBySubagentSessionId.get(sessionId);
+		if (!scopeKey) {
+			return;
+		}
+		this.lightweightLeaseScopeBySubagentSessionId.delete(sessionId);
+		const sessionIds = this.lightweightSubagentSessionIdsByScopeKey.get(scopeKey);
+		if (!sessionIds) {
+			return;
+		}
+		sessionIds.delete(sessionId);
+		if (sessionIds.size === 0) {
+			this.lightweightSubagentSessionIdsByScopeKey.delete(scopeKey);
+		}
+	}
+
+	private unregisterLightweightScopeMetadata(scopeKey: string): void {
+		const childSessionIds = this.lightweightSubagentSessionIdsByScopeKey.get(scopeKey);
+		if (childSessionIds) {
+			for (const childSessionId of childSessionIds) {
+				this.lightweightLeaseScopeBySubagentSessionId.delete(childSessionId);
+			}
+			this.lightweightSubagentSessionIdsByScopeKey.delete(scopeKey);
+		}
+
+		const parentSessionId = this.lightweightParentSessionIdByScopeKey.get(scopeKey);
+		if (!parentSessionId) {
+			return;
+		}
+		this.lightweightParentSessionIdByScopeKey.delete(scopeKey);
+		const scopeKeys = this.lightweightLeaseScopeKeysByParentSessionId.get(parentSessionId);
+		if (!scopeKeys) {
+			return;
+		}
+		scopeKeys.delete(scopeKey);
+		if (scopeKeys.size === 0) {
+			this.lightweightLeaseScopeKeysByParentSessionId.delete(parentSessionId);
+		}
 	}
 
 	private getActiveLeaseForSession(sessionId: string): InternalLease | null {
+		const scopeKey = this.lightweightLeaseScopeBySubagentSessionId.get(sessionId);
+		if (scopeKey) {
+			const lease = this.leasesBySessionId.get(scopeKey);
+			if (!lease) {
+				this.unregisterLightweightLeaseAssociation(sessionId);
+				return null;
+			}
+			if (lease.expiresAt <= Date.now()) {
+				this.unregisterLease(scopeKey);
+				return null;
+			}
+			return lease;
+		}
+
 		const lease = this.leasesBySessionId.get(sessionId);
 		if (!lease) {
 			return null;
@@ -764,6 +1338,20 @@ export class KeyDistributor {
 			changedProviders.add(lease.providerId);
 			this.unregisterLease(lease.sessionId);
 		}
+	}
+
+	private getLightweightLeaseScopeKey(
+		providerId: SupportedProviderId,
+		parentSessionId: string | undefined,
+	): string | undefined {
+		if (!parentSessionId || !this.isLightweightRotationProvider(providerId)) {
+			return undefined;
+		}
+		return createLightweightSessionLeaseScopeKey(providerId, parentSessionId);
+	}
+
+	private refreshLeaseExpiration(lease: InternalLease, lightweight: boolean): void {
+		lease.expiresAt = Date.now() + (lightweight ? LIGHTWEIGHT_SESSION_LEASE_TTL_MS : LEASE_TTL_MS);
 	}
 
 	private clearExpiredInMemoryCooldowns(now: number, changedProviders: Set<SupportedProviderId>): void {
@@ -825,6 +1413,63 @@ export class KeyDistributor {
 		return created;
 	}
 
+	private getOrCreateAcquireLock(providerId: SupportedProviderId): {
+		locked: boolean;
+		waiters: Array<() => void>;
+	} {
+		const existing = this.acquireLocksByProvider.get(providerId);
+		if (existing) {
+			return existing;
+		}
+
+		const created = {
+			locked: false,
+			waiters: [] as Array<() => void>,
+		};
+		this.acquireLocksByProvider.set(providerId, created);
+		return created;
+	}
+
+	private async acquireProviderLock(providerId: SupportedProviderId): Promise<void> {
+		const lock = this.getOrCreateAcquireLock(providerId);
+		if (!lock.locked) {
+			lock.locked = true;
+			return;
+		}
+
+		await new Promise<void>((resolve) => {
+			lock.waiters.push(resolve);
+		});
+	}
+
+	private releaseProviderLock(providerId: SupportedProviderId): void {
+		const lock = this.acquireLocksByProvider.get(providerId);
+		if (!lock) {
+			return;
+		}
+
+		const nextWaiter = lock.waiters.shift();
+		if (nextWaiter) {
+			nextWaiter();
+			return;
+		}
+
+		lock.locked = false;
+		this.acquireLocksByProvider.delete(providerId);
+	}
+
+	private async withProviderAcquireLock<T>(
+		providerId: SupportedProviderId,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		await this.acquireProviderLock(providerId);
+		try {
+			return await operation();
+		} finally {
+			this.releaseProviderLock(providerId);
+		}
+	}
+
 	private recordAcquireSuccess(providerId: SupportedProviderId, durationMs: number): void {
 		const metrics = this.getOrCreateProviderMetrics(providerId);
 		metrics.successCount += 1;
@@ -840,7 +1485,7 @@ export class KeyDistributor {
 	): void {
 		const metrics = this.getOrCreateProviderMetrics(providerId);
 		metrics.acquisitionLatencyMs.record(durationMs);
-		if (isAbortError(error)) {
+		if (isNamedAbortError(error)) {
 			metrics.abortedCount += 1;
 			if (signal?.aborted) {
 				metrics.timeoutCount += 1;
@@ -875,7 +1520,7 @@ export class KeyDistributor {
 		signal?: AbortSignal,
 	): Promise<void> {
 		if (signal?.aborted) {
-			throw createAbortError(providerId);
+			throw createAbortError(createCredentialAvailabilityAbortMessage(providerId));
 		}
 
 		await new Promise<void>((resolve, reject) => {
@@ -913,7 +1558,9 @@ export class KeyDistributor {
 			};
 
 			const onAbort = (): void => {
-				waiter.reject(createAbortError(providerId));
+				waiter.reject(
+					createAbortError(createCredentialAvailabilityAbortMessage(providerId)),
+				);
 			};
 
 			waiters.add(waiter);
@@ -971,6 +1618,7 @@ export class KeyDistributor {
 			this.wakeTimerByProvider.delete(providerId);
 			this.notifyAvailability(providerId);
 		}, delayMs);
+		wakeTimer.unref();
 		this.wakeTimerByProvider.set(providerId, wakeTimer);
 	}
 
@@ -984,6 +1632,55 @@ export class KeyDistributor {
 		this.waitersByProvider.set(providerId, created);
 		return created;
 	}
+}
+
+function normalizeProviderId(providerId: SupportedProviderId): SupportedProviderId {
+	const normalized = providerId.trim().toLowerCase();
+	if (normalized.length === 0) {
+		throw new Error("providerId must be a non-empty string.");
+	}
+	return normalized;
+}
+
+function normalizeOptionalString(value: string | undefined): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeDelegatedCredentialRequest(
+	sessionIdOrRequest: string | DelegatedCredentialRequest,
+	providerId: SupportedProviderId | undefined,
+	options: AcquireWaitOptions,
+): DelegatedCredentialRequest {
+	if (typeof sessionIdOrRequest !== "string") {
+		return {
+			...sessionIdOrRequest,
+			sessionId: normalizeSessionId(sessionIdOrRequest.sessionId),
+			providerId: normalizeProviderId(sessionIdOrRequest.providerId),
+			modelId: normalizeOptionalString(sessionIdOrRequest.modelId),
+			modelRef: normalizeOptionalString(sessionIdOrRequest.modelRef),
+			api: normalizeOptionalString(sessionIdOrRequest.api),
+			parentSessionId: normalizeOptionalSessionId(sessionIdOrRequest.parentSessionId),
+		};
+	}
+
+	if (!providerId) {
+		throw new Error("providerId must be provided when acquiring a delegated credential by session ID.");
+	}
+
+	return {
+		sessionId: normalizeSessionId(sessionIdOrRequest),
+		providerId: normalizeProviderId(providerId),
+		timeoutMs: options.timeoutMs,
+		modelId: normalizeOptionalString(options.modelId),
+		modelRef: normalizeOptionalString(options.modelRef),
+		api: normalizeOptionalString(options.api),
+		parentSessionId: normalizeOptionalSessionId(options.parentSessionId),
+		signal: options.signal,
+	};
 }
 
 function trimRecordByKeys<T>(record: Record<string, T>, keys: Set<string>): void {
@@ -1002,6 +1699,21 @@ function normalizeSessionId(sessionId: string): string {
 	return normalized;
 }
 
+function normalizeOptionalSessionId(sessionId: string | undefined): string | undefined {
+	if (typeof sessionId !== "string") {
+		return undefined;
+	}
+	const normalized = sessionId.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function createLightweightSessionLeaseScopeKey(
+	providerId: SupportedProviderId,
+	parentSessionId: string,
+): string {
+	return `${LIGHTWEIGHT_SESSION_LEASE_SCOPE_PREFIX}:${providerId}:${parentSessionId}`;
+}
+
 function toPositiveInteger(value: number | undefined, fallback: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
 		return fallback;
@@ -1016,13 +1728,12 @@ function toNonNegativeNumber(value: number | undefined, fallback: number): numbe
 	return value;
 }
 
-function createAbortError(providerId: SupportedProviderId): Error {
-	const error = new Error(`Wait for credential availability aborted for ${providerId}.`);
-	error.name = "AbortError";
-	return error;
+function createCredentialAvailabilityAbortMessage(providerId: SupportedProviderId): string {
+	return `Wait for credential availability aborted for ${providerId}.`;
 }
 
-function isAbortError(error: unknown): boolean {
+// Keep balancer metrics and lease cleanup limited to explicit AbortError instances.
+function isNamedAbortError(error: unknown): boolean {
 	return error instanceof Error && error.name === "AbortError";
 }
 
@@ -1030,14 +1741,6 @@ function isAcquireTimeoutError(error: unknown): boolean {
 	return error instanceof Error && error.message.startsWith("Timed out after ");
 }
 
-function assertNotAborted(signal: AbortSignal | undefined, providerId: SupportedProviderId): void {
-	if (signal?.aborted) {
-		throw createAbortError(providerId);
-	}
-}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export { DEFAULT_CONFIG };

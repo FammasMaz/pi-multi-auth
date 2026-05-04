@@ -1,4 +1,5 @@
 import { request as httpsRequest } from "node:https";
+import { getErrorMessage, isRecord } from "../auth-error-utils.js";
 import { quotaClassifier } from "../quota-classifier.js";
 import { headersToRecord, rateLimitHeaderParser } from "../rate-limit-headers.js";
 import type {
@@ -11,6 +12,7 @@ import type {
 
 const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_USAGE_USER_AGENT = "pi-multi-auth/0.1.0";
+const CODEX_USAGE_REQUEST_TIMEOUT_MS = 3_000;
 const OPENAI_AUTH_CLAIM_KEY = "https://api.openai.com/auth";
 const MAX_CODEX_ACCOUNT_ID_CACHE_ENTRIES = 128;
 
@@ -34,9 +36,6 @@ const PLAN_TYPE_MAP: Record<string, string> = {
 
 const cachedCodexAccountIdsByToken = new Map<string, string | null>();
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asNumber(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -187,13 +186,6 @@ function formatPlanType(planType: string | null): string | null {
 	return PLAN_TYPE_MAP[normalized] ?? planType;
 }
 
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	return String(error);
-}
-
 function isCodexUsageTransportError(error: unknown): boolean {
 	const message = getErrorMessage(error);
 	return /fetch failed|econnreset|ehostunreach|enetunreach|etimedout|connection reset by peer|socket hang up|network/i.test(
@@ -201,12 +193,27 @@ function isCodexUsageTransportError(error: unknown): boolean {
 	);
 }
 
+function createCodexUsageTimeoutError(timeoutMs: number, viaIpv4Fallback: boolean = false): Error {
+	return new Error(
+		`OpenAI Codex usage request timed out after ${timeoutMs}ms${viaIpv4Fallback ? " during IPv4 fallback" : ""}`,
+	);
+}
+
 async function fetchCodexUsageViaIpv4(
 	headers: Record<string, string>,
+	timeoutMs: number = CODEX_USAGE_REQUEST_TIMEOUT_MS,
 ): Promise<{ status: number; bodyText: string; responseHeaders: Record<string, string> }> {
 	const url = new URL(CODEX_USAGE_ENDPOINT);
 
 	return new Promise((resolve, reject) => {
+		let settled = false;
+		const settle = (fn: () => void): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			fn();
+		};
 		const request = httpsRequest(
 			url,
 			{
@@ -221,7 +228,7 @@ async function fetchCodexUsageViaIpv4(
 					bodyText += chunk;
 				});
 				response.on("end", () => {
-					resolve({
+					settle(() => resolve({
 						status: response.statusCode ?? 0,
 						bodyText,
 						responseHeaders: Object.fromEntries(
@@ -229,26 +236,41 @@ async function fetchCodexUsageViaIpv4(
 								.filter((entry): entry is [string, string | string[]] => entry[1] !== undefined)
 								.map(([key, value]) => [key, Array.isArray(value) ? value.join(", ") : value]),
 						),
-					});
+					}));
 				});
 			},
 		);
 
-		request.on("error", reject);
+		request.setTimeout(timeoutMs, () => {
+			settle(() => {
+				request.destroy();
+				reject(createCodexUsageTimeoutError(timeoutMs, true));
+			});
+		});
+		request.on("error", (error) => {
+			settle(() => reject(error));
+		});
 		request.end();
 	});
 }
 
 async function fetchCodexUsageResponse(
 	headers: Record<string, string>,
+	timeoutMs: number = CODEX_USAGE_REQUEST_TIMEOUT_MS,
 ): Promise<{
 	status: number;
 	bodyText: string;
 	viaIpv4Fallback: boolean;
 	responseHeaders: Record<string, string>;
 }> {
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const response = await fetch(CODEX_USAGE_ENDPOINT, { method: "GET", headers });
+		const response = await fetch(CODEX_USAGE_ENDPOINT, {
+			method: "GET",
+			headers,
+			signal: controller.signal,
+		});
 		return {
 			status: response.status,
 			bodyText: await response.text(),
@@ -256,15 +278,20 @@ async function fetchCodexUsageResponse(
 			responseHeaders: headersToRecord(response.headers),
 		};
 	} catch (error: unknown) {
+		if (error instanceof Error && error.name === "AbortError") {
+			throw createCodexUsageTimeoutError(timeoutMs);
+		}
 		if (!isCodexUsageTransportError(error)) {
 			throw error;
 		}
 
-		const fallback = await fetchCodexUsageViaIpv4(headers);
+		const fallback = await fetchCodexUsageViaIpv4(headers, timeoutMs);
 		return {
 			...fallback,
 			viaIpv4Fallback: true,
 		};
+	} finally {
+		clearTimeout(timeoutId);
 	}
 }
 

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getErrorMessage } from "./auth-error-utils.js";
 import { DEFAULT_CASCADE_CONFIG, type CascadeConfig } from "./types-cascade.js";
 import {
 	DEFAULT_HEALTH_CONFIG,
@@ -10,9 +11,9 @@ import {
 } from "./types-health.js";
 import { DEFAULT_OAUTH_CONFIG, type OAuthRefreshConfig } from "./types-oauth.js";
 import {
-	DEFAULT_STREAM_TIMEOUT_CONFIG,
-	type StreamTimeoutConfig,
-} from "./types-stream-timeout.js";
+	DEFAULT_USAGE_COORDINATION_CONFIG,
+	type UsageCoordinationConfig,
+} from "./usage/usage-coordinator.js";
 
 export const MULTI_AUTH_EXTENSION_ID = "pi-multi-auth";
 
@@ -22,6 +23,16 @@ export interface HistoryPersistenceConfig {
 	cascadeFileName: string;
 }
 
+export type CodexUsageLookupFailureMode = "strict" | "allow-unverified";
+
+export interface CodexModelEntitlementConfig {
+	usageLookupFailureMode: CodexUsageLookupFailureMode;
+}
+
+export interface ModelEntitlementConfig {
+	codex: CodexModelEntitlementConfig;
+}
+
 export interface MultiAuthExtensionConfig {
 	debug: boolean;
 	/** Providers to exclude from multi-auth rotation (handled by dedicated auth extensions). */
@@ -29,8 +40,9 @@ export interface MultiAuthExtensionConfig {
 	cascade: CascadeConfig;
 	health: HealthMetricsConfig;
 	historyPersistence: HistoryPersistenceConfig;
+	modelEntitlements: ModelEntitlementConfig;
 	oauthRefresh: OAuthRefreshConfig;
-	streamTimeouts: StreamTimeoutConfig;
+	usageCoordination: UsageCoordinationConfig;
 }
 
 export interface MultiAuthConfigLoadResult {
@@ -45,6 +57,23 @@ export const DEFAULT_HISTORY_PERSISTENCE_CONFIG: HistoryPersistenceConfig = {
 	cascadeFileName: `${MULTI_AUTH_EXTENSION_ID}-cascade-history.json`,
 };
 
+export const DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG: CodexModelEntitlementConfig = {
+	usageLookupFailureMode: "allow-unverified",
+};
+
+export const DEFAULT_MODEL_ENTITLEMENT_CONFIG: ModelEntitlementConfig = {
+	codex: { ...DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG },
+};
+
+export function cloneOAuthRefreshConfig(
+	config: OAuthRefreshConfig = DEFAULT_OAUTH_CONFIG,
+): OAuthRefreshConfig {
+	return {
+		...config,
+		excludedProviders: [...config.excludedProviders],
+	};
+}
+
 export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	debug: false,
 	excludeProviders: [],
@@ -54,8 +83,9 @@ export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 		weights: { ...DEFAULT_HEALTH_WEIGHTS },
 	},
 	historyPersistence: { ...DEFAULT_HISTORY_PERSISTENCE_CONFIG },
-	oauthRefresh: { ...DEFAULT_OAUTH_CONFIG },
-	streamTimeouts: { ...DEFAULT_STREAM_TIMEOUT_CONFIG },
+	modelEntitlements: cloneModelEntitlementConfig(DEFAULT_MODEL_ENTITLEMENT_CONFIG),
+	oauthRefresh: cloneOAuthRefreshConfig(DEFAULT_OAUTH_CONFIG),
+	usageCoordination: { ...DEFAULT_USAGE_COORDINATION_CONFIG },
 };
 
 export function cloneHistoryPersistenceConfig(
@@ -68,12 +98,19 @@ export function cloneHistoryPersistenceConfig(
 	};
 }
 
-export function cloneStreamTimeoutConfig(
-	config: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
-): StreamTimeoutConfig {
+export function cloneCodexModelEntitlementConfig(
+	config: CodexModelEntitlementConfig = DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG,
+): CodexModelEntitlementConfig {
 	return {
-		attemptTimeoutMs: config.attemptTimeoutMs,
-		idleTimeoutMs: config.idleTimeoutMs,
+		usageLookupFailureMode: config.usageLookupFailureMode,
+	};
+}
+
+export function cloneModelEntitlementConfig(
+	config: ModelEntitlementConfig = DEFAULT_MODEL_ENTITLEMENT_CONFIG,
+): ModelEntitlementConfig {
+	return {
+		codex: cloneCodexModelEntitlementConfig(config.codex),
 	};
 }
 
@@ -89,8 +126,9 @@ export function cloneMultiAuthExtensionConfig(
 			weights: { ...config.health.weights },
 		},
 		historyPersistence: cloneHistoryPersistenceConfig(config.historyPersistence),
-		oauthRefresh: { ...config.oauthRefresh },
-		streamTimeouts: cloneStreamTimeoutConfig(config.streamTimeouts),
+		modelEntitlements: cloneModelEntitlementConfig(config.modelEntitlements),
+		oauthRefresh: cloneOAuthRefreshConfig(config.oauthRefresh),
+		usageCoordination: { ...config.usageCoordination },
 	};
 }
 
@@ -218,6 +256,36 @@ function readStringArray(
 	}
 
 	return [...new Set(normalized)];
+}
+
+function readStringEnum<TValue extends string>(
+	value: unknown,
+	path: string,
+	allowedValues: readonly TValue[],
+	defaultValue: TValue,
+	warnings: string[],
+): TValue {
+	if (value === undefined) {
+		return defaultValue;
+	}
+	if (typeof value !== "string") {
+		appendWarning(
+			warnings,
+			createValidationWarning(path, `expected one of ${allowedValues.join(", ")}`, defaultValue),
+		);
+		return defaultValue;
+	}
+
+	const normalized = value.trim() as TValue;
+	if (allowedValues.includes(normalized)) {
+		return normalized;
+	}
+
+	appendWarning(
+		warnings,
+		createValidationWarning(path, `expected one of ${allowedValues.join(", ")}`, defaultValue),
+	);
+	return defaultValue;
 }
 
 function readNonNegativeInteger(
@@ -483,6 +551,34 @@ function normalizeHistoryPersistenceConfig(
 	};
 }
 
+function normalizeCodexModelEntitlementConfig(
+	value: unknown,
+	warnings: string[],
+): CodexModelEntitlementConfig {
+	const defaults = DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG;
+	const record = toRecord(value);
+	return {
+		usageLookupFailureMode: readStringEnum(
+			record.usageLookupFailureMode,
+			"modelEntitlements.codex.usageLookupFailureMode",
+			["strict", "allow-unverified"],
+			defaults.usageLookupFailureMode,
+			warnings,
+		),
+	};
+}
+
+function normalizeModelEntitlementConfig(
+	value: unknown,
+	warnings: string[],
+): ModelEntitlementConfig {
+	const defaults = DEFAULT_MODEL_ENTITLEMENT_CONFIG;
+	const record = toRecord(value);
+	return {
+		codex: normalizeCodexModelEntitlementConfig(record.codex ?? defaults.codex, warnings),
+	};
+}
+
 function normalizeOAuthRefreshConfig(value: unknown, warnings: string[]): OAuthRefreshConfig {
 	const defaults = DEFAULT_OAUTH_CONFIG;
 	const record = toRecord(value);
@@ -518,23 +614,99 @@ function normalizeOAuthRefreshConfig(value: unknown, warnings: string[]): OAuthR
 			warnings,
 		),
 		enabled: readBoolean(record.enabled, "oauthRefresh.enabled", defaults.enabled, warnings),
+		excludedProviders: readStringArray(
+			record.excludedProviders,
+			"oauthRefresh.excludedProviders",
+			defaults.excludedProviders,
+			warnings,
+		),
 	};
 }
 
-function normalizeStreamTimeoutConfig(value: unknown, warnings: string[]): StreamTimeoutConfig {
-	const defaults = DEFAULT_STREAM_TIMEOUT_CONFIG;
+function normalizeUsageCoordinationConfig(
+	value: unknown,
+	warnings: string[],
+): UsageCoordinationConfig {
+	const defaults = DEFAULT_USAGE_COORDINATION_CONFIG;
 	const record = toRecord(value);
 	return {
-		attemptTimeoutMs: readPositiveInteger(
-			record.attemptTimeoutMs,
-			"streamTimeouts.attemptTimeoutMs",
-			defaults.attemptTimeoutMs,
+		enabled: readBoolean(record.enabled, "usageCoordination.enabled", defaults.enabled, warnings),
+		globalMaxConcurrentFreshRequests: readPositiveInteger(
+			record.globalMaxConcurrentFreshRequests,
+			"usageCoordination.globalMaxConcurrentFreshRequests",
+			defaults.globalMaxConcurrentFreshRequests,
 			warnings,
 		),
-		idleTimeoutMs: readPositiveInteger(
-			record.idleTimeoutMs,
-			"streamTimeouts.idleTimeoutMs",
-			defaults.idleTimeoutMs,
+		perProviderMaxConcurrentFreshRequests: readPositiveInteger(
+			record.perProviderMaxConcurrentFreshRequests,
+			"usageCoordination.perProviderMaxConcurrentFreshRequests",
+			defaults.perProviderMaxConcurrentFreshRequests,
+			warnings,
+		),
+		selectionCandidateWindow: readPositiveInteger(
+			record.selectionCandidateWindow,
+			"usageCoordination.selectionCandidateWindow",
+			defaults.selectionCandidateWindow,
+			warnings,
+		),
+		blockedReconciliationCandidateWindow: readPositiveInteger(
+			record.blockedReconciliationCandidateWindow,
+			"usageCoordination.blockedReconciliationCandidateWindow",
+			defaults.blockedReconciliationCandidateWindow,
+			warnings,
+		),
+		entitlementCandidateWindow: readPositiveInteger(
+			record.entitlementCandidateWindow,
+			"usageCoordination.entitlementCandidateWindow",
+			defaults.entitlementCandidateWindow,
+			warnings,
+		),
+		startupCandidateWindow: readPositiveInteger(
+			record.startupCandidateWindow,
+			"usageCoordination.startupCandidateWindow",
+			defaults.startupCandidateWindow,
+			warnings,
+		),
+		modalRefreshCandidateWindow: readPositiveInteger(
+			record.modalRefreshCandidateWindow,
+			"usageCoordination.modalRefreshCandidateWindow",
+			defaults.modalRefreshCandidateWindow,
+			warnings,
+		),
+		manualProviderRefreshCandidateWindow: readPositiveInteger(
+			record.manualProviderRefreshCandidateWindow,
+			"usageCoordination.manualProviderRefreshCandidateWindow",
+			defaults.manualProviderRefreshCandidateWindow,
+			warnings,
+		),
+		accountCooldownMs: readNonNegativeInteger(
+			record.accountCooldownMs,
+			"usageCoordination.accountCooldownMs",
+			defaults.accountCooldownMs,
+			warnings,
+		),
+		providerCooldownMs: readNonNegativeInteger(
+			record.providerCooldownMs,
+			"usageCoordination.providerCooldownMs",
+			defaults.providerCooldownMs,
+			warnings,
+		),
+		circuitBreakerFailureThreshold: readPositiveInteger(
+			record.circuitBreakerFailureThreshold,
+			"usageCoordination.circuitBreakerFailureThreshold",
+			defaults.circuitBreakerFailureThreshold,
+			warnings,
+		),
+		circuitBreakerCooldownMs: readNonNegativeInteger(
+			record.circuitBreakerCooldownMs,
+			"usageCoordination.circuitBreakerCooldownMs",
+			defaults.circuitBreakerCooldownMs,
+			warnings,
+		),
+		jitterMs: readNonNegativeInteger(
+			record.jitterMs,
+			"usageCoordination.jitterMs",
+			defaults.jitterMs,
 			warnings,
 		),
 	};
@@ -562,8 +734,9 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 			cascade: normalizeCascadeConfig(record.cascade, warnings),
 			health: normalizeHealthConfig(record.health, warnings),
 			historyPersistence: normalizeHistoryPersistenceConfig(record.historyPersistence, warnings),
+			modelEntitlements: normalizeModelEntitlementConfig(record.modelEntitlements, warnings),
 			oauthRefresh: normalizeOAuthRefreshConfig(record.oauthRefresh, warnings),
-			streamTimeouts: normalizeStreamTimeoutConfig(record.streamTimeouts, warnings),
+			usageCoordination: normalizeUsageCoordinationConfig(record.usageCoordination, warnings),
 		},
 		warnings,
 	};
@@ -588,7 +761,7 @@ export function ensureMultiAuthConfig(configPath = CONFIG_PATH): { created: bool
 		writeFileSync(configPath, createDefaultConfigContent(), "utf-8");
 		return { created: true };
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+		const message = getErrorMessage(error);
 		return {
 			created: false,
 			warning: `Failed to initialize pi-multi-auth config at '${configPath}': ${message}`,
@@ -609,7 +782,7 @@ export function loadMultiAuthConfig(configPath = CONFIG_PATH): MultiAuthConfigLo
 			warning: joinWarnings([ensureResult.warning, ...normalized.warnings]),
 		};
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+		const message = getErrorMessage(error);
 		return {
 			config: cloneMultiAuthExtensionConfig(),
 			created: ensureResult.created,
@@ -626,7 +799,7 @@ export function ensureMultiAuthDebugDirectory(debugDir = DEBUG_DIR): string | un
 		mkdirSync(debugDir, { recursive: true });
 		return undefined;
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+		const message = getErrorMessage(error);
 		return `Failed to create pi-multi-auth debug directory '${debugDir}': ${message}`;
 	}
 }

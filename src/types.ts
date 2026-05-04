@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import type { ProviderCascadeState } from "./types-cascade.js";
 import type { FailoverChain, FailoverChainState } from "./types-failover.js";
@@ -14,8 +14,6 @@ export const LEGACY_SUPPORTED_PROVIDERS = [
 	"openai-codex",
 	"github-copilot",
 	"anthropic",
-	"google-gemini-cli",
-	"google-antigravity",
 ] as const;
 
 /** Provider IDs handled by pi-multi-auth. */
@@ -24,13 +22,25 @@ export type SupportedProviderId = string;
 /** Rotation strategies for selecting credentials. */
 export type RotationMode = "round-robin" | "usage-based" | "balancer";
 
+export interface CredentialRequestOverrides {
+	/** Credential-scoped endpoint override used when the endpoint is account-specific. */
+	baseUrl?: string;
+	/** Credential-scoped request headers merged after provider headers. */
+	headers?: Record<string, string>;
+}
+
+export interface StoredCredentialRequestConfig {
+	/** Optional request overrides that travel with a single credential. */
+	request?: CredentialRequestOverrides;
+}
+
 /** OAuth credential payload stored in auth.json entries. */
 export type StoredOAuthCredential = {
 	type: "oauth";
-} & OAuthCredentials;
+} & OAuthCredentials & StoredCredentialRequestConfig;
 
 /** API key payload stored in auth.json entries. */
-export interface StoredApiKeyCredential {
+export interface StoredApiKeyCredential extends StoredCredentialRequestConfig {
 	type: "api_key";
 	key: string;
 }
@@ -40,6 +50,13 @@ export type StoredAuthCredential = StoredOAuthCredential | StoredApiKeyCredentia
 
 /** Full auth.json structure. */
 export type AuthFileData = Record<string, StoredAuthCredential>;
+
+export interface ModelCredentialIncompatibilityState {
+	modelId: string;
+	blockedUntil: number;
+	blockedAt: number;
+	error: string;
+}
 
 /** Per-provider rotation state persisted in multi-auth.json. */
 export interface ProviderRotationState {
@@ -64,7 +81,7 @@ export interface ProviderRotationState {
 	 * Key is credentialId, value contains the error message and timestamp when disabled.
 	 * Used for balance exhaustion and other unrecoverable errors.
 	 */
-	disabledCredentials: Record<string, { error: string; disabledAt: number }>;
+	disabledCredentials: Record<string, { error: string; disabledAt: number; planType?: string }>;
 	/** Persisted cascade retry state keyed by provider ID. */
 	cascadeState?: Record<string, ProviderCascadeState>;
 	/** Persisted credential health scores and request history. */
@@ -83,6 +100,8 @@ export interface ProviderRotationState {
 	activeChain?: FailoverChainState;
 	/** Richer quota classifications keyed by credential ID. */
 	quotaStates?: Record<string, QuotaStateForCredential>;
+	/** Temporary per-model credential incompatibilities keyed by credential ID then normalized model ID. */
+	modelIncompatibilities?: Record<string, Record<string, ModelCredentialIncompatibilityState>>;
 }
 
 /** UI preferences persisted in multi-auth.json. */
@@ -134,6 +153,7 @@ export interface CredentialStatus {
 	lastTransientError?: string;
 	lastUsedAt?: number;
 	usageSnapshot?: UsageSnapshot | null;
+	usageSnapshotDisplayOnly?: boolean;
 	usageFetchError?: string;
 	disabledError?: string;
 }
@@ -152,7 +172,9 @@ export interface ProviderModelDefinition {
 	id: string;
 	name: string;
 	api?: Api;
+	baseUrl?: string;
 	reasoning: boolean;
+	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 	input: ("text" | "image")[];
 	cost: {
 		input: number;
