@@ -1545,6 +1545,7 @@ export async function registerMultiAuthProviders(
 		pi.registerProvider(metadata.provider, {
 			baseUrl: metadata.baseUrl,
 			apiKey: "managed-by-multi-auth",
+			headers: metadata.headers,
 			api: primaryApi,
 			models: metadata.models,
 			streamSimple: primaryWrapper,

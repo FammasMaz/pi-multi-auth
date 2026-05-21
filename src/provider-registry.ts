@@ -23,6 +23,7 @@ interface ModelsProviderEntry {
 	baseUrl: string;
 	models: ProviderModelDefinition[];
 	apiKey?: string;
+	headers?: Record<string, string>;
 	compat?: Record<string, unknown>;
 }
 
@@ -173,7 +174,37 @@ function toCost(value: unknown): ProviderModelDefinition["cost"] {
 	};
 }
 
-function normalizeModelRecord(model: unknown, providerApi: Api, providerCompat?: Record<string, unknown>): ProviderModelDefinition | null {
+function toHeaders(value: unknown): Record<string, string> | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const headers = Object.fromEntries(
+		Object.entries(value)
+			.filter((entry): entry is [string, string] => typeof entry[1] === "string")
+			.map(([key, headerValue]) => [key.trim(), headerValue])
+			.filter(([key]) => key.length > 0),
+	);
+
+	return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function mergeHeaders(
+	providerHeaders?: Record<string, string>,
+	modelHeaders?: Record<string, string>,
+): Record<string, string> | undefined {
+	if (!providerHeaders && !modelHeaders) {
+		return undefined;
+	}
+	return { ...(providerHeaders ?? {}), ...(modelHeaders ?? {}) };
+}
+
+function normalizeModelRecord(
+	model: unknown,
+	providerApi: Api,
+	providerCompat?: Record<string, unknown>,
+	providerHeaders?: Record<string, string>,
+): ProviderModelDefinition | null {
 	if (!isRecord(model) || typeof model.id !== "string" || !model.id.trim()) {
 		return null;
 	}
@@ -184,13 +215,7 @@ function normalizeModelRecord(model: unknown, providerApi: Api, providerCompat?:
 		? { ...(providerCompat ?? {}), ...(modelCompat ?? {}) }
 		: undefined;
 	const baseUrl = typeof model.baseUrl === "string" && model.baseUrl.trim() ? model.baseUrl.trim() : undefined;
-	const headers = isRecord(model.headers)
-		? Object.fromEntries(
-				Object.entries(model.headers)
-					.filter((entry): entry is [string, string] => typeof entry[1] === "string")
-					.map(([key, value]) => [key, value]),
-			)
-		: undefined;
+	const headers = mergeHeaders(providerHeaders, toHeaders(model.headers));
 	const thinkingLevelMap = toThinkingLevelMap(model.thinkingLevelMap);
 
 	return {
@@ -269,11 +294,12 @@ function normalizeModelsFileData(parsed: unknown): ModelsFileData {
 		}
 
 		const providerCompat = isRecord(rawProvider.compat) ? { ...rawProvider.compat } : undefined;
+		const providerHeaders = toHeaders(rawProvider.headers);
 		const rawApiKey = typeof rawProvider.apiKey === "string" ? rawProvider.apiKey.trim() : undefined;
 
 		const models = Array.isArray(rawModels)
 			? rawModels
-					.map((model) => normalizeModelRecord(model, api as Api, providerCompat))
+					.map((model) => normalizeModelRecord(model, api as Api, providerCompat, providerHeaders))
 					.filter((model): model is ProviderModelDefinition => model !== null)
 			: [];
 		if (models.length === 0) {
@@ -287,6 +313,9 @@ function normalizeModelsFileData(parsed: unknown): ModelsFileData {
 		};
 		if (rawApiKey) {
 			entry.apiKey = rawApiKey;
+		}
+		if (providerHeaders) {
+			entry.headers = providerHeaders;
 		}
 		if (providerCompat) {
 			entry.compat = providerCompat;
@@ -540,6 +569,7 @@ export class ProviderRegistry {
 			baseUrl: fromFile.baseUrl,
 			models: [...fromFile.models],
 			apiKey: fromFile.apiKey,
+			headers: fromFile.headers,
 		};
 	}
 

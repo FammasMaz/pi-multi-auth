@@ -197,6 +197,8 @@ export interface ProviderRegistrationMetadata {
 	apis: Api[];
 	baseUrl: string;
 	models: ProviderModelDefinition[];
+	/** Provider-level request headers from models.json. */
+	headers?: Record<string, string>;
 	/** API key from models.json for custom providers (auto-seeded into auth). */
 	apiKey?: string;
 }
