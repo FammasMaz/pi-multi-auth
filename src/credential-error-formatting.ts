@@ -21,7 +21,7 @@ export function describeCredentialErrorAction(kind: CredentialErrorKind): string
 		case "request_timeout":
 			return "Retry later; the provider or network path appears temporarily unavailable.";
 		case "organization_disabled":
-			return "Restore or switch the disabled provider organization/account before retrying.";
+			return "Restore or switch the disabled provider organization, workspace, or account before retrying.";
 		case "unknown":
 			return "Review the provider response below, then retry with another credential/provider if needed.";
 	}

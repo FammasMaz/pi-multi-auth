@@ -8,7 +8,7 @@ import {
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
 	type OAuthProviderInterface,
-} from "@mariozechner/pi-ai/oauth";
+} from "@earendil-works/pi-ai/oauth";
 import {
 	formatOAuthRefreshFailureSummary,
 	isRecord,
