@@ -12,13 +12,53 @@
 ## Capabilities
 
 - Wraps discovered Pi providers with multi-account rotation, quota-aware cooldowns, failover, health scoring, and optional pool selection.
-- Supports OAuth credential management for providers exposed by Pi and registers first-class Cline and Kilo OAuth login and refresh handling.
+- Supports OAuth credential management for providers exposed by Pi and registers first-class Cline, Kilo, Kimi For Coding, and Qwen OAuth login and refresh handling.
 - Applies per-credential request overrides for provider base URLs and headers, with Cloudflare Workers AI credentials using account-scoped OpenAI-compatible base URLs and token/account discovery during credential setup.
 - Enriches status-only provider failures with bounded diagnostic probes so authentication, permission, billing, and rate-limit errors include actionable provider response details when available.
 - Provides lightweight rotation for API-key providers that do not expose external usage state, including delegated parent-session lease reuse.
 - Filters removed legacy Google Gemini CLI and Google Antigravity providers so stale provider definitions are not offered for credential setup or usage refreshes.
 - Persists extension state and usage snapshots under Pi's runtime directory while keeping local `config.json` and debug output outside the published package.
 - Coordinates fresh usage refreshes across selection, startup, modal, and manual refresh flows with bounded concurrency, candidate windows, cooldowns, and circuit breaking.
+
+## Provider capability matrix
+
+The following table shows credential and usage support for each recognized provider. Providers marked **API Key** appear in the credential setup dialog; providers marked **OAuth** support browser-based or device-code login flows.
+
+| Provider | API Key | OAuth | Usage / Quota | Notes |
+|---|---|---|---|---|
+| Anthropic | ✅ | — | ✅ | Usage via dedicated Anthropic endpoint |
+| Amazon Bedrock | ✅ | — | — | |
+| Azure OpenAI Responses | ✅ | — | — | |
+| BlazeAPI | ✅ | — | ✅ | Usage via `/api/usage` (daily requests + premium credits); rotation defaults to `usage-based` and routes credentials by plan tier (Premium → Pro → Free) with automatic fallback when the active tier's daily-request or premium-credit budget is exhausted |
+| Cerebras | ✅ | — | — | |
+| Cline | — | ✅ | — | OAuth only; browser callback |
+| Cloudflare Workers AI | ✅ | — | — | Requires account-scoped base URL |
+| Cloudflare AI Gateway | ✅ | — | — | |
+| DeepSeek | ✅ | — | — | |
+| Fireworks | ✅ | — | — | |
+| GitHub Copilot | ✅ | — | ✅ | Legacy discovery; usage via Copilot API |
+| Google Gemini | ✅ | — | — | |
+| Google Vertex AI | ✅ | — | — | |
+| Groq | ✅ | — | — | |
+| Hugging Face | ✅ | — | — | |
+| Kimi For Coding | ✅ | ✅ | ✅ | Device-code OAuth; usage via `/usages` endpoint |
+| Kilo | — | ✅ | — | OAuth only; device authorization |
+| MiniMax | ✅ | — | — | |
+| MiniMax (China) | ✅ | — | — | |
+| Mistral | ✅ | — | — | |
+| OpenAI | ✅ | — | ✅ | Usage via Codex entitlement |
+| OpenAI Codex | ✅ | — | ✅ | Legacy discovery; Codex usage + entitlement |
+| OpenCode Go | ✅ | — | — | |
+| OpenCode Zen | ✅ | — | — | |
+| OpenRouter | ✅ | — | — | |
+| Qwen | — | ✅ | — | OAuth only; device code with PKCE |
+| Vercel AI Gateway | ✅ | — | — | |
+| xAI | ✅ | — | — | |
+| Xiaomi MiMo | ✅ | — | — | |
+| ZAI | ✅ | — | — | |
+
+> **Legacy providers** `openai-codex` and `github-copilot` are retained for discovery and migration seed paths.
+> **Removed providers** Google Gemini CLI and Google Antigravity are filtered from credential setup and usage refreshes.
 
 ## Repository structure
 
@@ -34,6 +74,7 @@ pi-multi-auth/
 │   ├── usage/
 │   └── *.ts
 ├── tests/
+├── .env.example
 ├── package.json
 ├── package-lock.json
 ├── tsconfig.json
@@ -91,6 +132,30 @@ Credentials may include a `request` object with provider-specific request settin
 | `request.headers` | `Record<string, string>` | Adds credential-scoped headers to the provider request |
 
 Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL. When adding a Cloudflare API-key credential, the extension can extract `cfat_` tokens, account IDs, dashboard token URLs, or full Workers AI base URLs from pasted input. It discovers the base URL automatically when the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
+
+## Environment variables
+
+The extension reads optional environment variables to override OAuth client settings, runtime paths, and display behavior. See [`.env.example`](.env.example) for a copy-ready template.
+
+### OAuth client overrides
+
+| Variable | Provider | Default | Purpose |
+|---|---|---|---|
+| `KIMI_CODING_OAUTH_CLIENT_ID` | Kimi For Coding | Built-in app ID | Override the OAuth application client ID |
+| `QWEN_OAUTH_CLIENT_ID` | Qwen | Built-in app ID | Override the OAuth application client ID |
+
+### Runtime path overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PI_MULTI_AUTH_RUNTIME_DIR` | Pi agent runtime directory | Override the directory for usage cache and `multi-auth.json` |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Override the Pi agent directory (affects `models.json` and runtime path resolution) |
+
+### Display overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PI_MULTI_AUTH_ASCII_BORDERS` | Auto-detected | Force ASCII border rendering in the extension TUI (`1`, `true`, `yes`, `on`) |
 
 ## Validation
 
