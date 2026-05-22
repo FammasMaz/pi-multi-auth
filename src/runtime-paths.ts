@@ -1,4 +1,4 @@
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 
 export const PI_MULTI_AUTH_RUNTIME_DIR_ENV = "PI_MULTI_AUTH_RUNTIME_DIR";

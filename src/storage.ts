@@ -1,14 +1,19 @@
-import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { sleep } from "./async-utils.js";
 import {
 	DEBUG_DIR,
 	DEFAULT_HISTORY_PERSISTENCE_CONFIG,
 	cloneHistoryPersistenceConfig,
 	type HistoryPersistenceConfig,
 } from "./config.js";
-import { getErrorMessage, isRecord, toError } from "./auth-error-utils.js";
+import { getErrorMessage, isRecord } from "./auth-error-utils.js";
+import {
+	acquireFileLock,
+	ensureFileExists,
+	ensureParentDir,
+	hardenCredentialFilePermissions,
+	pathExists,
+} from "./file-utils.js";
 import { isRetryableFileAccessError, readTextSnapshotWithRetries, writeTextSnapshotWithRetries } from "./file-retry.js";
 import { MultiAuthHistoryStore } from "./history-storage.js";
 import { RollingMetricSeries, type MetricSeriesSnapshot } from "./performance-metrics.js";
@@ -26,26 +31,6 @@ import {
 type LockResult<T> = {
 	result: T;
 	next?: MultiAuthState;
-};
-
-type LockRetryOptions = {
-	retries: number;
-	factor: number;
-	minTimeout: number;
-	maxTimeout: number;
-	randomize: boolean;
-};
-
-type LockOptions = {
-	realpath?: boolean;
-	retries: LockRetryOptions;
-	stale: number;
-	onCompromised?: (error: Error) => void;
-};
-
-type LockObserver = {
-	onRetry?: (delayMs: number) => void;
-	onAcquired?: (latencyMs: number) => void;
 };
 
 type CachedStorageSnapshot = {
@@ -69,78 +54,6 @@ export interface MultiAuthStorageMetrics {
 export interface MultiAuthStorageOptions {
 	debugDir?: string;
 	historyPersistence?: HistoryPersistenceConfig;
-}
-
-function lockDirPath(filePath: string): string {
-	return `${filePath}.lock`;
-}
-
-async function acquireFileLock(
-	filePath: string,
-	options: LockOptions,
-	observer: LockObserver = {},
-): Promise<() => Promise<void>> {
-	const lockPath = lockDirPath(filePath);
-	const maxAttempts = Math.max(0, options.retries.retries) + 1;
-	const startedAt = Date.now();
-
-	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		try {
-			await mkdir(lockPath, { mode: 0o700 });
-			observer.onAcquired?.(Date.now() - startedAt);
-			return async () => {
-				await rm(lockPath, { recursive: true, force: true });
-			};
-		} catch (error) {
-			const lockError = toError(error);
-			const maybeCode = (lockError as Error & { code?: unknown }).code;
-			const isExistingLockError = maybeCode === "EEXIST";
-			const isRetryableAccessError = isRetryableFileAccessError(lockError);
-
-			if (!isExistingLockError && !isRetryableAccessError) {
-				throw lockError;
-			}
-
-			try {
-				const lockStats = await stat(lockPath);
-				const ageMs = Date.now() - lockStats.mtimeMs;
-				if (ageMs > options.stale) {
-					await rm(lockPath, { recursive: true, force: true });
-					if (options.onCompromised) {
-						options.onCompromised(
-							new Error(`Removed stale lock '${lockPath}' older than ${Math.round(ageMs)}ms.`),
-						);
-					}
-					// Decrement attempt so we retry the mkdir immediately after removing stale lock
-					attempt -= 1;
-					continue;
-				}
-			} catch {
-				// Lock may be released while checking staleness; retry.
-			}
-
-			if (attempt >= maxAttempts) {
-				throw new Error(
-					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
-				);
-			}
-
-			const baseDelay = Math.min(
-				options.retries.maxTimeout,
-				Math.max(
-					options.retries.minTimeout,
-					Math.round(options.retries.minTimeout * Math.pow(options.retries.factor, attempt - 1)),
-				),
-			);
-			const delay = options.retries.randomize
-				? Math.round(baseDelay * (0.5 + Math.random()))
-				: baseDelay;
-			observer.onRetry?.(delay);
-			await sleep(delay);
-		}
-	}
-
-	throw new Error(`Failed to acquire lock for '${filePath}'.`);
 }
 
 /**
@@ -173,6 +86,7 @@ export function createEmptyProviderState(
 		chains: undefined,
 		activeChain: undefined,
 		quotaStates: undefined,
+		quotaDrainStates: undefined,
 		modelIncompatibilities: undefined,
 	};
 }
@@ -196,29 +110,6 @@ export function createDefaultMultiAuthState(providers: readonly string[] = []): 
 			hiddenProviders: [],
 		},
 	};
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-	try {
-		await access(filePath, fsConstants.F_OK);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function ensureParentDir(filePath: string): Promise<void> {
-	const parentDir = dirname(filePath);
-	if (!(await pathExists(parentDir))) {
-		await mkdir(parentDir, { recursive: true, mode: 0o700 });
-	}
-}
-
-async function ensureFileExists(filePath: string): Promise<void> {
-	if (!(await pathExists(filePath))) {
-		await writeFile(filePath, JSON.stringify(createDefaultMultiAuthState(), null, 2), "utf-8");
-		await chmod(filePath, 0o600);
-	}
 }
 
 function getDefaultMultiAuthPath(): string {
@@ -281,6 +172,7 @@ function parseProviderState(
 		chains: parseChains(value.chains),
 		activeChain: parseActiveChain(value.activeChain),
 		quotaStates: parseQuotaStates(value.quotaStates),
+		quotaDrainStates: parseQuotaDrainStates(value.quotaDrainStates),
 		modelIncompatibilities: parseModelIncompatibilities(value.modelIncompatibilities),
 	};
 }
@@ -615,6 +507,34 @@ function parseQuotaStates(value: unknown): ProviderRotationState["quotaStates"] 
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function parseQuotaDrainStates(value: unknown): ProviderRotationState["quotaDrainStates"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const result: NonNullable<ProviderRotationState["quotaDrainStates"]> = {};
+	for (const [credentialId, state] of Object.entries(value)) {
+		if (!isRecord(state) || state.draining !== true) {
+			continue;
+		}
+		const updatedAt = typeof state.updatedAt === "number" && Number.isFinite(state.updatedAt)
+			? state.updatedAt
+			: Date.now();
+		result[credentialId] = {
+			draining: true,
+			enteredAt: typeof state.enteredAt === "number" && Number.isFinite(state.enteredAt)
+				? state.enteredAt
+				: updatedAt,
+			lastUsedPercent: typeof state.lastUsedPercent === "number" && Number.isFinite(state.lastUsedPercent)
+				? Math.max(0, Math.min(100, state.lastUsedPercent))
+				: undefined,
+			updatedAt,
+		};
+	}
+
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 function parseModelIncompatibilities(
 	value: unknown,
 ): ProviderRotationState["modelIncompatibilities"] {
@@ -772,7 +692,7 @@ async function writeSerializedMultiAuthStateSnapshot(
 		failureMessage: `Failed to persist multi-auth.json to '${storagePath}'.`,
 		write: async () => {
 			await writeFile(storagePath, serializedState, "utf-8");
-			await chmod(storagePath, 0o600);
+			await hardenCredentialFilePermissions(storagePath);
 		},
 		isRetryableError: isRetryableFileAccessError,
 	});
@@ -959,7 +879,7 @@ export class MultiAuthStorage {
 
 	private async ensureStorageReady(): Promise<void> {
 		await ensureParentDir(this.storagePath);
-		await ensureFileExists(this.storagePath);
+		await ensureFileExists(this.storagePath, JSON.stringify(createDefaultMultiAuthState(), null, 2));
 	}
 
 	private async readCachedSnapshotReference(): Promise<CachedStorageSnapshot> {

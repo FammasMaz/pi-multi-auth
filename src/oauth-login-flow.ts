@@ -1,17 +1,38 @@
-import { LoginDialogComponent, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { LoginDialogComponent, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { OverlayOptions } from "@earendil-works/pi-tui";
 import { getErrorMessage } from "./auth-error-utils.js";
+import {
+	RESPONSIVE_MODAL_DEFAULT_SCALE,
+	resolveResponsiveOverlayOptions,
+	resolveResponsiveOverlayRuntimeOptions,
+	type ModalOverlayOptions,
+} from "./formatters/responsive-modal.js";
 import type { AccountManager } from "./account-manager.js";
 import type { OAuthLoginCallbacks } from "./oauth-compat.js";
 import type { SupportedProviderId } from "./types.js";
 
 export const MANUAL_CODE_INPUT_PROMPT = "Paste authorization code or callback URL:";
 
-const OAUTH_LOGIN_OVERLAY_OPTIONS = {
-	anchor: "center" as const,
-	width: "88%" as const,
-	maxHeight: "88%" as const,
-	margin: 1,
-};
+export function resolveOAuthLoginOverlayOptions(
+	terminal?: { terminalColumns?: number | null; terminalRows?: number | null },
+): ModalOverlayOptions {
+	return resolveResponsiveOverlayOptions({
+		...terminal,
+		minimumWidth: 48,
+		maximumWidth: Math.ceil(110 * RESPONSIVE_MODAL_DEFAULT_SCALE),
+		minimumHeight: 12,
+		widthRatio: 0.88,
+		heightRatio: 0.86,
+	});
+}
+
+export function resolveOAuthLoginRuntimeOverlayOptions(): OverlayOptions {
+	return resolveResponsiveOverlayRuntimeOptions({
+		minimumWidth: 48,
+		widthRatio: 0.88,
+		heightRatio: 0.86,
+	});
+}
 
 export interface OAuthDialogDriver {
 	readonly signal: AbortSignal;
@@ -27,6 +48,20 @@ interface StoredOAuthLoginResult {
 	isBackupCredential: boolean;
 	credentialIds: string[];
 }
+
+interface OAuthSelectOption {
+	id: string;
+	label: string;
+}
+
+interface OAuthSelectPrompt {
+	message: string;
+	options: OAuthSelectOption[];
+}
+
+type OAuthLoginCallbacksWithSelect = OAuthLoginCallbacks & {
+	onSelect?: (prompt: OAuthSelectPrompt) => Promise<string | undefined>;
+};
 
 type OAuthDialogResult =
 	| {
@@ -52,13 +87,33 @@ function requireOAuthInput(value: string, message: string): string {
 	throw new Error(message);
 }
 
+function formatSelectPrompt(message: string, options: OAuthSelectOption[]): string {
+	const optionLines = options.map((option) => `- ${option.id}: ${option.label}`);
+	return [message, "Enter one option id:", ...optionLines].join("\n");
+}
+
+function resolveSelectedOption(
+	input: string,
+	options: OAuthSelectOption[],
+): string | undefined {
+	const normalized = input.trim().toLowerCase();
+	if (!normalized) {
+		return undefined;
+	}
+	return options.find(
+		(option) =>
+			option.id.toLowerCase() === normalized ||
+			option.label.toLowerCase() === normalized,
+	)?.id ?? input.trim();
+}
+
 export class OAuthDialogCallbackBridge {
 	private hasShownWaitingState = false;
 
 	constructor(private readonly dialog: OAuthDialogDriver) {}
 
 	createCallbacks(): OAuthLoginCallbacks {
-		return {
+		const callbacks: OAuthLoginCallbacksWithSelect = {
 			signal: this.dialog.signal,
 			onAuth: ({ url, instructions }) => {
 				this.hasShownWaitingState = false;
@@ -92,7 +147,16 @@ export class OAuthDialogCallbackBridge {
 					"Authorization code or callback URL is required to continue login.",
 				);
 			},
+			onSelect: async ({ message, options }) => {
+				this.hasShownWaitingState = false;
+				const value = await this.dialog.showPrompt(
+					formatSelectPrompt(message, options),
+					options[0]?.id,
+				);
+				return resolveSelectedOption(value, options);
+			},
 		};
+		return callbacks;
 	}
 }
 
@@ -126,6 +190,7 @@ export async function runOAuthLoginDialog(
 	accountManager: AccountManager,
 	provider: SupportedProviderId,
 ): Promise<{ message: string; credentialId: string }> {
+	const overlayOptions = resolveOAuthLoginRuntimeOverlayOptions();
 	const dialogResult = await ctx.ui.custom<OAuthDialogResult>(
 		async (tui, _theme, _keybindings, done) => {
 			let settled = false;
@@ -171,7 +236,7 @@ export async function runOAuthLoginDialog(
 		},
 		{
 			overlay: true,
-			overlayOptions: OAUTH_LOGIN_OVERLAY_OPTIONS,
+			overlayOptions,
 		},
 	);
 

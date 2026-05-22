@@ -1,3 +1,8 @@
+import {
+	parseRetryAfterCooldownMs,
+	TRANSIENT_COOLDOWN_BASE_MS,
+	TRANSIENT_COOLDOWN_MAX_MS,
+} from "./balancer/credential-backoff.js";
 import { quotaClassifier } from "./quota-classifier.js";
 import type { QuotaClassification, QuotaWindow, RecoveryAction } from "./types-quota.js";
 
@@ -68,6 +73,12 @@ const ORGANIZATION_DISABLED_PATTERNS: RegExp[] = [
 	/organization has been disabled/i,
 	/organization[^\n]*disabled/i,
 	/invalid_request_error[^\n]*organization/i,
+	// Workspace/account-level deactivation surfaced by providers such as OpenAI Codex
+	// (`{"detail":{"code":"deactivated_workspace"}}`). Same recovery semantics as an
+	// administratively disabled organization: requires manual reactivation by the user.
+	/\bdeactivated[_\s-]?workspace\b/i,
+	/\bworkspace[_\s-]?deactivated\b/i,
+	/\bworkspace[^\n]*disabled\b/i,
 ];
 
 const PERMISSION_PATTERNS: RegExp[] = [
@@ -110,6 +121,7 @@ const QUOTA_PATTERNS: RegExp[] = [
 	/exceeded your current quota/i,
 	/quota exceeded/i,
 	/usage limit/i,
+	/you\s+have\s+reached\s+(?:(?:your|the)\s+)?(?:usage\s+)?limit/i,
 	/credit balance/i,
 	/out of credits?/i,
 	/monthly (?:spend|usage) limit/i,
@@ -133,6 +145,13 @@ const QUOTA_PATTERNS: RegExp[] = [
  * Examples: "outstanding_balance", "insufficient balance", "no credits remaining"
  */
 const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
+	/\bHTTP\s+402\b/i,
+	/\b402\b[^\n]*(?:payment|required|verification|top\s*up)/i,
+	/payment[_\s-]?required/i,
+	/requires?[^\n.]*verification/i,
+	/account[^\n.]*requires?[^\n.]*verification/i,
+	/verify[^\n.]*(?:phone|phone\s+number)/i,
+	/top\s*up/i,
 	/outstanding[_\s-]?balance/i,
 	/balance[_\s-]?too[_\s-]?low/i,
 	/insufficient[_\s-]?balance/i,
@@ -144,6 +163,9 @@ const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
 	/balance[_\s-]?depleted/i,
 	/please[_\s-]?add[_\s-]?credits/i,
 	/please[_\s-]?add[_\s-]?funds/i,
+	/insufficient[_\s-]?tokens/i,
+	/purchase[_\s-]?more[_\s-]?tokens/i,
+	/INSUFFICIENT_TOKENS/,
 ];
 
 /**
@@ -165,7 +187,12 @@ const REQUEST_TIMEOUT_PATTERNS: RegExp[] = [
 	/multi-auth stream timeout/i,
 	/\b(?:attempt|idle)_timeout\b/i,
 	/stream timed out/i,
+	/Kiro request timed out after \d+ms\.?/i,
 	/request timed out/i,
+];
+
+const TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS: RegExp[] = [
+	/400\s+(?:<|&lt;)html(?:>|&gt;)[\s\S]*(?:<|&lt;)title(?:>|&gt;)400\s+Bad Request(?:<\/|&lt;\/)title(?:>|&gt;)[\s\S]*(?:<|&lt;)center(?:>|&gt;)\s*alb\s*(?:<\/|&lt;\/)center(?:>|&gt;)/i,
 ];
 
 /**
@@ -182,6 +209,7 @@ const CANCELLATION_PATTERNS: RegExp[] = [
 ];
 
 const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
+	...TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS,
 	/\b5\d\d\b/i,
 	/internal[_\s-]?server[_\s-]?error/i,
 	/internal_server_error/i,
@@ -190,7 +218,9 @@ const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/gateway timeout/i,
 	/upstream[^\n]*(?:timeout|error|failed|unavailable)/i,
 	/temporar(?:y|ily) unavailable/i,
-	/please try again later/i,
+	/high traffic/i,
+	/Multi-auth rotation failed[\s\S]*Provider:\s*kiro\b[\s\S]*Reason:\s*I am experiencing high traffic,\s*please try again shortly\.?/i,
+	/please try again (?:later|shortly)/i,
 	/timeout/i,
 	/timed out/i,
 	/ECONNRESET/i,
@@ -202,6 +232,7 @@ const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/ended (?:before|without) completion/i,
 	/without completion event/i,
 	/stream ended unexpectedly/i,
+	/stream returned an error/i,
 	// Ollama model lifecycle/runner patterns
 	/model\s+(?:is\s+)?not\s+loaded/i,
 	/failed\s+to\s+load\s+model/i,
@@ -220,6 +251,24 @@ const CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS: RegExp[] = [
 	/(?:do not|don't|does not|doesn't) have access[^\n]*(?:model|gpt)/i,
 	/(?:account|plan|subscription)[^\n]*(?:cannot|can't|does not|doesn't|not allowed|not permitted)[^\n]*(?:access|use)/i,
 	/requires[^\n]*(?:plus|pro|team|business|enterprise|paid)/i,
+];
+
+const KIRO_CREDENTIAL_MODEL_ACCESS_PATTERNS: RegExp[] = [
+	/^invalid model\. please select a different model to continue\.?$/i,
+	/model[^\n]*(?:not found|not supported|not available|not enabled|invalid)/i,
+	/(?:do not|don't|does not|doesn't) have access[^\n]*(?:model|claude|opus|sonnet)/i,
+	/(?:account|plan|subscription)[^\n]*(?:cannot|can't|does not|doesn't|not allowed|not permitted)[^\n]*(?:access|use)/i,
+	/requires[^\n]*(?:pro|paid|upgrade|subscription)/i,
+];
+
+const BLAZEAPI_CREDENTIAL_MODEL_ACCESS_PATTERNS: RegExp[] = [
+	/model[^\n]*(?:only available to paid users|paid users only|requires a paid plan|requires paid)/i,
+	/(?:account|plan)[^\n]*(?:cannot|can't|does not|doesn't|not allowed|not permitted)[^\n]*(?:access|use)[^\n]*(?:model|claude|opus|sonnet)/i,
+	/paid[_\s-]?plan[_\s-]?required/i,
+];
+
+const BLAZEAPI_SELECTED_PROVIDER_FAILED_HTTP_400_PATTERNS: RegExp[] = [
+	/the selected provider failed this request\s*\(HTTP\s*400\)/i,
 ];
 
 function matchesAny(message: string, patterns: readonly RegExp[]): boolean {
@@ -241,12 +290,20 @@ function withQuotaClassification(
 	}
 
 	const quotaResult = quotaClassifier.classifyFromMessage(message);
+	const retryAfterCooldownMs = parseRetryAfterCooldownMs(message);
+	const recommendedCooldownMs =
+		classification.kind === "rate_limit" && quotaResult.classification === "unknown"
+			? Math.min(retryAfterCooldownMs ?? TRANSIENT_COOLDOWN_BASE_MS, TRANSIENT_COOLDOWN_MAX_MS)
+			: quotaResult.cooldownMs;
 	return {
 		...classification,
 		quotaClassification: quotaResult.classification,
 		quotaWindow: quotaResult.window,
-		recommendedCooldownMs: quotaResult.cooldownMs,
-		recoveryAction: quotaResult.recoveryAction,
+		recommendedCooldownMs,
+		recoveryAction: {
+			...quotaResult.recoveryAction,
+			estimatedWaitMs: recommendedCooldownMs,
+		},
 	};
 }
 
@@ -259,11 +316,23 @@ export function isCredentialModelIncompatibilityError(
 	const rawModelId = (context?.modelId ?? "").trim().toLowerCase();
 	const separatorIndex = rawModelId.indexOf("/");
 	const modelId = separatorIndex >= 0 ? rawModelId.slice(separatorIndex + 1).trim() : rawModelId;
-	if (!message || providerId !== "openai-codex" || !modelId.startsWith("gpt-")) {
+	if (!message) {
 		return false;
 	}
 
-	return matchesAny(message, CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+	if (providerId === "openai-codex" && modelId.startsWith("gpt-")) {
+		return matchesAny(message, CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+	}
+
+	if (providerId === "kiro" && modelId.startsWith("claude-")) {
+		return matchesAny(message, KIRO_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+	}
+
+	if (providerId === "blazeapi") {
+		return matchesAny(message, BLAZEAPI_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+	}
+
+	return false;
 }
 
 export function isRetryableModelAvailabilityError(
@@ -377,7 +446,32 @@ export function classifyCredentialError(
 			shouldRetrySameCredential: false,
 			shouldApplyCooldown: false,
 			shouldDisableCredential: false,
-			reason: "Provider reported the requested model is unavailable on this vivgrid credential",
+			reason: "Provider reported the requested model is unavailable on this credential",
+		};
+	}
+
+	if (
+		(context?.providerId ?? "").trim().toLowerCase() === "blazeapi" &&
+		matchesAny(message, BLAZEAPI_SELECTED_PROVIDER_FAILED_HTTP_400_PATTERNS)
+	) {
+		return {
+			kind: "provider_transient",
+			shouldRotateCredential: false,
+			shouldRetrySameCredential: true,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: false,
+			reason: "BlazeAPI upstream route returned a transient provider HTTP 400",
+		};
+	}
+
+	if (matchesAny(message, TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS)) {
+		return {
+			kind: "provider_transient",
+			shouldRotateCredential: true,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: false,
+			reason: "Transient provider gateway 400 response detected",
 		};
 	}
 

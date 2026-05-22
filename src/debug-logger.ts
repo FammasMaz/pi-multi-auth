@@ -14,9 +14,19 @@ export interface MultiAuthDebugLoggerOptions {
 	logPath?: string;
 }
 
+/**
+ * Matches JSON keys that likely contain secret material.
+ * Covers: tokens, secrets, passwords, authorization headers, API keys, and OAuth access/refresh fields.
+ */
+const SENSITIVE_KEY_PATTERN = /(?:token|secret|password|authorization|key$|^(?:access|refresh)$)/i;
+
 function safeJsonStringify(value: unknown): string {
 	const seen = new WeakSet<object>();
-	return JSON.stringify(value, (_key, currentValue) => {
+	return JSON.stringify(value, (key, currentValue) => {
+		if (key !== "" && SENSITIVE_KEY_PATTERN.test(key)) {
+			return "[REDACTED]";
+		}
+
 		if (currentValue instanceof Error) {
 			return {
 				name: currentValue.name,
@@ -89,6 +99,10 @@ export class MultiAuthDebugLogger {
 
 	flush(): Promise<void> {
 		return this.writer.flush();
+	}
+
+	dispose(): Promise<void> {
+		return this.writer.dispose();
 	}
 }
 

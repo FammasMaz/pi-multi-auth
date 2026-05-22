@@ -42,6 +42,12 @@ const MESSAGE_PATTERNS: Record<QuotaClassification, RegExp[]> = {
 		/reset.?next.?month/i,
 	],
 	balance: [
+		/\bHTTP\s+402\b/i,
+		/\b402\b[^\n]*(?:payment|required|verification|top\s*up)/i,
+		/requires?[^\n.]*verification/i,
+		/account[^\n.]*requires?[^\n.]*verification/i,
+		/verify[^\n.]*(?:phone|phone\s+number)/i,
+		/top\s*up/i,
 		/outstanding.?balance/i,
 		/insufficient.?balance/i,
 		/no.?credits?/i,
@@ -50,6 +56,10 @@ const MESSAGE_PATTERNS: Record<QuotaClassification, RegExp[]> = {
 		/payment.?required/i,
 	],
 	organization: [
+		/this organization has been disabled/i,
+		/organization has been disabled/i,
+		/organization[^\n.]*disabled/i,
+		/invalid_request_error[^\n.]*organization/i,
 		/organization.?disabled/i,
 		/organization.?restricted/i,
 		/account.?suspended/i,

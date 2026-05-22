@@ -1,5 +1,12 @@
-import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, type OverlayOptions } from "@earendil-works/pi-tui";
+import {
+	RESPONSIVE_MODAL_DEFAULT_SCALE,
+	resolveBodyRowBudget,
+	resolveResponsiveOverlayOptions,
+	resolveResponsiveOverlayRuntimeOptions,
+	type ModalOverlayOptions,
+} from "./formatters/responsive-modal.js";
 import { renderZellijFrameWithRenderer } from "./formatters/zellij-frame.js";
 import type { SupportedProviderId } from "./types.js";
 
@@ -29,8 +36,9 @@ type ProviderConfigurationPane = "configured" | "available";
 type ProviderConfigurationResult = { provider: SupportedProviderId } | null;
 
 const DIALOG_MIN_SPLIT_WIDTH = 72;
-const DIALOG_BODY_ROWS = 18;
-const DIALOG_MIN_BODY_ROWS = 8;
+const DIALOG_BODY_ROWS = Math.ceil(18 * RESPONSIVE_MODAL_DEFAULT_SCALE);
+const DIALOG_MIN_BODY_ROWS = 3;
+const FRAME_BORDER_ROWS = 2;
 const COLUMN_GAP = 4;
 const SEARCH_FIELD_WIDTH = 24;
 
@@ -72,16 +80,59 @@ function isTextInput(data: string): boolean {
 	return data.length === 1 && data >= " " && data !== "\x7f";
 }
 
-function getTerminalBodyRows(): number {
-	const rows = process.stdout.rows;
-	if (typeof rows !== "number" || !Number.isFinite(rows) || rows <= 0) {
-		return DIALOG_BODY_ROWS;
-	}
-	return Math.max(DIALOG_MIN_BODY_ROWS, Math.min(DIALOG_BODY_ROWS, rows - 12));
+export function resolveProviderConfigurationOverlayOptions(
+	terminal?: { terminalColumns?: number | null; terminalRows?: number | null },
+): ModalOverlayOptions {
+	return resolveResponsiveOverlayOptions({
+		...terminal,
+		minimumWidth: 48,
+		maximumWidth: Math.ceil(120 * RESPONSIVE_MODAL_DEFAULT_SCALE),
+		minimumHeight: 14,
+		widthRatio: 0.92,
+		heightRatio: 0.88,
+	});
+}
+
+export function resolveProviderConfigurationRuntimeOverlayOptions(): OverlayOptions {
+	return resolveResponsiveOverlayRuntimeOptions({
+		minimumWidth: 48,
+		widthRatio: 0.92,
+		heightRatio: 0.88,
+	});
+}
+
+export function resolveProviderConfigurationContentRows(
+	overlayOptions: Pick<ModalOverlayOptions, "maxHeight">,
+): number {
+	return Math.max(1, overlayOptions.maxHeight - FRAME_BORDER_ROWS);
+}
+
+function resolveSplitBodyRows(maxContentRows: number | null): number {
+	return resolveBodyRowBudget({
+		defaultRows: DIALOG_BODY_ROWS,
+		terminalRows: maxContentRows,
+		reservedRows: 8,
+		minimumRows: DIALOG_MIN_BODY_ROWS,
+		fitAvailableRows: true,
+	});
+}
+
+function resolveStackedBodyRows(maxContentRows: number | null): number {
+	const combinedBodyRows = resolveBodyRowBudget({
+		defaultRows: DIALOG_BODY_ROWS * 2,
+		terminalRows: maxContentRows,
+		reservedRows: 10,
+		minimumRows: DIALOG_MIN_BODY_ROWS * 2,
+		fitAvailableRows: true,
+	});
+	return Math.max(0, Math.floor(combinedBodyRows / 2));
 }
 
 function getScrollableSlice<T>(items: readonly T[], selectedIndex: number, visibleRows: number): readonly T[] {
-	if (visibleRows <= 0 || items.length <= visibleRows) {
+	if (visibleRows <= 0) {
+		return [];
+	}
+	if (items.length <= visibleRows) {
 		return items;
 	}
 	const clampedSelection = Math.max(0, Math.min(items.length - 1, selectedIndex));
@@ -101,6 +152,7 @@ class ProviderConfigurationDialog {
 		private readonly options: ProviderConfigurationDialogOptions,
 		private readonly theme: ThemeLike,
 		private readonly done: (result: ProviderConfigurationResult) => void,
+		private readonly resolveMaxContentRows: () => number | null,
 	) {
 		this.initializeSelection();
 	}
@@ -183,7 +235,7 @@ class ProviderConfigurationDialog {
 		const gap = " ".repeat(COLUMN_GAP);
 		const columnWidth = Math.floor((width - COLUMN_GAP) / 2);
 		const rightWidth = width - COLUMN_GAP - columnWidth;
-		const bodyRows = getTerminalBodyRows();
+		const bodyRows = resolveSplitBodyRows(this.resolveMaxContentRows());
 		const lines = [
 			this.renderTitle(width),
 			divider(width),
@@ -201,7 +253,7 @@ class ProviderConfigurationDialog {
 	}
 
 	private renderStacked(width: number): string[] {
-		const bodyRows = Math.max(DIALOG_MIN_BODY_ROWS, Math.floor(getTerminalBodyRows() / 2));
+		const bodyRows = resolveStackedBodyRows(this.resolveMaxContentRows());
 		return [
 			this.renderTitle(width),
 			divider(width),
@@ -242,6 +294,9 @@ class ProviderConfigurationDialog {
 	}
 
 	private buildConfiguredRows(width: number, visibleRows: number): string[] {
+		if (visibleRows <= 0) {
+			return [];
+		}
 		const options = this.getConfiguredOptions();
 		if (options.length === 0) {
 			return [fit("  No configured credentials yet.", width)];
@@ -261,6 +316,9 @@ class ProviderConfigurationDialog {
 	}
 
 	private buildAvailableRows(width: number, visibleRows: number): string[] {
+		if (visibleRows <= 0) {
+			return [];
+		}
 		const options = this.getAvailableOptions();
 		if (options.length === 0) {
 			const message = this.searchQuery.trim()
@@ -377,9 +435,13 @@ export async function runProviderConfigurationDialog(
 	ctx: ExtensionCommandContext,
 	options: ProviderConfigurationDialogOptions,
 ): Promise<SupportedProviderId | null> {
+	const overlayOptions = resolveProviderConfigurationRuntimeOverlayOptions();
+	const resolveMaxContentRows = (): number => resolveProviderConfigurationContentRows(
+		resolveProviderConfigurationOverlayOptions(),
+	);
 	const result = await ctx.ui.custom<ProviderConfigurationResult>(
 		(tui, theme, _keybindings, done) => {
-			const dialog = new ProviderConfigurationDialog(options, theme, done);
+			const dialog = new ProviderConfigurationDialog(options, theme, done, resolveMaxContentRows);
 			return {
 				render(width: number): string[] {
 					const framed = renderZellijFrameWithRenderer(width, theme, {
@@ -399,12 +461,7 @@ export async function runProviderConfigurationDialog(
 		},
 		{
 			overlay: true,
-			overlayOptions: {
-				anchor: "center" as const,
-				width: "96%" as const,
-				maxHeight: "92%" as const,
-				margin: 0,
-			},
+			overlayOptions,
 		},
 	);
 	return result?.provider ?? null;

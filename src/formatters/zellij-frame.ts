@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { resolveBorderGlyphs, type BorderGlyphSet } from "./charset.js";
 import { normalizeInlineText } from "./multi-auth-display.js";
 

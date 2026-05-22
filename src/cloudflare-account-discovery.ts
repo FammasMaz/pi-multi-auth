@@ -1,7 +1,9 @@
+import { runWithTimeoutSignal } from "./async-utils.js";
 import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import { buildCloudflareWorkersAiBaseUrl } from "./credential-request-overrides.js";
 
 const CLOUDFLARE_ACCOUNTS_URL = "https://api.cloudflare.com/client/v4/accounts";
+const CLOUDFLARE_ACCOUNT_DISCOVERY_TIMEOUT_MS = 3_000;
 
 interface CloudflareApiError {
 	code?: number;
@@ -105,17 +107,27 @@ async function readCloudflareJsonResponse(response: Response): Promise<Cloudflar
 
 export async function discoverCloudflareWorkersAiBaseUrl(
 	apiToken: string,
-	options?: { signal?: AbortSignal },
+	options?: { signal?: AbortSignal; timeoutMs?: number },
 ): Promise<string> {
-	const response = await fetch(CLOUDFLARE_ACCOUNTS_URL, {
-		method: "GET",
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${apiToken}`,
+	const timeoutMs = options?.timeoutMs ?? CLOUDFLARE_ACCOUNT_DISCOVERY_TIMEOUT_MS;
+	const { response, payload } = await runWithTimeoutSignal(
+		async (signal) => {
+			const response = await fetch(CLOUDFLARE_ACCOUNTS_URL, {
+				method: "GET",
+				headers: {
+					Accept: "application/json",
+					Authorization: `Bearer ${apiToken}`,
+				},
+				signal,
+			});
+			return { response, payload: await readCloudflareJsonResponse(response) };
 		},
-		signal: options?.signal,
-	});
-	const payload = await readCloudflareJsonResponse(response);
+		{
+			signal: options?.signal,
+			timeoutMs,
+			timeoutMessage: `Cloudflare account discovery timed out after ${timeoutMs}ms`,
+		},
+	);
 
 	if (!response.ok || payload.success !== true) {
 		throw new Error(

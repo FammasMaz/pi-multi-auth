@@ -52,13 +52,13 @@ export interface MultiAuthConfigLoadResult {
 }
 
 export const DEFAULT_HISTORY_PERSISTENCE_CONFIG: HistoryPersistenceConfig = {
-	enabled: true,
+	enabled: false,
 	healthFileName: `${MULTI_AUTH_EXTENSION_ID}-health-history.json`,
 	cascadeFileName: `${MULTI_AUTH_EXTENSION_ID}-cascade-history.json`,
 };
 
 export const DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG: CodexModelEntitlementConfig = {
-	usageLookupFailureMode: "allow-unverified",
+	usageLookupFailureMode: "strict",
 };
 
 export const DEFAULT_MODEL_ENTITLEMENT_CONFIG: ModelEntitlementConfig = {

@@ -26,6 +26,7 @@ export function cloneProviderState(state: ProviderRotationState): ProviderRotati
 		chains: state.chains ? cloneJson(state.chains) : undefined,
 		activeChain: state.activeChain ? cloneJson(state.activeChain) : undefined,
 		quotaStates: state.quotaStates ? cloneJson(state.quotaStates) : undefined,
+		quotaDrainStates: state.quotaDrainStates ? cloneJson(state.quotaDrainStates) : undefined,
 		modelIncompatibilities: state.modelIncompatibilities
 			? cloneJson(state.modelIncompatibilities)
 			: undefined,

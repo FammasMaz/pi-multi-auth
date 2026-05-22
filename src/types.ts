@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import type { ProviderCascadeState } from "./types-cascade.js";
 import type { FailoverChain, FailoverChainState } from "./types-failover.js";
@@ -58,6 +58,13 @@ export interface ModelCredentialIncompatibilityState {
 	error: string;
 }
 
+export interface QuotaDrainStateForCredential {
+	draining: boolean;
+	enteredAt?: number;
+	lastUsedPercent?: number;
+	updatedAt: number;
+}
+
 /** Per-provider rotation state persisted in multi-auth.json. */
 export interface ProviderRotationState {
 	credentialIds: string[];
@@ -100,6 +107,8 @@ export interface ProviderRotationState {
 	activeChain?: FailoverChainState;
 	/** Richer quota classifications keyed by credential ID. */
 	quotaStates?: Record<string, QuotaStateForCredential>;
+	/** Persisted balancer quota-draining hysteresis state keyed by credential ID. */
+	quotaDrainStates?: Record<string, QuotaDrainStateForCredential>;
 	/** Temporary per-model credential incompatibilities keyed by credential ID then normalized model ID. */
 	modelIncompatibilities?: Record<string, Record<string, ModelCredentialIncompatibilityState>>;
 }
@@ -134,6 +143,10 @@ export interface CredentialStatus {
 	credentialType: CredentialType;
 	redactedSecret: string;
 	friendlyName?: string;
+	/** Stable identity email extracted from OAuth claims/user profile when available. */
+	identityEmail?: string;
+	/** Stable plan label extracted from OAuth claims when usage data is unavailable. */
+	identityPlanType?: string;
 	index: number;
 	isActive: boolean;
 	isManualActive?: boolean;

@@ -1,15 +1,18 @@
-import { constants as fsConstants } from "node:fs";
-import { sleep } from "./async-utils.js";
-import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, writeFile } from "node:fs/promises";
 import {
 	getErrorMessage,
 	isRecord,
-	toError,
 } from "./auth-error-utils.js";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
+import {
+	acquireFileLock,
+	ensureFileExists,
+	ensureParentDir,
+	hardenCredentialFilePermissions,
+	pathExists,
+} from "./file-utils.js";
 import {
 	isRetryableFileAccessError,
 	readTextSnapshotWithRetries,
@@ -44,157 +47,10 @@ export interface ApiKeyProviderNormalizationResult {
 	credentialIdMap: Record<string, string>;
 }
 
-type LockRetryOptions = {
-	retries: number;
-	factor: number;
-	minTimeout: number;
-	maxTimeout: number;
-	randomize: boolean;
-};
-
-type LockOptions = {
-	realpath?: boolean;
-	retries: LockRetryOptions;
-	stale: number;
-	onCompromised?: (error: Error) => void;
-};
-
-function lockDirPath(filePath: string): string {
-	return `${filePath}.lock`;
-}
-
-async function acquireFileLock(filePath: string, options: LockOptions): Promise<() => Promise<void>> {
-	const lockPath = lockDirPath(filePath);
-	const maxAttempts = Math.max(0, options.retries.retries) + 1;
-
-	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		try {
-			await mkdir(lockPath, { mode: 0o700 });
-			if (attempt > 1) {
-				multiAuthDebugLogger.log("auth_lock_acquired_after_retry", {
-					authPath: filePath,
-					lockPath,
-					attempt,
-					maxAttempts,
-				});
-			}
-			return async () => {
-				await rm(lockPath, { recursive: true, force: true });
-			};
-		} catch (error) {
-			const lockError = toError(error);
-			const maybeCode = (lockError as Error & { code?: unknown }).code;
-			const isExistingLockError = maybeCode === "EEXIST";
-			const isRetryableAccessError = isRetryableFileAccessError(lockError);
-
-			if (!isExistingLockError && !isRetryableAccessError) {
-				multiAuthDebugLogger.log("auth_lock_error", {
-					authPath: filePath,
-					lockPath,
-					attempt,
-					maxAttempts,
-					error: lockError.message,
-				});
-				throw lockError;
-			}
-
-			if (!isExistingLockError) {
-				multiAuthDebugLogger.log("auth_lock_retryable_access_error", {
-					authPath: filePath,
-					lockPath,
-					attempt,
-					maxAttempts,
-					error: lockError.message,
-				});
-			}
-
-			try {
-				const lockStats = await stat(lockPath);
-				const ageMs = Date.now() - lockStats.mtimeMs;
-				if (ageMs > options.stale) {
-					await rm(lockPath, { recursive: true, force: true });
-					multiAuthDebugLogger.log("auth_lock_removed_stale", {
-						authPath: filePath,
-						lockPath,
-						attempt,
-						maxAttempts,
-						staleMs: options.stale,
-						ageMs: Math.round(ageMs),
-					});
-					if (options.onCompromised) {
-						options.onCompromised(
-							new Error(`Removed stale lock '${lockPath}' older than ${Math.round(ageMs)}ms.`),
-						);
-					}
-					// Decrement attempt so we retry the mkdir immediately after removing stale lock
-					attempt -= 1;
-					continue;
-				}
-			} catch {
-				// Lock may be released while checking staleness; retry.
-			}
-
-			if (attempt >= maxAttempts) {
-				multiAuthDebugLogger.log("auth_lock_timeout", {
-					authPath: filePath,
-					lockPath,
-					attempt,
-					maxAttempts,
-					staleMs: options.stale,
-					error: lockError.message,
-				});
-				throw new Error(
-					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
-				);
-			}
-
-			const baseDelay = Math.min(
-				options.retries.maxTimeout,
-				Math.max(
-					options.retries.minTimeout,
-					Math.round(options.retries.minTimeout * Math.pow(options.retries.factor, attempt - 1)),
-				),
-			);
-			const delay = options.retries.randomize
-				? Math.round(baseDelay * (0.5 + Math.random()))
-				: baseDelay;
-			multiAuthDebugLogger.log("auth_lock_wait", {
-				authPath: filePath,
-				lockPath,
-				attempt,
-				maxAttempts,
-				staleMs: options.stale,
-				delayMs: delay,
-			});
-			await sleep(delay);
-		}
-	}
-
-	throw new Error(`Failed to acquire lock for '${filePath}'.`);
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-	try {
-		await access(filePath, fsConstants.F_OK);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function ensureParentDir(filePath: string): Promise<void> {
-	const parentDir = dirname(filePath);
-	if (!(await pathExists(parentDir))) {
-		await mkdir(parentDir, { recursive: true, mode: 0o700 });
-	}
-}
-
-async function ensureFileExists(filePath: string): Promise<void> {
-	if (!(await pathExists(filePath))) {
-		await writeFile(filePath, "{}", "utf-8");
-		await chmod(filePath, 0o600);
-	}
-}
+export type CredentialIdentityKeyResolver = (
+	provider: SupportedProviderId,
+	credential: StoredAuthCredential,
+) => string | undefined;
 
 function getDefaultAuthPath(): string {
 	return resolveAgentRuntimePath("auth.json");
@@ -229,7 +85,7 @@ function isRetryableSnapshotReadError(error: Error): boolean {
 
 async function readAuthDataSnapshot(authPath: string): Promise<RawAuthFileData> {
 	await ensureParentDir(authPath);
-	await ensureFileExists(authPath);
+	await ensureFileExists(authPath, "{}");
 
 	return readTextSnapshotWithRetries({
 		filePath: authPath,
@@ -276,7 +132,7 @@ async function writeAuthDataSnapshot(authPath: string, data: RawAuthFileData): P
 		failureMessage: `Failed to persist auth.json to '${authPath}'.`,
 		write: async () => {
 			await writeFile(authPath, serialized, "utf-8");
-			await chmod(authPath, 0o600);
+			await hardenCredentialFilePermissions(authPath);
 		},
 		isRetryableError: isRetryableFileAccessError,
 		onRetry: ({ attempt, maxAttempts, reason, delayMs }) => {
@@ -424,6 +280,11 @@ function maybeResolveBackupBaseProvider(
 
 function getExpectedProviderCredentialId(provider: SupportedProviderId, index: number): string {
 	return index === 0 ? provider : `${provider}-${index}`;
+}
+
+function normalizeCredentialIdentityKey(identityKey: string | undefined): string | undefined {
+	const normalized = identityKey?.trim();
+	return normalized ? normalized : undefined;
 }
 
 /**
@@ -610,6 +471,7 @@ export class AuthWriter {
 		provider: SupportedProviderId,
 		key: string,
 		request?: CredentialRequestOverrides,
+		identityKeyResolver?: CredentialIdentityKeyResolver,
 	): Promise<BackupAndStoreResult> {
 		const normalized = key.trim();
 		if (!normalized) {
@@ -620,6 +482,15 @@ export class AuthWriter {
 			const existingEntries = this.getProviderCredentialEntriesFromData(provider, data);
 			const uniqueCredentials: StoredAuthCredential[] = [];
 			const firstIndexByApiKey = new Map<string, number>();
+			const firstIndexByIdentityKey = new Map<string, number>();
+			const newCredential: StoredAuthCredential = {
+				type: "api_key",
+				key: normalized,
+				...(request && { request }),
+			};
+			const targetIdentityKey = normalizeCredentialIdentityKey(
+				identityKeyResolver?.(provider, newCredential),
+			);
 			let deduplicatedCount = 0;
 
 			for (const entry of existingEntries) {
@@ -630,35 +501,54 @@ export class AuthWriter {
 						deduplicatedCount += 1;
 						continue;
 					}
-					if (firstIndexByApiKey.has(normalizedExistingKey)) {
+					const existingIdentityKey = normalizeCredentialIdentityKey(
+						identityKeyResolver?.(provider, credential),
+					);
+					if (
+						firstIndexByApiKey.has(normalizedExistingKey) ||
+						(existingIdentityKey !== undefined && firstIndexByIdentityKey.has(existingIdentityKey))
+					) {
 						deduplicatedCount += 1;
 						continue;
 					}
 					credential.key = normalizedExistingKey;
-					firstIndexByApiKey.set(normalizedExistingKey, uniqueCredentials.length);
+					const nextIndex = uniqueCredentials.length;
+					firstIndexByApiKey.set(normalizedExistingKey, nextIndex);
+					if (existingIdentityKey !== undefined) {
+						firstIndexByIdentityKey.set(existingIdentityKey, nextIndex);
+					}
 				}
 				uniqueCredentials.push(credential);
 			}
 
-			let targetIndex = firstIndexByApiKey.get(normalized);
-			const didAddCredential = targetIndex === undefined;
-			if (didAddCredential) {
+			let targetIndex = targetIdentityKey === undefined
+				? undefined
+				: firstIndexByIdentityKey.get(targetIdentityKey);
+			targetIndex ??= firstIndexByApiKey.get(normalized);
+			let didAddCredential = false;
+			if (targetIndex === undefined) {
+				didAddCredential = true;
 				targetIndex = uniqueCredentials.length;
-				uniqueCredentials.push({
-					type: "api_key",
-					key: normalized,
-					...(request && { request }),
-				});
+				uniqueCredentials.push(newCredential);
 				firstIndexByApiKey.set(normalized, targetIndex);
-			} else if (request && targetIndex !== undefined) {
-				const existingCredential = uniqueCredentials[targetIndex];
+				if (targetIdentityKey !== undefined) {
+					firstIndexByIdentityKey.set(targetIdentityKey, targetIndex);
+				}
+			} else {
+				const existingIndex = targetIndex;
+				const existingCredential = uniqueCredentials[existingIndex];
 				if (existingCredential?.type === "api_key") {
-					uniqueCredentials[targetIndex] = {
+					uniqueCredentials[existingIndex] = {
 						...existingCredential,
-						request: {
-							...existingCredential.request,
-							...request,
-						},
+						key: normalized,
+						...(request
+							? {
+									request: {
+										...existingCredential.request,
+										...request,
+									},
+								}
+							: {}),
 					};
 				}
 			}
@@ -700,6 +590,7 @@ export class AuthWriter {
 	private normalizeProviderCredentialsFromData(
 		data: RawAuthFileData,
 		seedProviders: readonly string[] = [],
+		identityKeyResolver?: CredentialIdentityKeyResolver,
 	): {
 		hasChanges: boolean;
 		next: RawAuthFileData;
@@ -722,6 +613,7 @@ export class AuthWriter {
 				credential: StoredAuthCredential;
 			}> = [];
 			const seenApiKeys = new Set<string>();
+			const seenIdentityKeys = new Set<string>();
 			let removedDuplicateCount = 0;
 
 			for (const entry of entries) {
@@ -732,12 +624,21 @@ export class AuthWriter {
 						removedDuplicateCount += 1;
 						continue;
 					}
-					if (seenApiKeys.has(normalizedKey)) {
+					const identityKey = normalizeCredentialIdentityKey(
+						identityKeyResolver?.(provider, credential),
+					);
+					if (
+						seenApiKeys.has(normalizedKey) ||
+						(identityKey !== undefined && seenIdentityKeys.has(identityKey))
+					) {
 						removedDuplicateCount += 1;
 						continue;
 					}
 					credential.key = normalizedKey;
 					seenApiKeys.add(normalizedKey);
+					if (identityKey !== undefined) {
+						seenIdentityKeys.add(identityKey);
+					}
 				}
 				retainedEntries.push({
 					credentialId: entry.credentialId,
@@ -792,15 +693,24 @@ export class AuthWriter {
 	 */
 	async normalizeProviderCredentials(
 		seedProviders: readonly string[] = [],
+		options: { identityKeyResolver?: CredentialIdentityKeyResolver } = {},
 	): Promise<ApiKeyProviderNormalizationResult[]> {
 		const snapshot = await this.readSnapshot();
-		const analyzedSnapshot = this.normalizeProviderCredentialsFromData(snapshot, seedProviders);
+		const analyzedSnapshot = this.normalizeProviderCredentialsFromData(
+			snapshot,
+			seedProviders,
+			options.identityKeyResolver,
+		);
 		if (!analyzedSnapshot.hasChanges) {
 			return analyzedSnapshot.changedProviders;
 		}
 
 		return this.withLock((data) => {
-			const normalized = this.normalizeProviderCredentialsFromData(data, seedProviders);
+			const normalized = this.normalizeProviderCredentialsFromData(
+				data,
+				seedProviders,
+				options.identityKeyResolver,
+			);
 			return normalized.hasChanges
 				? { result: normalized.changedProviders, next: normalized.next }
 				: { result: normalized.changedProviders };
@@ -833,25 +743,88 @@ export class AuthWriter {
 		fn: (data: RawAuthFileData) => Promise<LockResult<T>> | LockResult<T>,
 	): Promise<T> {
 		await ensureParentDir(this.authPath);
-		await ensureFileExists(this.authPath);
+		await ensureFileExists(this.authPath, "{}");
 
 		let release: (() => Promise<void>) | undefined;
 
 		try {
-			release = await acquireFileLock(this.authPath, {
-				realpath: false,
-				retries: {
-					retries: 10,
-					factor: 2,
-					minTimeout: 100,
-					maxTimeout: 10_000,
-					randomize: true,
+			release = await acquireFileLock(
+				this.authPath,
+				{
+					realpath: false,
+					retries: {
+						retries: 10,
+						factor: 2,
+						minTimeout: 100,
+						maxTimeout: 10_000,
+						randomize: true,
+					},
+					stale: 30_000,
+					onCompromised: () => {
+						// Stale lock cleanup happened; continue transaction under the new lock.
+					},
 				},
-				stale: 30_000,
-				onCompromised: () => {
-					// Stale lock cleanup happened; continue transaction under the new lock.
+				{
+					onAcquired: (_latencyMs, details) => {
+						if (details.attempt > 1) {
+							multiAuthDebugLogger.log("auth_lock_acquired_after_retry", {
+								authPath: details.filePath,
+								lockPath: details.lockPath,
+								attempt: details.attempt,
+								maxAttempts: details.maxAttempts,
+							});
+						}
+					},
+					onError: (details) => {
+						multiAuthDebugLogger.log("auth_lock_error", {
+							authPath: details.filePath,
+							lockPath: details.lockPath,
+							attempt: details.attempt,
+							maxAttempts: details.maxAttempts,
+							error: details.error,
+						});
+					},
+					onRetryableAccessError: (details) => {
+						multiAuthDebugLogger.log("auth_lock_retryable_access_error", {
+							authPath: details.filePath,
+							lockPath: details.lockPath,
+							attempt: details.attempt,
+							maxAttempts: details.maxAttempts,
+							error: details.error,
+						});
+					},
+					onStaleLockRemoved: (details) => {
+						multiAuthDebugLogger.log("auth_lock_removed_stale", {
+							authPath: details.filePath,
+							lockPath: details.lockPath,
+							attempt: details.attempt,
+							maxAttempts: details.maxAttempts,
+							staleMs: details.staleMs,
+							ageMs: details.ageMs,
+						});
+					},
+					onTimeout: (details) => {
+						multiAuthDebugLogger.log("auth_lock_timeout", {
+							authPath: details.filePath,
+							lockPath: details.lockPath,
+							attempt: details.attempt,
+							maxAttempts: details.maxAttempts,
+							staleMs: details.staleMs,
+							error: details.error,
+						});
+					},
+					onRetry: (delayMs, details) => {
+						multiAuthDebugLogger.log("auth_lock_wait", {
+							authPath: details.filePath,
+							lockPath: details.lockPath,
+							attempt: details.attempt,
+							maxAttempts: details.maxAttempts,
+							staleMs: details.staleMs,
+							delayMs,
+						});
+					},
 				},
-			});
+			);
 
 			const parsed = await readAuthDataSnapshot(this.authPath);
 			const lockResult = await fn(cloneAuthData(parsed));
