@@ -1,5 +1,6 @@
 import type {
 	BalancerCredentialState,
+	BalancerUsageSnapshot,
 	CredentialLease,
 	KeyDistributorConfig,
 	SelectionContext,
@@ -7,6 +8,9 @@ import type {
 
 const DEFAULT_TOLERANCE = 2.0;
 const MIN_WEIGHT = Number.EPSILON;
+const DRAINING_ENTER_USED_PERCENT = 85;
+const EXHAUSTED_USED_PERCENT = 99;
+const DRAINING_WEIGHT_FACTOR = 0.1;
 
 /**
  * Runtime shape used by `calculateWeight` for one credential.
@@ -16,6 +20,8 @@ export interface WeightedCredentialState {
 	usageCount: number;
 	activeRequests: number;
 	healthScore: number;
+	quotaUsageFactor?: number;
+	isQuotaExhausted?: boolean;
 }
 
 /**
@@ -26,6 +32,7 @@ export interface WeightedSelectorStates {
 	usageCount: Readonly<Record<string, number>>;
 	balancerState: Readonly<BalancerCredentialState>;
 	leasesByCredentialId?: Readonly<Record<string, CredentialLease | undefined>>;
+	usageSnapshots?: Readonly<Record<string, BalancerUsageSnapshot | undefined>>;
 }
 
 /**
@@ -56,12 +63,16 @@ export function calculateWeight(
 		: DEFAULT_TOLERANCE;
 	const normalizedHealthScore = clampHealthScore(state.healthScore);
 
+	const quotaUsageFactor = clampQuotaUsageFactor(state.quotaUsageFactor);
 	const baseWeight = safeMaxUsage - usageCount + safeTolerance + 1;
 	const clampedBaseWeight = Math.max(MIN_WEIGHT, baseWeight);
 	const concurrencyPenaltyFactor = 1 / (activeRequests + 1);
 	const healthWeightFactor = normalizedHealthScore <= 0 ? 0 : normalizedHealthScore;
 
-	return Math.max(0, clampedBaseWeight * concurrencyPenaltyFactor * healthWeightFactor);
+	return Math.max(
+		0,
+		clampedBaseWeight * concurrencyPenaltyFactor * healthWeightFactor * quotaUsageFactor,
+	);
 }
 
 /**
@@ -151,6 +162,8 @@ export function selectBestCredential(
 			continue;
 		}
 
+		const usageSnapshot = states.usageSnapshots?.[credentialId];
+		const isQuotaExhausted = isUsageSnapshotExhausted(usageSnapshot);
 		const usageCount = toNonNegativeNumber(states.usageCount[credentialId]);
 		maxUsage = Math.max(maxUsage, usageCount);
 		eligibleCredentials.push({
@@ -158,6 +171,11 @@ export function selectBestCredential(
 			usageCount,
 			activeRequests,
 			healthScore: states.balancerState.healthScores?.[credentialId] ?? 1,
+			quotaUsageFactor: resolveQuotaUsageFactor(
+				usageSnapshot,
+				states.balancerState.quotaDrainStates?.[credentialId]?.draining === true,
+			),
+			isQuotaExhausted,
 		});
 	}
 
@@ -165,8 +183,12 @@ export function selectBestCredential(
 		return null;
 	}
 
+	const selectableCredentials = eligibleCredentials.some((credential) => !credential.isQuotaExhausted)
+		? eligibleCredentials.filter((credential) => !credential.isQuotaExhausted)
+		: eligibleCredentials;
+
 	let totalWeight = 0;
-	for (const credential of eligibleCredentials) {
+	for (const credential of selectableCredentials) {
 		totalWeight += calculateWeight(credential, maxUsage, tolerance);
 	}
 	if (totalWeight <= 0) {
@@ -175,7 +197,7 @@ export function selectBestCredential(
 
 	let target = Math.random() * totalWeight;
 	let lastEligibleCredentialId: string | null = null;
-	for (const credential of eligibleCredentials) {
+	for (const credential of selectableCredentials) {
 		const weight = calculateWeight(credential, maxUsage, tolerance);
 		if (weight <= 0) {
 			continue;
@@ -203,6 +225,38 @@ function clampHealthScore(value: number | undefined): number {
 		return 1;
 	}
 	return Math.max(0, Math.min(1, value));
+}
+
+function clampQuotaUsageFactor(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value)) {
+		return 1;
+	}
+	return Math.max(0, Math.min(1, value));
+}
+
+function isUsageSnapshotExhausted(usage: BalancerUsageSnapshot | undefined): boolean {
+	if (!usage) {
+		return false;
+	}
+	return usage.quotaState.state === "exhausted" ||
+		(usage.usedPercent !== null && usage.usedPercent >= EXHAUSTED_USED_PERCENT);
+}
+
+function resolveQuotaUsageFactor(
+	usage: BalancerUsageSnapshot | undefined,
+	isDraining: boolean,
+	): number {
+	if (isUsageSnapshotExhausted(usage)) {
+		return DRAINING_WEIGHT_FACTOR;
+	}
+	const usedPercent = usage?.usedPercent;
+	if (
+		isDraining ||
+		(usedPercent !== undefined && usedPercent !== null && usedPercent >= DRAINING_ENTER_USED_PERCENT)
+	) {
+		return DRAINING_WEIGHT_FACTOR;
+	}
+	return 1;
 }
 
 function resolveTolerance(tolerance: number | undefined): number {
