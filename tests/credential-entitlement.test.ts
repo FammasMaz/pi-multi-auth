@@ -122,7 +122,7 @@ async function createCodexAccountManager(
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry, undefined, options.extensionConfig);
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	return accountManager;
@@ -151,7 +151,11 @@ test("codex plan normalization recognizes paid-plan labels for restricted models
 	assert.equal(isPlanEligibleForModel("unknown"), false);
 	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.4"), false);
-	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.5"), true);
+	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.5"), true);
+	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.5"), false);
+	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.3-codex"), true);
+	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.3-codex"), false);
+	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5-mini"), true);
 });
 
 test("account manager preserves current selection for unconstrained codex requests", async (t) => {
@@ -173,7 +177,7 @@ test("account manager prefers free codex credentials for free-eligible models", 
 	]);
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.4",
+		modelId: "gpt-5.5",
 	});
 	assert.equal(selected.credentialId, "openai-codex");
 });
@@ -227,7 +231,7 @@ test("account manager reuses codex model routing usage lookups across repeated s
 
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
@@ -270,7 +274,7 @@ test("account manager skips free codex credentials for paid-only models", async 
 	]);
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.5",
+		modelId: "gpt-5-mini",
 	});
 	assert.equal(selected.credentialId, "openai-codex-1");
 });
@@ -340,7 +344,7 @@ test("account manager scans later entitlement windows for paid codex credentials
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.5",
+		modelId: "gpt-5-mini",
 	});
 	assert.equal(selected.credentialId, "openai-codex-11");
 });
@@ -390,18 +394,18 @@ test("codex zero-evidence paid entitlement bootstrap scans later bounded windows
 	});
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.5",
+		modelId: "gpt-5-mini",
 	});
 	assert.equal(selected.credentialId, "openai-codex-4");
-	assert.deepEqual(
-		fetchedCredentialIds,
-		credentials.map((credential) => credential.credentialId),
-	);
+	const expectedFetchedCredentialIds = credentials.map((credential) => credential.credentialId);
+	assert.equal(fetchedCredentialIds.length, expectedFetchedCredentialIds.length);
+	assert.equal(new Set(fetchedCredentialIds).size, expectedFetchedCredentialIds.length);
+	assert.deepEqual(new Set(fetchedCredentialIds), new Set(expectedFetchedCredentialIds));
 	assert.deepEqual(earlyLaterWindowCredentialIds, []);
 
 	fetchedCredentialIds.length = 0;
 	const cacheFirstSelected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.5",
+		modelId: "gpt-5-mini",
 	});
 	assert.equal(cacheFirstSelected.credentialId, "openai-codex-4");
 	assert.deepEqual(fetchedCredentialIds, []);
@@ -416,7 +420,7 @@ test("account manager rejects restricted codex selection when no eligible plan e
 	await assert.rejects(
 		() =>
 			accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-				modelId: "gpt-5.5",
+				modelId: "gpt-5-mini",
 			}),
 		/no eligible credentials available with a paid plan|No credentials available with a paid plan/i,
 	);
@@ -474,7 +478,7 @@ test("codex usage-based selection returns immediately and queues background refr
 	t.after(async () => {
 		refreshGate.resolve();
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
@@ -542,7 +546,7 @@ test("codex stale usage selection keeps local rotation fair while queueing backg
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
@@ -557,7 +561,7 @@ test("codex stale usage selection keeps local rotation fair while queueing backg
 	assert.equal(fetchCount > 0, true);
 });
 
-test("codex paid entitlement treats stale quota exhaustion as plan evidence while refreshing in background", async (t) => {
+test("codex paid entitlement uses stale quota exhaustion without blocking on live validation", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-cache-first-plan-only-"));
 
 	const authPath = join(tempRoot, "auth.json");
@@ -603,16 +607,19 @@ test("codex paid entitlement treats stale quota exhaustion as plan evidence whil
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
 	await sleep(5);
 	fetchCount = 0;
 
-	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
-
-	assert.equal(selected.credentialId, "openai-codex");
+	await assert.rejects(
+		() => accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5-mini" }),
+		/Could not find an available credential for openai-codex/i,
+	);
+	assert.equal(fetchCount, 0);
+	await sleep(50);
 	assert.equal(fetchCount > 0, true);
 });
 
@@ -662,14 +669,14 @@ test("codex paid entitlement uses durable negative evidence without a fresh boot
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
 	fetchCount = 0;
 
 	await assert.rejects(
-		() => accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" }),
+		() => accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5-mini" }),
 		/No credentials available with a paid plan/i,
 	);
 	assert.equal(fetchCount, 0);

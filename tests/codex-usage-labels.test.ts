@@ -35,3 +35,15 @@ test("usage window labels disambiguate matching duration windows generically", (
 	assert.equal(resolveUsageWindowLabel(snapshot, "primary"), "5-hour window (window 1)");
 	assert.equal(resolveUsageWindowLabel(snapshot, "secondary"), "5-hour window (window 2)");
 });
+
+test("usage window labels name BlazeAPI daily requests and premium credits", () => {
+	const snapshot = createSnapshot({
+		provider: "blazeapi",
+		planType: "Premium",
+		primary: { usedPercent: 1, windowMinutes: 1440, resetsAt: null },
+		secondary: { usedPercent: 2, windowMinutes: 1440, resetsAt: null },
+	});
+
+	assert.equal(resolveUsageWindowLabel(snapshot, "primary"), "Daily requests");
+	assert.equal(resolveUsageWindowLabel(snapshot, "secondary"), "Premium credits");
+});

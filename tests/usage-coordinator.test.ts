@@ -302,3 +302,59 @@ test("usage service preserves single-flight fresh usage requests under coordinat
 	assert.equal(first.error, null);
 	assert.equal(second.error, null);
 });
+
+test("usage service reuses fresh negative cache even for forced refreshes", async () => {
+	let fetchCount = 0;
+	const usageService = new UsageService(30_000, 300_000, 60_000, undefined, { persistentCache: false });
+	usageService.register({
+		id: "negative-cache-provider",
+		displayName: "Negative Cache Provider",
+		fetchUsage: async (_auth: UsageAuth) => {
+			fetchCount += 1;
+			throw new Error("429 usage endpoint limited");
+		},
+	});
+
+	const first = await usageService.fetchUsage(
+		"negative-cache-provider",
+		"credential-a",
+		{ accessToken: "token-a" },
+		{ forceRefresh: true },
+	);
+	const second = await usageService.fetchUsage(
+		"negative-cache-provider",
+		"credential-a",
+		{ accessToken: "token-a" },
+		{ forceRefresh: true },
+	);
+
+	assert.equal(fetchCount, 1);
+	assert.equal(first.fromCache, false);
+	assert.equal(second.fromCache, true);
+	assert.match(first.error ?? "", /429 usage endpoint limited/);
+	assert.equal(second.error, first.error);
+});
+
+test("usage service harvests rate-limit headers into operational usage cache", () => {
+	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, { persistentCache: false });
+	const credentialCacheKey = "cache-key-a";
+	const observedAt = Date.now();
+
+	const harvested = usageService.harvestRateLimitHeaders(
+		"openai-codex",
+		"credential-a",
+		credentialCacheKey,
+		{
+			"x-ratelimit-limit-requests": "100",
+			"x-ratelimit-remaining-requests": "0",
+			"x-ratelimit-reset-requests": "60",
+		},
+		observedAt,
+	);
+
+	assert.ok(harvested?.snapshot);
+	assert.equal(harvested.snapshot.rateLimitHeaders?.remaining, 0);
+	assert.equal(harvested.snapshot.quotaClassification, "hourly");
+	const cached = usageService.readCachedUsage("openai-codex", "credential-a", { allowStale: true });
+	assert.equal(cached?.snapshot?.rateLimitHeaders?.remaining, 0);
+});

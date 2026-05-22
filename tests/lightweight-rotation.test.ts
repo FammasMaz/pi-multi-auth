@@ -6,10 +6,24 @@ import test from "node:test";
 
 import { AuthWriter } from "../src/auth-writer.js";
 import { KeyDistributor } from "../src/balancer/key-distributor.js";
+import type { BalancerUsageSnapshot } from "../src/balancer/index.js";
 import { LightweightRotationState } from "../src/lightweight-rotation-state.js";
 import type { ProviderCapabilities } from "../src/provider-registry.js";
 import { resolveProviderRotationClassification } from "../src/provider-rotation-profile.js";
 import { getProviderState, MultiAuthStorage } from "../src/storage.js";
+
+function createBalancerUsageSnapshot(
+	usedPercent: number,
+	state: "available" | "exhausted",
+): BalancerUsageSnapshot {
+	return {
+		snapshot: null,
+		usedPercent,
+		quotaState: { state },
+		fromCache: true,
+		needsRefresh: false,
+	};
+}
 
 test("resolveProviderRotationClassification keeps lightweight rotation provider-agnostic", () => {
 	assert.deepEqual(
@@ -303,6 +317,117 @@ test("KeyDistributor exposes redacted delegated routing capabilities", async () 
 	}
 });
 
+test("KeyDistributor uses balancer usage snapshots to avoid exhausted Codex credentials", async () => {
+	const providerId = "openai-codex";
+	const credentialIds = [providerId, `${providerId}-alt`] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-codex-balancer-usage-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+	const originalRandom = Math.random;
+	Math.random = () => 0;
+
+	try {
+		distributor.setUsageSnapshotProvider((currentProviderId, ids) => {
+			assert.equal(currentProviderId, providerId);
+			assert.deepEqual(ids, [...credentialIds]);
+			return {
+				[credentialIds[0]]: createBalancerUsageSnapshot(99, "exhausted"),
+				[credentialIds[1]]: createBalancerUsageSnapshot(10, "available"),
+			};
+		});
+		for (const credentialId of credentialIds) {
+			await authWriter.setApiKeyCredential(credentialId, `${credentialId}-key`);
+		}
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "balancer";
+			providerState.activeIndex = 0;
+			return { result: undefined, next: state };
+		});
+
+		const lease = await distributor.acquireForSubagent("codex-balancer-child", providerId);
+		assert.equal(lease.credentialId, credentialIds[1]);
+		distributor.releaseFromSubagent("codex-balancer-child");
+	} finally {
+		Math.random = originalRandom;
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("KeyDistributor drains near-exhausted Codex credentials with hysteresis", async () => {
+	const providerId = "openai-codex";
+	const credentialIds = [providerId, `${providerId}-alt`] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-codex-balancer-drain-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+	const originalRandom = Math.random;
+	let alphaUsedPercent = 86;
+	Math.random = () => 0.5;
+
+	try {
+		distributor.setUsageSnapshotProvider(() => ({
+			[credentialIds[0]]: createBalancerUsageSnapshot(alphaUsedPercent, "available"),
+			[credentialIds[1]]: createBalancerUsageSnapshot(10, "available"),
+		}));
+		for (const credentialId of credentialIds) {
+			await authWriter.setApiKeyCredential(credentialId, `${credentialId}-key`);
+		}
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "balancer";
+			providerState.activeIndex = 0;
+			return { result: undefined, next: state };
+		});
+
+		const firstLease = await distributor.acquireForSubagent("codex-drain-child-1", providerId);
+		assert.equal(firstLease.credentialId, credentialIds[1]);
+		distributor.releaseFromSubagent("codex-drain-child-1");
+		assert.equal(distributor.getState(providerId).quotaDrainStates?.[credentialIds[0]]?.draining, true);
+		const persistedAfterDrain = await storage.readProviderState(providerId);
+		assert.equal(persistedAfterDrain.quotaDrainStates?.[credentialIds[0]]?.draining, true);
+
+		const restoredDistributor = new KeyDistributor(storage, authWriter, {
+			waitTimeoutMs: 25,
+			maxConcurrentPerKey: 1,
+		});
+		restoredDistributor.setUsageSnapshotProvider(() => ({}));
+		const restoredLease = await restoredDistributor.acquireForSubagent("codex-drain-restored-child", providerId);
+		assert.equal(restoredLease.credentialId, credentialIds[1]);
+		restoredDistributor.releaseFromSubagent("codex-drain-restored-child");
+
+		alphaUsedPercent = 80;
+		const secondLease = await distributor.acquireForSubagent("codex-drain-child-2", providerId);
+		assert.equal(secondLease.credentialId, credentialIds[1]);
+		distributor.releaseFromSubagent("codex-drain-child-2");
+		assert.equal(distributor.getState(providerId).quotaDrainStates?.[credentialIds[0]]?.draining, true);
+
+		alphaUsedPercent = 70;
+		const thirdLease = await distributor.acquireForSubagent("codex-drain-child-3", providerId);
+		distributor.releaseFromSubagent("codex-drain-child-3");
+		assert.ok((credentialIds as readonly string[]).includes(thirdLease.credentialId));
+		assert.equal(distributor.getState(providerId).quotaDrainStates?.[credentialIds[0]], undefined);
+		const persistedAfterExit = await storage.readProviderState(providerId);
+		assert.equal(persistedAfterExit.quotaDrainStates?.[credentialIds[0]], undefined);
+	} finally {
+		Math.random = originalRandom;
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("KeyDistributor reuses lightweight parent-session leases and invalidates them on cooldown", async () => {
 	const providerId = "custom-provider";
 	const credentialIds = [providerId, `${providerId}-1`] as const;
@@ -522,6 +647,7 @@ test("KeyDistributor honors standard usage-based rotation for delegated subagent
 		waitTimeoutMs: 25,
 		maxConcurrentPerKey: 1,
 	});
+	let usageSnapshotLookups = 0;
 
 	try {
 		distributor.setProviderCapabilitiesResolver((provider) => ({
@@ -531,6 +657,10 @@ test("KeyDistributor honors standard usage-based rotation for delegated subagent
 			hasExternalAccountState: false,
 			rotationProfile: "standard",
 		}));
+		distributor.setUsageSnapshotProvider(() => {
+			usageSnapshotLookups += 1;
+			return {};
+		});
 
 		for (const credentialId of credentialIds) {
 			await authWriter.setApiKeyCredential(credentialId, `${credentialId}-secret`);
@@ -552,11 +682,65 @@ test("KeyDistributor honors standard usage-based rotation for delegated subagent
 		const lease = await distributor.acquireForSubagent("usage-child-1", providerId);
 		distributor.releaseFromSubagent("usage-child-1");
 		assert.equal(lease.credentialId, credentialIds[2]);
+		assert.equal(usageSnapshotLookups, 0);
 
 		const persistedState = await storage.readProviderState(providerId);
 		assert.equal(persistedState.activeIndex, 2);
 		assert.equal(persistedState.usageCount[credentialIds[2]], 1);
 		assert.ok((persistedState.lastUsedAt[credentialIds[2]] ?? 0) > 100);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("KeyDistributor reselects standard delegated credential rejected by selection validator", async () => {
+	const providerId = "oauth-validation-provider";
+	const credentialIds = [providerId, `${providerId}-1`] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-standard-validation-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+	const validatedCredentialIds: string[] = [];
+
+	try {
+		distributor.setProviderCapabilitiesResolver((provider) => ({
+			provider,
+			supportsApiKey: true,
+			supportsOAuth: true,
+			hasExternalAccountState: false,
+			rotationProfile: "standard",
+		}));
+		distributor.setCredentialSelectionValidator((_provider, credentialId) => {
+			validatedCredentialIds.push(credentialId);
+			return credentialId === credentialIds[0]
+				? { available: false, reason: "test-rejected" }
+				: { available: true };
+		});
+
+		for (const credentialId of credentialIds) {
+			await authWriter.setApiKeyCredential(credentialId, `${credentialId}-value`);
+		}
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "usage-based";
+			providerState.usageCount[credentialIds[0]] = 0;
+			providerState.usageCount[credentialIds[1]] = 5;
+			return { result: undefined, next: state };
+		});
+
+		const lease = await distributor.acquireForSubagent("validation-child", providerId);
+
+		assert.equal(lease.credentialId, credentialIds[1]);
+		assert.deepEqual(validatedCredentialIds, [...credentialIds]);
+		const persistedState = await storage.readProviderState(providerId);
+		assert.equal(persistedState.usageCount[credentialIds[0]], 0);
+		assert.equal(persistedState.usageCount[credentialIds[1]], 6);
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}

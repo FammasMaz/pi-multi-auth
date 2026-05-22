@@ -14,8 +14,8 @@ import {
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
-import { AccountManager } from "../src/account-manager.js";
+} from "@earendil-works/pi-ai";
+import { AccountManager, createCredentialSelectionCache } from "../src/account-manager.js";
 import {
 	formatOAuthRefreshFailureSummary,
 	getErrorMessage,
@@ -30,12 +30,20 @@ import {
 	type MultiAuthExtensionConfig,
 } from "../src/config.js";
 import { multiAuthDebugLogger } from "../src/debug-logger.js";
-import { classifyCredentialError } from "../src/error-classifier.js";
+import {
+	classifyCredentialError,
+	isCredentialModelIncompatibilityError,
+} from "../src/error-classifier.js";
+import { applyCredentialRequestOverrides } from "../src/credential-request-overrides.js";
 import { isRetryableFileAccessError, writeTextSnapshotWithRetries } from "../src/file-retry.js";
 import { HealthScorer } from "../src/health-scorer.js";
 import { refreshOAuthCredential, registerOAuthProvider, resetOAuthProviders } from "../src/oauth-compat.js";
 import { registerClineOAuthProvider } from "../src/oauth-cline.js";
 import { OAuthRefreshScheduler, determineTokenExpiration, extractJwtExpiration } from "../src/oauth-refresh-scheduler.js";
+import {
+    enrichProviderStatusOnlyErrorMessage,
+    parseEnrichedProviderResponse,
+} from "../src/provider-error-details.js";
 import {
 	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
 	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
@@ -259,7 +267,7 @@ async function createAccountManagerHarness(
 
 	t.after(async () => {
 		await accountManager.shutdown();
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	return {
@@ -301,6 +309,25 @@ function createTestContext(): Context {
 				timestamp: Date.now(),
 			},
 		],
+	};
+}
+
+function createUsageSnapshotForTest(
+	provider: string,
+	planType: string,
+	overrides: Partial<UsageSnapshot> = {},
+): UsageSnapshot {
+	const now = Date.now();
+	return {
+		timestamp: now,
+		provider,
+		planType,
+		primary: { usedPercent: 1, windowMinutes: 1440, resetsAt: now + 60_000 },
+		secondary: { usedPercent: 1, windowMinutes: 1440, resetsAt: now + 60_000 },
+		credits: null,
+		copilotQuota: null,
+		updatedAt: now,
+		...overrides,
 	};
 }
 
@@ -462,6 +489,50 @@ function createEmptyCompletionThenSuccessProvider(
 	};
 }
 
+function createAuthFailureThenSuccessProvider(
+	model: Model<"openai-completions">,
+	options: {
+		successText: string;
+		isExpiredSecret: (apiKey: string) => boolean;
+		errorMessage?: string;
+		onCall?: (apiKey: string) => void;
+	},
+): {
+	streamSimple: (
+		model: Model<"openai-completions">,
+		context: Context,
+		streamOptions?: SimpleStreamOptions,
+	) => ReturnType<typeof createAssistantMessageEventStream>;
+} {
+	return {
+		streamSimple: (_model, _context, streamOptions) => {
+			const apiKey = typeof streamOptions?.apiKey === "string" ? streamOptions.apiKey : "";
+			options.onCall?.(apiKey);
+			if (!options.isExpiredSecret(apiKey)) {
+				return createStreamingBaseProvider(model, {
+					thinking: "The refreshed token was accepted.",
+					text: options.successText,
+				}).streamSimple();
+			}
+
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessageForTest(model, []) });
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: createAssistantMessageForTest(model, [], {
+						stopReason: "error",
+						errorMessage: options.errorMessage ?? "HTTP 401 code=access_token_expired message=\"Access token expired\"",
+					}),
+				});
+				stream.end();
+			});
+			return stream;
+		},
+	};
+}
+
 async function collectAssistantEvents(
 	stream: ReturnType<ReturnType<typeof createRotatingStreamWrapper>>,
 ): Promise<AssistantMessageEvent[]> {
@@ -595,6 +666,215 @@ function createAbortAwareTimeoutProvider(
 		},
 	};
 }
+
+test("rotating stream wrapper refreshes an OAuth credential once on expired auth failure and replays the request", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	const providerId = "runtime-auth-refresh-provider";
+	const model = createTestModel(providerId);
+	const requestApiKeys: string[] = [];
+	const refreshCalls: string[] = [];
+	let releaseRefresh: (() => void) | undefined;
+	const refreshGate = new Promise<void>((resolve) => {
+		releaseRefresh = resolve;
+	});
+
+	registerOAuthProvider({
+		id: providerId,
+		name: "Runtime Auth Refresh Provider",
+		usesCallbackServer: false,
+		login: async () => {
+			throw new Error("Login is not used in this test.");
+		},
+		refreshToken: async (credentials) => {
+			refreshCalls.push(credentials.refresh);
+			await refreshGate;
+			return {
+				...credentials,
+				access: "access-rotated",
+				refresh: "refresh-rotated",
+				expires: Date.now() + 3_600_000,
+			};
+		},
+		getApiKey: (credentials) => credentials.access,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "oauth",
+				access: "access-initial",
+				refresh: "refresh-initial",
+				expires: Date.now() + 3_600_000,
+				provider: providerId,
+			},
+		},
+	});
+	await accountManager.ensureInitialized();
+
+	const wrapper = createRotatingStreamWrapper(
+		providerId,
+		accountManager,
+		createAuthFailureThenSuccessProvider(model, {
+			successText: "Recovered after refresh.",
+			isExpiredSecret: (apiKey) => apiKey === "access-initial",
+			onCall: (apiKey) => requestApiKeys.push(apiKey),
+		}) as never,
+	);
+
+	const eventsPromise = collectAssistantEvents(wrapper(model, createTestContext()));
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		if (refreshCalls.length >= 1) {
+			break;
+		}
+		await sleep(5);
+	}
+	releaseRefresh?.();
+	const events = await eventsPromise;
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+	const storedCredential = authData[providerId];
+
+	assert.deepEqual(refreshCalls, ["refresh-initial"]);
+	assert.deepEqual(requestApiKeys, ["access-initial", "access-rotated"]);
+	assert.equal(storedCredential?.type, "oauth");
+	assert.equal(storedCredential?.type === "oauth" ? storedCredential.refresh : undefined, "refresh-rotated");
+	assert.equal(events.at(-1)?.type, "done");
+	assert.equal(events.some((event) => event.type === "error"), false);
+});
+
+test("account manager singleflights concurrent runtime auth-failure refreshes for one credential", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	const providerId = "runtime-auth-singleflight-provider";
+	const refreshCalls: string[] = [];
+	let releaseRefresh: (() => void) | undefined;
+	const refreshGate = new Promise<void>((resolve) => {
+		releaseRefresh = resolve;
+	});
+	const failedCredential = {
+		type: "oauth" as const,
+		access: "access-initial",
+		refresh: "refresh-initial",
+		expires: Date.now() + 3_600_000,
+		provider: providerId,
+	};
+
+	registerOAuthProvider({
+		id: providerId,
+		name: "Runtime Auth Singleflight Provider",
+		usesCallbackServer: false,
+		login: async () => {
+			throw new Error("Login is not used in this test.");
+		},
+		refreshToken: async (credentials) => {
+			refreshCalls.push(credentials.refresh);
+			await refreshGate;
+			return {
+				...credentials,
+				access: "access-rotated",
+				refresh: "refresh-rotated",
+				expires: Date.now() + 3_600_000,
+			};
+		},
+		getApiKey: (credentials) => credentials.access,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: failedCredential,
+		},
+	});
+	await accountManager.ensureInitialized();
+
+	const firstRefresh = accountManager.refreshCredentialForAuthFailure(
+		providerId,
+		providerId,
+		failedCredential,
+	);
+	const secondRefresh = accountManager.refreshCredentialForAuthFailure(
+		providerId,
+		providerId,
+		failedCredential,
+	);
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		if (refreshCalls.length >= 1) {
+			break;
+		}
+		await sleep(5);
+	}
+	releaseRefresh?.();
+	const [firstResult, secondResult] = await Promise.all([firstRefresh, secondRefresh]);
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+	const storedCredential = authData[providerId];
+
+	assert.deepEqual(refreshCalls, ["refresh-initial"]);
+	assert.equal(firstResult.credential.refresh, "refresh-rotated");
+	assert.equal(secondResult.credential.refresh, "refresh-rotated");
+	assert.equal(storedCredential?.type, "oauth");
+	assert.equal(storedCredential?.type === "oauth" ? storedCredential.refresh : undefined, "refresh-rotated");
+});
+
+test("rotating stream wrapper does not refresh OAuth credentials for non-refreshable 403 permission failures", async (t) => {
+	const providerId = "runtime-auth-non-refreshable-provider";
+	const model = createTestModel(providerId);
+	const requestApiKeys: string[] = [];
+	let refreshCalls = 0;
+	const wrapper = createRotatingStreamWrapper(
+		providerId,
+		{
+			listProviderCredentialIds: async () => [providerId],
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string> },
+			) => {
+				if (requestOptions?.excludedCredentialIds?.has(providerId)) {
+					throw new Error(`No credential available for ${providerId}.`);
+				}
+				return {
+					provider: providerId,
+					credentialId: providerId,
+					credential: {
+						type: "oauth",
+						access: "access-current",
+						refresh: "refresh-current",
+						expires: Date.now() + 3_600_000,
+					},
+					secret: "access-current",
+					index: 0,
+				};
+			},
+			refreshCredential: async () => {
+				refreshCalls += 1;
+				throw new Error("Refresh should not be called for non-refreshable 403 errors.");
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		createAuthFailureThenSuccessProvider(model, {
+			successText: "unused",
+			isExpiredSecret: () => true,
+			errorMessage: "HTTP 403 code=model_access_denied message=\"The credential cannot access this model\"",
+			onCall: (apiKey) => requestApiKeys.push(apiKey),
+		}) as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext()));
+
+	assert.equal(refreshCalls, 0);
+	assert.deepEqual(requestApiKeys, ["access-current"]);
+	assert.equal(events.at(-1)?.type, "error");
+});
 
 test("rotating stream wrapper redacts request auth debug secrets", async (t) => {
 	const provider = "openai-codex";
@@ -1119,6 +1399,386 @@ test("OpenAI Codex token_revoked OAuth errors classify as disabling authenticati
 	assert.equal(classification.shouldApplyCooldown, false);
 });
 
+test("BlazeAPI paid-plan model access errors are credential-model incompatibilities", () => {
+	const message = "Model 'claude-opus-4.7' is only available to paid users.";
+
+	assert.equal(
+		isCredentialModelIncompatibilityError(message, {
+			providerId: "blazeapi",
+			modelId: "claude-opus-4.7",
+		}),
+		true,
+	);
+
+	const classification = classifyCredentialError(message, {
+		providerId: "blazeapi",
+		modelId: "claude-opus-4.7",
+	});
+	assert.equal(classification.kind, "invalid_request");
+	assert.equal(classification.shouldRotateCredential, true);
+	assert.equal(classification.shouldApplyCooldown, false);
+});
+
+test("BlazeAPI selected upstream provider HTTP 400 errors are transient", () => {
+	const classification = classifyCredentialError(
+		"The selected provider failed this request (HTTP 400).",
+		{ providerId: "blazeapi", modelId: "claude-opus-4.7" },
+	);
+
+	assert.equal(classification.kind, "provider_transient");
+	assert.equal(classification.shouldRetrySameCredential, true);
+	assert.equal(classification.shouldRotateCredential, false);
+	assert.equal(classification.shouldApplyCooldown, false);
+});
+
+test("generic HTTP 429 rate limits receive short cooldowns instead of quota-window cooldowns", () => {
+	const classification = classifyCredentialError(
+		"Provider request failed with 429 status code (no body)",
+		{ providerId: "openai-codex", modelId: "gpt-5.5" },
+	);
+
+	assert.equal(classification.kind, "rate_limit");
+	assert.equal(classification.shouldApplyCooldown, true);
+	assert.equal(classification.quotaClassification, "unknown");
+	assert.equal(classification.recommendedCooldownMs, 15_000);
+});
+
+test("Kiro provider request timeouts retry the same credential", () => {
+	const classification = classifyCredentialError(
+		"Kiro request timed out after 300000ms.",
+		{ providerId: "kiro", modelId: "claude-opus-4.7" },
+	);
+
+	assert.equal(classification.kind, "request_timeout");
+	assert.equal(classification.shouldRetrySameCredential, true);
+	assert.equal(classification.shouldRotateCredential, false);
+	assert.equal(classification.shouldApplyCooldown, false);
+});
+
+test("Kiro generic reached-limit errors rotate as quota exhaustion", () => {
+	const classification = classifyCredentialError(
+		"You have reached the limit.",
+		{ providerId: "kiro", modelId: "claude-opus-4.7" },
+	);
+
+	assert.equal(classification.kind, "quota");
+	assert.equal(classification.shouldRotateCredential, true);
+	assert.equal(classification.shouldApplyCooldown, true);
+});
+
+test("workspace deactivation errors disable the affected credential like organization-disabled errors", () => {
+  const classification = classifyCredentialError(
+    '{"detail":{"code":"deactivated_workspace","message":"Workspace has been deactivated"}}',
+    { providerId: "openai-codex", modelId: "gpt-5.5" },
+  );
+
+  assert.equal(classification.kind, "organization_disabled");
+  assert.equal(classification.shouldRotateCredential, true);
+  assert.equal(classification.shouldDisableCredential, true);
+  assert.equal(classification.shouldApplyCooldown, false);
+});
+
+test("nested provider detail fields are extracted from diagnostic responses", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => new Response(
+      JSON.stringify({
+        detail: {
+          code: "deactivated_workspace",
+          message: "Workspace has been deactivated",
+        },
+      }),
+      { status: 403, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+		let harvestedHeaders: Record<string, string> | null = null;
+
+    const enriched = await enrichProviderStatusOnlyErrorMessage(
+      "Provider request failed with 403 status code (no body)",
+      {
+        model: createTestModel("openai-codex"),
+        apiKey: "test-key",
+			onResponseHeaders: (headers) => {
+				harvestedHeaders = headers;
+			},
+      },
+    );
+    const parsed = parseEnrichedProviderResponse(enriched);
+
+    assert.match(enriched, /provider response: HTTP 403/);
+    assert.equal(parsed.status, 403);
+    assert.equal(parsed.code, "deactivated_workspace");
+    assert.equal(parsed.message, "Workspace has been deactivated");
+		assert.equal(harvestedHeaders?.["content-type"], "application/json");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("BlazeAPI Claude request overrides disable OpenAI-style reasoning_effort", () => {
+	const model: Model<"openai-completions"> = {
+		...createTestModel("blazeapi"),
+		id: "claude-opus-4.6",
+		name: "Claude Opus 4.6",
+		baseUrl: "https://blazeai.boxu.dev/api",
+		compat: {
+			supportsReasoningEffort: true,
+			supportsStore: false,
+		},
+	};
+
+	const result = applyCredentialRequestOverrides({
+		provider: "blazeapi",
+		credentialId: "blazeapi-1",
+		credential: { type: "api_key", key: "blz_test" },
+		model,
+		headers: { "x-test": "preserved" },
+	});
+
+	const compat = result.model.compat as { supportsReasoningEffort?: boolean; supportsStore?: boolean } | undefined;
+	assert.equal(compat?.supportsReasoningEffort, false);
+	assert.equal(compat?.supportsStore, false);
+	assert.deepEqual(result.headers, { "x-test": "preserved" });
+});
+
+test("BlazeAPI route-tagged Claude request overrides disable OpenAI-style reasoning_effort", () => {
+	const model = {
+		...createTestModel("blazeapi"),
+		id: "openai-compatible-opus-4.7",
+		name: "OpenAI-Compatible Opus 4.7",
+		baseUrl: "https://blazeai.boxu.dev/api",
+		compat: {
+			supportsReasoningEffort: true,
+			supportsStore: false,
+		},
+		endpointMetadata: {
+			providerId: "route:claude-opus-4.7",
+			routingGroup: "openai-compatible-opus-4.7",
+		},
+	} as Model<"openai-completions">;
+
+	const result = applyCredentialRequestOverrides({
+		provider: "blazeapi",
+		credentialId: "blazeapi-1",
+		credential: { type: "api_key", key: "blz_test" },
+		model,
+		headers: {},
+	});
+
+	const compat = result.model.compat as { supportsReasoningEffort?: boolean; supportsStore?: boolean } | undefined;
+	assert.equal(compat?.supportsReasoningEffort, false);
+	assert.equal(compat?.supportsStore, false);
+});
+
+test("BlazeAPI request-limit 429 retries for free models when daily requests still have capacity", async () => {
+	const model: Model<"openai-completions"> = {
+		...createTestModel("blazeapi"),
+		id: "MiniMax-M2.5-highspeed",
+	};
+	let providerCalls = 0;
+	let quotaCooldowns = 0;
+	const baseProvider = {
+		api: "openai-completions" as const,
+		stream: () => createAssistantMessageEventStream(),
+		streamSimple: () => {
+			providerCalls += 1;
+			if (providerCalls > 1) {
+				return createStreamingBaseProvider(model, {
+					thinking: "Recovered after transient BlazeAPI request limit.",
+					text: "ok-after-retry",
+				}).streamSimple();
+			}
+
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: createAssistantMessageForTest(model, [], {
+						stopReason: "error",
+						errorMessage: "429 Request limit reached for your current plan.",
+					}),
+				});
+				stream.end();
+			});
+			return stream;
+		},
+	};
+	const accountManager = {
+		acquireCredential: async () => ({
+			provider: "blazeapi",
+			credentialId: "blazeapi-1",
+			credential: { type: "api_key", key: "blz_test" },
+			secret: "blz_test",
+			index: 1,
+		}),
+		recordCredentialSuccess: async () => undefined,
+		resolveFailoverTarget: async () => null,
+		disableApiKeyCredential: async () => undefined,
+		markTransientProviderError: async () => 0,
+		markQuotaExceeded: async () => {
+			quotaCooldowns += 1;
+		},
+		getCredentialUsageSnapshot: async () => ({
+			snapshot: {
+				timestamp: Date.now(),
+				provider: "blazeapi",
+				planType: "Premium",
+				primary: { usedPercent: 1, windowMinutes: 1440, resetsAt: Date.now() + 60_000 },
+				secondary: { usedPercent: 100, windowMinutes: 1440, resetsAt: Date.now() + 60_000 },
+				credits: null,
+				copilotQuota: null,
+				updatedAt: Date.now(),
+			},
+			error: null,
+			fromCache: false,
+		}),
+	} as unknown as AccountManager;
+
+	const wrapper = createRotatingStreamWrapper("blazeapi", accountManager, baseProvider);
+	const events = await collectAssistantEvents(wrapper(model, createTestContext()));
+
+	assert.equal(providerCalls, 2);
+	assert.equal(quotaCooldowns, 0);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.equal(
+		doneEvent.message.content.some(
+			(block) => block.type === "text" && block.text === "ok-after-retry",
+		),
+		true,
+	);
+});
+
+test("BlazeAPI live-capacity request-limit 429 does not persist quota cooldown after retry budget", async () => {
+	const model: Model<"openai-completions"> = {
+		...createTestModel("blazeapi"),
+		id: "claude-opus-4.6",
+	};
+	let providerCalls = 0;
+	let quotaCooldowns = 0;
+	let transientCooldowns = 0;
+	const baseProvider = {
+		api: "openai-completions" as const,
+		stream: () => createAssistantMessageEventStream(),
+		streamSimple: () => {
+			providerCalls += 1;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: createAssistantMessageForTest(model, [], {
+						stopReason: "error",
+						errorMessage: "429 Request limit reached for your current plan.",
+					}),
+				});
+				stream.end();
+			});
+			return stream;
+		},
+	};
+	const accountManager = {
+		acquireCredential: async () => ({
+			provider: "blazeapi",
+			credentialId: "blazeapi-1",
+			credential: { type: "api_key", key: "blz_test" },
+			secret: "blz_test",
+			index: 1,
+		}),
+		recordCredentialSuccess: async () => undefined,
+		resolveFailoverTarget: async () => null,
+		disableApiKeyCredential: async () => undefined,
+		markTransientProviderError: async () => {
+			transientCooldowns += 1;
+			return 0;
+		},
+		markQuotaExceeded: async () => {
+			quotaCooldowns += 1;
+		},
+		getCredentialUsageSnapshot: async () => ({
+			snapshot: {
+				timestamp: Date.now(),
+				provider: "blazeapi",
+				planType: "Premium",
+				primary: { usedPercent: 1, windowMinutes: 1440, resetsAt: Date.now() + 60_000 },
+				secondary: { usedPercent: 2, windowMinutes: 1440, resetsAt: Date.now() + 60_000 },
+				credits: null,
+				copilotQuota: null,
+				updatedAt: Date.now(),
+			},
+			error: null,
+			fromCache: false,
+		}),
+	} as unknown as AccountManager;
+
+	const wrapper = createRotatingStreamWrapper("blazeapi", accountManager, baseProvider);
+	const events = await collectAssistantEvents(wrapper(model, createTestContext()));
+
+	assert.equal(providerCalls >= 3, true);
+	assert.equal(quotaCooldowns, 0);
+	assert.equal(transientCooldowns > 0, true);
+	assert.equal(events.some((event) => event.type === "error"), true);
+});
+
+test("usable alternate detection ignores model-ineligible alternates for plan-aware providers", async (t) => {
+	const providerId = "blazeapi";
+	const usageByToken = new Map<string, UsageSnapshot>([
+		["current-pro-token", createUsageSnapshotForTest(providerId, "Premium")],
+		["alternate-free-token", createUsageSnapshotForTest(providerId, "Free")],
+	]);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			blazeapi: { type: "api_key", key: "current-pro-token" },
+			"blazeapi-1": { type: "api_key", key: "alternate-free-token" },
+		},
+		usageFetcher: async (auth) => usageByToken.get(auth.accessToken) ?? null,
+	});
+
+	const hasAlternate = await accountManager.hasUsableAlternateCredential(providerId, {
+		currentCredentialId: "blazeapi",
+		modelId: "claude-opus-4.7",
+		selectionCache: createCredentialSelectionCache(),
+	});
+
+	assert.equal(hasAlternate, false);
+});
+
+test("usable alternate detection finds eligible alternates without relying on provider-specific IDs", async (t) => {
+	const providerId = "blazeapi";
+	const usageByToken = new Map<string, UsageSnapshot>([
+		["current-pro-token", createUsageSnapshotForTest(providerId, "Premium")],
+		["alternate-free-token", createUsageSnapshotForTest(providerId, "Free")],
+		["alternate-premium-token", createUsageSnapshotForTest(providerId, "Premium")],
+	]);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			blazeapi: { type: "api_key", key: "current-pro-token" },
+			"blazeapi-1": { type: "api_key", key: "alternate-free-token" },
+			"blazeapi-2": { type: "api_key", key: "alternate-premium-token" },
+		},
+		usageFetcher: async (auth) => usageByToken.get(auth.accessToken) ?? null,
+	});
+
+	const hasEligibleAlternate = await accountManager.hasUsableAlternateCredential(providerId, {
+		currentCredentialId: "blazeapi",
+		modelId: "claude-opus-4.7",
+		selectionCache: createCredentialSelectionCache(),
+	});
+	const hasEligibleAlternateAfterExclusion = await accountManager.hasUsableAlternateCredential(providerId, {
+		currentCredentialId: "blazeapi",
+		excludedCredentialIds: new Set(["blazeapi-2"]),
+		modelId: "claude-opus-4.7",
+		selectionCache: createCredentialSelectionCache(),
+	});
+
+	assert.equal(hasEligibleAlternate, true);
+	assert.equal(hasEligibleAlternateAfterExclusion, false);
+});
+
 test("delegated credential overrides pin the delegated credential through account-manager selection", async (t) => {
 	const model = createTestModel("cline");
 	const delegatedCredentialId = "cline";
@@ -1263,6 +1923,205 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 	assert.equal(callsByApiKey.get("secret-a"), 1);
 	assert.equal(callsByApiKey.get("secret-b"), undefined);
 	assert.deepEqual(transientCooldowns, []);
+});
+
+test("rotating stream wrapper auto-retries transient empty completions on sole-credential providers", async () => {
+	const model = createTestModel("openai-completions");
+	const acquiredCredentialIds: string[] = [];
+	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
+	let streamAttempts = 0;
+	const accountManager = {
+		acquireCredential: async (
+			_provider: string,
+			requestOptions?: { excludedCredentialIds?: Set<string> },
+		) => {
+			const excluded = requestOptions?.excludedCredentialIds ?? new Set<string>();
+			if (excluded.has("sole-credential")) {
+				throw new Error("No credential available for sole-provider.");
+			}
+			acquiredCredentialIds.push("sole-credential");
+			return {
+				provider: "sole-provider",
+				credentialId: "sole-credential",
+				credential: { type: "api_key", key: "sole-secret" },
+				secret: "sole-secret",
+				index: 0,
+			};
+		},
+		listProviderCredentialIds: async () => ["sole-credential"],
+		recordCredentialSuccess: async () => undefined,
+		resolveFailoverTarget: async () => null,
+		disableApiKeyCredential: async () => undefined,
+		markTransientProviderError: async (
+			_provider: string,
+			credentialId: string,
+			message: string,
+		) => {
+			transientCooldowns.push({ credentialId, message });
+			return 0;
+		},
+		markQuotaExceeded: async () => undefined,
+	} as unknown as AccountManager;
+
+	const wrapper = createRotatingStreamWrapper(
+		"sole-provider",
+		accountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				_options?: SimpleStreamOptions,
+			) => {
+				streamAttempts += 1;
+				const stream = createAssistantMessageEventStream();
+				const currentAttempt = streamAttempts;
+				queueMicrotask(() => {
+					// Emit enough empty completions to exhaust the per-credential
+					// transient retry budget (which would previously fail rotation
+					// because no alternate credential is available).
+					if (currentAttempt < 5) {
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessageForTest(model, [], {
+								stopReason: "stop",
+								responseId: `empty-${currentAttempt}`,
+							}),
+						});
+						stream.end();
+						return;
+					}
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "recovered after empty completions" },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+		new Map(),
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "proxy" }),
+	);
+
+	assert.equal(
+		events.some((event) => event.type === "error"),
+		false,
+		"Transient empty completions on a sole-credential provider should not surface an error event.",
+	);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> =>
+			event.type === "done",
+	);
+	assert.ok(doneEvent);
+	const textBlock = doneEvent.message.content.find(
+		(block): block is Extract<(typeof doneEvent.message.content)[number], { type: "text" }> =>
+			block.type === "text",
+	);
+	assert.ok(textBlock);
+	assert.equal(textBlock.text, "recovered after empty completions");
+	assert.ok(streamAttempts >= 5, `expected at least 5 stream attempts, saw ${streamAttempts}`);
+	assert.ok(
+		acquiredCredentialIds.length >= 2,
+		`expected the sole credential to be re-acquired at least once, saw ${acquiredCredentialIds.length} acquisition(s)`,
+	);
+	assert.ok(acquiredCredentialIds.every((credentialId) => credentialId === "sole-credential"));
+	assert.ok(transientCooldowns.length >= 1);
+	assert.ok(
+		transientCooldowns.every(({ message }) => /empty completion/i.test(message)),
+	);
+});
+
+test("rotating stream wrapper preserves credential rotation when alternate lookup fails", async () => {
+	const model = createTestModel("openai-completions");
+	const acquiredCredentialIds: string[] = [];
+	let listAttempts = 0;
+	const accountManager = {
+		acquireCredential: async (
+			_provider: string,
+			requestOptions?: { excludedCredentialIds?: Set<string> },
+		) => {
+			const excluded = requestOptions?.excludedCredentialIds ?? new Set<string>();
+			const credentialId = excluded.has("credential-a") ? "credential-b" : "credential-a";
+			acquiredCredentialIds.push(credentialId);
+			return {
+				provider: "lookup-failure-provider",
+				credentialId,
+				credential: { type: "api_key", key: `secret-${credentialId}` },
+				secret: credentialId === "credential-a" ? "secret-a" : "secret-b",
+				index: credentialId === "credential-a" ? 0 : 1,
+			};
+		},
+		listProviderCredentialIds: async () => {
+			listAttempts += 1;
+			throw new Error("Credential list unavailable.");
+		},
+		recordCredentialSuccess: async () => undefined,
+		resolveFailoverTarget: async () => null,
+		disableApiKeyCredential: async () => undefined,
+		markTransientProviderError: async () => 0,
+		markQuotaExceeded: async () => undefined,
+	} as unknown as AccountManager;
+
+	const wrapper = createRotatingStreamWrapper(
+		"lookup-failure-provider",
+		accountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (options?.apiKey === "secret-a") {
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessageForTest(model, [], {
+								stopReason: "stop",
+								responseId: "empty-a",
+							}),
+						});
+						stream.end();
+						return;
+					}
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "rotated after lookup failure" },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+		new Map(),
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "proxy" }),
+	);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> =>
+			event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.equal(doneEvent.message.content[0]?.type, "text");
+	assert.equal(
+		doneEvent.message.content[0]?.type === "text" ? doneEvent.message.content[0].text : "",
+		"rotated after lookup failure",
+	);
+	assert.ok(listAttempts >= 1);
+	assert.deepEqual(acquiredCredentialIds.at(-1), "credential-b");
 });
 
 test("rate-limit header parser normalizes reset headers and retry metadata", () => {
@@ -1556,6 +2415,131 @@ test("account manager updates an existing Cline OAuth credential instead of addi
 	assert.equal(authData.cline?.type === "oauth" ? authData.cline.access : undefined, "new-access");
 });
 
+function getCredentialAuthMethodForTest(credential: StoredAuthCredential | undefined): string | undefined {
+	if (credential?.type !== "oauth") {
+		return undefined;
+	}
+	const authMethod = (credential as StoredAuthCredential & { authMethod?: unknown }).authMethod;
+	return typeof authMethod === "string" ? authMethod : undefined;
+}
+
+test("account manager keeps same-email Kiro OAuth credentials separate by auth method", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	const loginCredentials = [
+		{
+			access: "builder-access",
+			refresh: "builder-refresh",
+			expires: Date.now() + 3_600_000,
+			provider: "kiro",
+			accountId: "acct-same",
+			userInfo: { email: "same@example.com" },
+			authMethod: "builder-id",
+		},
+		{
+			access: "google-access",
+			refresh: "google-refresh",
+			expires: Date.now() + 3_600_000,
+			provider: "kiro",
+			accountId: "acct-same",
+			userInfo: { email: "same@example.com" },
+			authMethod: "google",
+		},
+	];
+	let loginIndex = 0;
+
+	registerOAuthProvider({
+		id: "kiro",
+		name: "Kiro",
+		usesCallbackServer: false,
+		login: async () => loginCredentials[loginIndex++] ?? loginCredentials.at(-1)!,
+		refreshToken: async (credentials) => credentials,
+		getApiKey: (credentials) => credentials.access,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "kiro",
+		authData: {},
+	});
+
+	const first = await accountManager.loginProvider("kiro", {
+		onAuth: () => {},
+		onPrompt: async () => "unused",
+	});
+	const second = await accountManager.loginProvider("kiro", {
+		onAuth: () => {},
+		onPrompt: async () => "unused",
+	});
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+	const status = await accountManager.getProviderStatus("kiro");
+
+	assert.equal(first.credentialId, "kiro");
+	assert.equal(second.credentialId, "kiro-1");
+	assert.deepEqual(second.credentialIds, ["kiro", "kiro-1"]);
+	assert.deepEqual(Object.keys(authData).sort(), ["kiro", "kiro-1"]);
+	assert.equal(getCredentialAuthMethodForTest(authData.kiro), "builder-id");
+	assert.equal(getCredentialAuthMethodForTest(authData["kiro-1"]), "google");
+	assert.deepEqual(
+		status.credentials.map((credential) => credential.friendlyName),
+		["same@example.com (builder-id)", "same@example.com (google)"],
+	);
+});
+
+test("account manager updates same-method Kiro OAuth credentials instead of duplicating", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	registerOAuthProvider({
+		id: "kiro",
+		name: "Kiro",
+		usesCallbackServer: false,
+		login: async () => ({
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 3_600_000,
+			provider: "kiro",
+			accountId: "acct-same",
+			userInfo: { email: "same@example.com" },
+			authMethod: "github",
+		}),
+		refreshToken: async (credentials) => credentials,
+		getApiKey: (credentials) => credentials.access,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "kiro",
+		authData: {
+			kiro: {
+				type: "oauth",
+				access: "old-access",
+				refresh: "old-refresh",
+				expires: Date.now() + 60_000,
+				provider: "kiro",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+				authMethod: "github",
+			},
+		},
+	});
+
+	const result = await accountManager.loginProvider("kiro", {
+		onAuth: () => {},
+		onPrompt: async () => "unused",
+	});
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+
+	assert.equal(result.credentialId, "kiro");
+	assert.deepEqual(result.credentialIds, ["kiro"]);
+	assert.deepEqual(Object.keys(authData), ["kiro"]);
+	assert.equal(authData.kiro?.type === "oauth" ? authData.kiro.access : undefined, "new-access");
+	assert.equal(getCredentialAuthMethodForTest(authData.kiro), "github");
+});
+
 test("account manager keeps the recovered round-robin credential active after retry selection", async (t) => {
 	const providerId = "cline";
 	registerClineOAuthProvider();
@@ -1613,7 +2597,7 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 	let fetchCount = 0;
 
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await writeFile(
@@ -1685,7 +2669,7 @@ test("provider registry lists pi-mono API-key, models.json, and credential-known
 	const modelsPath = join(tempRoot, "models.json");
 
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await writeFile(
@@ -1733,7 +2717,7 @@ test("provider registry lists pi-mono API-key, models.json, and credential-known
 test("provider registry refreshes models metadata after models.json changes", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-provider-registry-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const authPath = join(tempRoot, "auth.json");
@@ -1793,6 +2777,8 @@ test("provider registry refreshes models metadata after models.json changes", as
 
 test("cascade retry state persists across account-manager restarts and clears on success", async (t) => {
 	const providerId = "cascade-provider";
+	const extensionConfig = cloneExtensionConfig();
+	extensionConfig.historyPersistence.enabled = true;
 	const harness = await createAccountManagerHarness(t, {
 		providerId,
 		authData: {
@@ -1800,9 +2786,10 @@ test("cascade retry state persists across account-manager restarts and clears on
 			[`${providerId}-1`]: { type: "api_key", key: "beta" },
 			[`${providerId}-2`]: { type: "api_key", key: "gamma" },
 		},
+		extensionConfig,
 	});
 	const historyPaths = resolveStateHistoryPersistencePaths(
-		DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
+		extensionConfig.historyPersistence,
 		harness.debugDir,
 	);
 
@@ -1839,12 +2826,12 @@ test("cascade retry state persists across account-manager restarts and clears on
 		new AuthWriter(harness.authPath),
 		new MultiAuthStorage(harness.storagePath, {
 			debugDir: harness.debugDir,
-			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
+			historyPersistence: extensionConfig.historyPersistence,
 		}),
 		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(harness.authPath), harness.modelsPath, [providerId]),
 		undefined,
-		cloneExtensionConfig(),
+		extensionConfig,
 	);
 	t.after(async () => {
 		await restarted.shutdown();
@@ -1869,6 +2856,7 @@ test("cascade retry state persists across account-manager restarts and clears on
 test("account manager applies configured cascade history retention", async (t) => {
 	const providerId = "cascade-config-provider";
 	const extensionConfig = cloneExtensionConfig();
+	extensionConfig.historyPersistence.enabled = true;
 	extensionConfig.cascade.maxHistoryEntries = 1;
 	const { accountManager, storagePath, debugDir } = await createAccountManagerHarness(t, {
 		providerId,
@@ -1951,6 +2939,7 @@ test("health scoring favors reliable credentials in weighted selection", () => {
 test("account manager applies configured health scoring thresholds", async (t) => {
 	const providerId = "health-config-provider";
 	const extensionConfig = cloneExtensionConfig();
+	extensionConfig.historyPersistence.enabled = true;
 	extensionConfig.health.minRequests = 1;
 	extensionConfig.health.maxLatencyMs = 1_000;
 	const { accountManager, storagePath, debugDir } = await createAccountManagerHarness(t, {
@@ -1998,8 +2987,12 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-history-migration-"));
 	const storagePath = join(tempRoot, "multi-auth.json");
 	const debugDir = join(tempRoot, "debug");
+	const historyPersistence = {
+		...DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
+		enabled: true,
+	};
 	const historyPaths = resolveStateHistoryPersistencePaths(
-		DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
+		historyPersistence,
 		debugDir,
 	);
 
@@ -2063,7 +3056,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 
 		const storage = new MultiAuthStorage(storagePath, {
 			debugDir,
-			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
+			historyPersistence,
 		});
 		const hydrated = await storage.read();
 		assert.equal(
@@ -2125,7 +3118,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 			1,
 		);
 	} finally {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	}
 });
 
@@ -2451,7 +3444,7 @@ test("storage validates and persists explicit provider pool configuration", asyn
 			preferHealthyWithinPool: false,
 		});
 	} finally {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	}
 });
 
@@ -2481,7 +3474,7 @@ test("storage reuses cached snapshots for provider-scoped reads and credential l
 		assert.equal(metrics.cacheMissCount, 1);
 		assert.equal(metrics.cacheHitCount, 2);
 	} finally {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	}
 });
 
@@ -3185,7 +4178,7 @@ test("account manager getProviderStatus avoids rewriting unchanged multi-auth st
 test("auth writer skips no-op persistence when adding an existing API key credential", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-auth-writer-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const authPath = join(tempRoot, "auth.json");
@@ -3215,7 +4208,7 @@ test("multi-auth storage retries transient Windows file-open errors while readin
 
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-storage-read-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const storagePath = join(tempRoot, "multi-auth.json");

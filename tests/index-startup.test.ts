@@ -184,7 +184,7 @@ test("delegated subagent runtime resolves the router-provided credential overrid
 test("multi-auth config initializes with documented module defaults", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const configPath = join(tempRoot, "config.json");
@@ -206,7 +206,7 @@ test("multi-auth config initializes with documented module defaults", async (t) 
 test("multi-auth config validates nested documented options and falls back with warnings", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-invalid-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const configPath = join(tempRoot, "config.json");
@@ -293,7 +293,7 @@ test("multi-auth config validates nested documented options and falls back with 
 test("multi-auth config accepts custom history persistence file names", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-history-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const configPath = join(tempRoot, "config.json");
@@ -326,7 +326,7 @@ test("multi-auth config accepts custom history persistence file names", async (t
 test("multi-auth debug logger writes JSONL entries under the debug directory when enabled", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-debug-log-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const configPath = join(tempRoot, "config.json");
@@ -361,7 +361,7 @@ test("multi-auth debug logger writes JSONL entries under the debug directory whe
 test("account manager initializes lazily when credentials are first acquired", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-account-manager-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const authPath = join(tempRoot, "auth.json");
@@ -405,7 +405,7 @@ test("account manager initializes lazily when credentials are first acquired", a
 test("account manager can acquire credentials while core auth lock is held for read-only access", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-auth-lock-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const authPath = join(tempRoot, "auth.json");
@@ -442,7 +442,7 @@ test("account manager can acquire credentials while core auth lock is held for r
 			join(
 				process.cwd(),
 				"node_modules",
-				"@mariozechner",
+				"@earendil-works",
 				"pi-coding-agent",
 				"dist",
 				"core",
@@ -496,7 +496,7 @@ test("account manager can acquire credentials while core auth lock is held for r
 test("openai-codex defaults to usage-based rotation when provider state is initialized", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-codex-rotation-"));
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const authPath = join(tempRoot, "auth.json");

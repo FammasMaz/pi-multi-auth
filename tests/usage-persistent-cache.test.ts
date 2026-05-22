@@ -129,7 +129,7 @@ async function readPersistedCache(cachePath: string): Promise<PersistedUsageCach
 test("usage service persists successful snapshots with bounded cache metadata", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const providerId = "persistent-provider";
@@ -168,7 +168,7 @@ test("usage service persists successful snapshots with bounded cache metadata", 
 test("usage service hydrates valid non-expired entries and prunes expired or orphaned entries", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const now = Date.now();
@@ -237,7 +237,7 @@ test("usage service hydrates valid non-expired entries and prunes expired or orp
 test("usage service hydrates display snapshots after operational entries expire", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const now = Date.now();
@@ -310,7 +310,7 @@ test("usage service hydrates display snapshots after operational entries expire"
 test("usage service migrates safely associated schema-v1 cache entries to credential-keyed schema-v2", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const now = Date.now();
@@ -362,7 +362,7 @@ test("usage service migrates safely associated schema-v1 cache entries to creden
 test("usage service prunes ambiguous or invalid schema-v1 cache entries during migration", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const now = Date.now();
@@ -435,7 +435,7 @@ test("usage service prunes ambiguous or invalid schema-v1 cache entries during m
 test("usage cache store keeps one latest entry per provider credential within the hard entry bound", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const store = new UsageSnapshotCacheStore({ filePath: cachePath, maxEntries: 2 });
@@ -456,7 +456,7 @@ test("usage cache store keeps one latest entry per provider credential within th
 test("usage service ignores malformed persisted cache files during hydration", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await writeFile(cachePath, "{ not valid json", "utf-8");
@@ -471,7 +471,7 @@ test("usage service ignores malformed persisted cache files during hydration", a
 test("usage service does not overwrite last persisted successful snapshot with transient errors", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const providerId = "error-preserve-provider";
@@ -513,7 +513,7 @@ test("usage service does not overwrite last persisted successful snapshot with t
 test("usage service separates cache records for reused credential ids with different credential material", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const providerId = "openai-codex";
@@ -559,7 +559,7 @@ test("usage service separates cache records for reused credential ids with diffe
 test("usage service resolves ambiguous credential-id cache history when the current credential key is known", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const providerId = "openai-codex";
@@ -615,7 +615,7 @@ test("account manager hydrates persisted usage cache during initialization and s
 	let fetchCount = 0;
 
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	await writeFile(
@@ -751,7 +751,7 @@ test("usage service keeps Codex usage snapshots separated for base and numbered 
 	let nextSnapshot = baseSnapshot;
 
 	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true });
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, {
