@@ -1,11 +1,4 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import {
-	DEBUG_DIR,
-	DEFAULT_HISTORY_PERSISTENCE_CONFIG,
-	cloneHistoryPersistenceConfig,
-	type HistoryPersistenceConfig,
-} from "./config.js";
 import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import {
 	acquireFileLock,
@@ -15,7 +8,6 @@ import {
 	pathExists,
 } from "./file-utils.js";
 import { isRetryableFileAccessError, readTextSnapshotWithRetries, writeTextSnapshotWithRetries } from "./file-retry.js";
-import { MultiAuthHistoryStore } from "./history-storage.js";
 import { RollingMetricSeries, type MetricSeriesSnapshot } from "./performance-metrics.js";
 import { cloneProviderState } from "./provider-state-utils.js";
 import { resolveDefaultRotationMode } from "./rotation-modes.js";
@@ -23,6 +15,7 @@ import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { DEFAULT_PROVIDER_POOL_CONFIG, type ProviderPoolConfig } from "./types-pool.js";
 import {
 	type MultiAuthState,
+	type ProviderCredentialLeaseState,
 	type ProviderRotationState,
 	type RotationMode,
 	type SupportedProviderId,
@@ -49,11 +42,6 @@ export interface MultiAuthStorageMetrics {
 	cacheHitRate: number;
 	lockRetryCount: number;
 	lastKnownStateSizeBytes: number;
-}
-
-export interface MultiAuthStorageOptions {
-	debugDir?: string;
-	historyPersistence?: HistoryPersistenceConfig;
 }
 
 /**
@@ -88,6 +76,7 @@ export function createEmptyProviderState(
 		quotaStates: undefined,
 		quotaDrainStates: undefined,
 		modelIncompatibilities: undefined,
+		credentialLeases: undefined,
 	};
 }
 
@@ -106,9 +95,6 @@ export function createDefaultMultiAuthState(providers: readonly string[] = []): 
 	return {
 		version: 1,
 		providers: createProviderStateMap(providers),
-		ui: {
-			hiddenProviders: [],
-		},
 	};
 }
 
@@ -174,6 +160,7 @@ function parseProviderState(
 		quotaStates: parseQuotaStates(value.quotaStates),
 		quotaDrainStates: parseQuotaDrainStates(value.quotaDrainStates),
 		modelIncompatibilities: parseModelIncompatibilities(value.modelIncompatibilities),
+		credentialLeases: parseCredentialLeases(value.credentialLeases),
 	};
 }
 
@@ -579,6 +566,44 @@ function parseModelIncompatibilities(
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function parseCredentialLeases(value: unknown): ProviderRotationState["credentialLeases"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const result: Record<string, ProviderCredentialLeaseState> = {};
+	for (const [ownerId, entry] of Object.entries(value)) {
+		if (!isRecord(entry)) {
+			continue;
+		}
+		const normalizedOwnerId = typeof entry.ownerId === "string" && entry.ownerId.trim().length > 0
+			? entry.ownerId.trim()
+			: ownerId.trim();
+		const credentialId = typeof entry.credentialId === "string" ? entry.credentialId.trim() : "";
+		const acquiredAt = typeof entry.acquiredAt === "number" && Number.isFinite(entry.acquiredAt)
+			? entry.acquiredAt
+			: Date.now();
+		const lastSeenAt = typeof entry.lastSeenAt === "number" && Number.isFinite(entry.lastSeenAt)
+			? entry.lastSeenAt
+			: acquiredAt;
+		const expiresAt = typeof entry.expiresAt === "number" && Number.isFinite(entry.expiresAt)
+			? entry.expiresAt
+			: 0;
+		if (!normalizedOwnerId || !credentialId || expiresAt <= 0) {
+			continue;
+		}
+		result[normalizedOwnerId] = {
+			ownerId: normalizedOwnerId,
+			credentialId,
+			acquiredAt,
+			lastSeenAt,
+			expiresAt,
+		};
+	}
+
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 function parseNumberMap(value: unknown): Record<string, number> {
 	if (!isRecord(value)) {
 		return {};
@@ -612,26 +637,6 @@ function parseStringMap(value: unknown): Record<string, string> {
 	return result;
 }
 
-function parseHiddenProviders(value: unknown): string[] {
-	if (!Array.isArray(value)) {
-		return [];
-	}
-
-	const hiddenProviders: string[] = [];
-	for (const entry of value) {
-		if (typeof entry !== "string") {
-			continue;
-		}
-		const normalized = entry.trim();
-		if (!normalized || hiddenProviders.includes(normalized)) {
-			continue;
-		}
-		hiddenProviders.push(normalized);
-	}
-
-	return hiddenProviders;
-}
-
 function parseState(content: string | undefined): MultiAuthState {
 	if (!content || content.trim() === "") {
 		return createDefaultMultiAuthState();
@@ -649,13 +654,11 @@ function parseState(content: string | undefined): MultiAuthState {
 	}
 
 	const providersRaw = isRecord(parsed.providers) ? parsed.providers : {};
-	const uiRaw = isRecord(parsed.ui) ? parsed.ui : {};
 	const state = createDefaultMultiAuthState();
 
 	for (const [providerId, providerValue] of Object.entries(providersRaw)) {
 		state.providers[providerId] = parseProviderState(providerId as SupportedProviderId, providerValue);
 	}
-	state.ui.hiddenProviders = parseHiddenProviders(uiRaw.hiddenProviders);
 
 	return state;
 }
@@ -707,9 +710,6 @@ function cloneState(state: MultiAuthState): MultiAuthState {
 	return {
 		version: 1,
 		providers,
-		ui: {
-			hiddenProviders: [...state.ui.hiddenProviders],
-		},
 	};
 }
 
@@ -741,19 +741,10 @@ export class MultiAuthStorage {
 	private cacheMissCount = 0;
 	private lockRetryCount = 0;
 	private lastKnownStateSizeBytes = 0;
-	private readonly historyStore: MultiAuthHistoryStore;
 	private readonly storagePath: string;
 
-	constructor(storagePath: string = getDefaultMultiAuthPath(), options: MultiAuthStorageOptions = {}) {
+	constructor(storagePath: string = getDefaultMultiAuthPath()) {
 		this.storagePath = storagePath;
-		const defaultDebugDir =
-			storagePath === getDefaultMultiAuthPath() ? DEBUG_DIR : join(dirname(storagePath), "debug");
-		this.historyStore = new MultiAuthHistoryStore({
-			debugDir: options.debugDir ?? defaultDebugDir,
-			historyPersistence: cloneHistoryPersistenceConfig(
-				options.historyPersistence ?? DEFAULT_HISTORY_PERSISTENCE_CONFIG,
-			),
-		});
 	}
 
 	/**
@@ -904,12 +895,11 @@ export class MultiAuthStorage {
 
 		this.cacheMissCount += 1;
 		const parsed = await readMultiAuthStateSnapshot(this.storagePath);
-		const hydrated = await this.historyStore.hydrateState(parsed);
-		const serializedState = serializeState(hydrated);
-		this.updateCache(hydrated, fingerprint, serializedState, fileStats.size);
+		const serializedState = serializeState(parsed);
+		this.updateCache(parsed, fingerprint, serializedState, fileStats.size);
 		this.readLatencyMs.record(Date.now() - startedAt);
 		return {
-			state: this.cachedState ?? cloneState(hydrated),
+			state: this.cachedState ?? cloneState(parsed),
 			fingerprint,
 			serializedState,
 		};
@@ -920,9 +910,7 @@ export class MultiAuthStorage {
 		serializedState: string,
 	): Promise<void> {
 		const startedAt = Date.now();
-		const persistedState = await this.historyStore.createPersistedState(cloneState(state));
-		const persistedSerializedState = serializeState(persistedState);
-		await writeSerializedMultiAuthStateSnapshot(this.storagePath, persistedSerializedState);
+		await writeSerializedMultiAuthStateSnapshot(this.storagePath, serializedState);
 		const fileStats = await stat(this.storagePath);
 		const fingerprint = await this.buildSnapshotFingerprint(fileStats);
 		this.writeLatencyMs.record(Date.now() - startedAt);
@@ -930,9 +918,7 @@ export class MultiAuthStorage {
 	}
 
 	private async buildSnapshotFingerprint(fileStats: { mtimeMs: number; size: number }): Promise<string> {
-		const storageFingerprint = createStorageFingerprint(fileStats);
-		const historyFingerprint = await this.historyStore.createFingerprint();
-		return historyFingerprint ? `${storageFingerprint}|${historyFingerprint}` : storageFingerprint;
+		return createStorageFingerprint(fileStats);
 	}
 
 	private updateCache(

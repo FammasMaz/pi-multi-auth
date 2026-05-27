@@ -1935,6 +1935,8 @@ class MultiAuthManagerModal {
 		return `${statusCell} ${this.theme.fg("warning", "[DUP]")}`;
 	}
 
+	private static readonly EXHAUSTED_QUOTA_ERROR_THRESHOLD = 5;
+
 	private getCredentialState(credential: CredentialStatus): { symbol: string; label: string } {
 		const now = Date.now();
 		if (credential.disabledError) {
@@ -1952,6 +1954,18 @@ class MultiAuthManagerModal {
 		if (
 			typeof credential.quotaExhaustedUntil === "number" &&
 			credential.quotaExhaustedUntil > now
+		) {
+			return { symbol: "◌", label: "Exhaust" };
+		}
+		// Detect dead credentials that accumulated repeated quota errors
+		// and never recovered (e.g. prepaid credits permanently depleted).
+		// lastQuotaError is cleared on success, so if it's still set the
+		// last operation failed with a quota/rate-limit error.
+		if (
+			typeof credential.quotaErrorCount === "number" &&
+			credential.quotaErrorCount >= MultiAuthManagerModal.EXHAUSTED_QUOTA_ERROR_THRESHOLD &&
+			typeof credential.lastQuotaError === "string" &&
+			credential.lastQuotaError.length > 0
 		) {
 			return { symbol: "◌", label: "Exhaust" };
 		}
@@ -2551,10 +2565,7 @@ class MultiAuthManagerModal {
 		const deletionLabels = deletion.credentialIds.map(
 			(credentialId) => credentialLabelById.get(credentialId) ?? credentialId,
 		);
-		const previewLines = deletionLabels.slice(0, 5).map((label) => `- ${label}`);
-		if (deletionLabels.length > previewLines.length) {
-			previewLines.push(`- …and ${deletionLabels.length - previewLines.length} more`);
-		}
+		const previewLines = deletionLabels.map((label) => `- ${label}`);
 		const busyMessage =
 			deletion.credentialIds.length === 1
 				? `Deleting ${deletion.credentialIds[0]}...`

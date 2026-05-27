@@ -122,10 +122,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 
 	const keyDistributor = accountManager.getKeyDistributor();
 	registerGlobalKeyDistributor(keyDistributor);
-	const excludedProviders = new Set([
-		...configLoadResult.config.excludeProviders,
-		...hiddenProvidersAtStartup,
-	]);
+	const excludedProviders = new Set(hiddenProvidersAtStartup);
 	const isRuntimeProviderAllowed = (provider: string): boolean => {
 		if (excludedProviders.has(provider)) {
 			return false;

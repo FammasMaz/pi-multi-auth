@@ -65,6 +65,15 @@ export interface QuotaDrainStateForCredential {
 	updatedAt: number;
 }
 
+/** Soft process/session lease for a credential persisted in multi-auth.json. */
+export interface ProviderCredentialLeaseState {
+	ownerId: string;
+	credentialId: string;
+	acquiredAt: number;
+	lastSeenAt: number;
+	expiresAt: number;
+}
+
 /** Per-provider rotation state persisted in multi-auth.json. */
 export interface ProviderRotationState {
 	credentialIds: string[];
@@ -111,18 +120,14 @@ export interface ProviderRotationState {
 	quotaDrainStates?: Record<string, QuotaDrainStateForCredential>;
 	/** Temporary per-model credential incompatibilities keyed by credential ID then normalized model ID. */
 	modelIncompatibilities?: Record<string, Record<string, ModelCredentialIncompatibilityState>>;
-}
-
-/** UI preferences persisted in multi-auth.json. */
-export interface MultiAuthUiState {
-	hiddenProviders: string[];
+	/** Soft process/session leases used to avoid concurrent credential reuse when alternatives exist. */
+	credentialLeases?: Record<string, ProviderCredentialLeaseState>;
 }
 
 /** Top-level multi-auth.json shape. */
 export interface MultiAuthState {
 	version: 1;
 	providers: Record<string, ProviderRotationState>;
-	ui: MultiAuthUiState;
 }
 
 /** Credential kind shown in status output. */
