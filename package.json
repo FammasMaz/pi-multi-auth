@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-auth",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
   "type": "module",
   "main": "./index.ts",
@@ -70,9 +70,9 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.75.4",
-    "@earendil-works/pi-coding-agent": "^0.75.4",
-    "@earendil-works/pi-tui": "^0.75.4"
+    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -81,10 +81,10 @@
     "eslint": "^10.4.0",
     "globals": "^17.6.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.4",
-    "@earendil-works/pi-ai": "^0.75.4",
-    "@earendil-works/pi-coding-agent": "^0.75.4",
-    "@earendil-works/pi-tui": "^0.75.4"
+    "typescript-eslint": "^8.60.0",
+    "@earendil-works/pi-ai": "^0.75.5",
+    "@earendil-works/pi-coding-agent": "^0.75.5",
+    "@earendil-works/pi-tui": "^0.75.5"
   },
   "overrides": {
     "basic-ftp": "5.3.1",
