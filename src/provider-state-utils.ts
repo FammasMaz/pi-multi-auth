@@ -30,5 +30,6 @@ export function cloneProviderState(state: ProviderRotationState): ProviderRotati
 		modelIncompatibilities: state.modelIncompatibilities
 			? cloneJson(state.modelIncompatibilities)
 			: undefined,
+		credentialLeases: state.credentialLeases ? cloneJson(state.credentialLeases) : undefined,
 	};
 }

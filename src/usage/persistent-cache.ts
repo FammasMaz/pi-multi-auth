@@ -745,15 +745,17 @@ export class UsageSnapshotCacheStore {
 
 	private pruneDisplayEntries(
 		entries: readonly PersistedUsageDisplayCacheEntry[],
-		now: number,
+		_now: number,
 		options: UsageCacheHydrationOptions = {},
 	): PersistedUsageDisplayCacheEntry[] {
 		const latestByCredential = new Map<string, PersistedUsageDisplayCacheEntry>();
 		for (const entry of entries) {
-			if (entry.displayUntil <= now || !isDisplayEntryAllowed(entry, options)) {
+			if (!isDisplayEntryAllowed(entry, options)) {
 				continue;
 			}
-			const key = createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey);
+			// Deduplicate by provider + credentialId only so newer fetches always
+			// replace older ones regardless of credentialCacheKey (token) changes.
+			const key = createRecordKey(entry.provider, entry.credentialId, "");
 			const existing = latestByCredential.get(key);
 			if (!existing || compareEntriesForRetention(entry, existing) < 0) {
 				latestByCredential.set(key, entry);

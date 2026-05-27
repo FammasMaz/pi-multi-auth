@@ -12,6 +12,7 @@ import {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "./oauth-compat.js";
 import { getOAuthProvider, refreshOAuthCredential } from "./oauth-compat.js";
 import { CascadeStateManager } from "./cascade-state.js";
+import { DEFAULT_CASCADE_CONFIG } from "./types-cascade.js";
 import { discoverCloudflareWorkersAiBaseUrl } from "./cloudflare-account-discovery.js";
 import {
 	extractCloudflareCredentialAccountId,
@@ -24,12 +25,14 @@ import { isValidCloudflareOpenAIBaseUrl } from "./credential-request-overrides.j
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import { FailoverChainManager } from "./failover-chain.js";
 import { HealthScorer } from "./health-scorer.js";
+import { DEFAULT_HEALTH_CONFIG, DEFAULT_HEALTH_WEIGHTS } from "./types-health.js";
 import {
 	determineTokenExpiration,
 	OAuthRefreshScheduler,
 } from "./oauth-refresh-scheduler.js";
 import { PoolManager } from "./pool-manager.js";
 import { cloneProviderState } from "./provider-state-utils.js";
+import { resolveDefaultRotationMode } from "./rotation-modes.js";
 import { quotaClassifier } from "./quota-classifier.js";
 import { getRoundRobinCandidateIndex, getUsageBasedCandidateIndex } from "./rotation-selection.js";
 import {
@@ -47,6 +50,7 @@ import {
 	type CredentialRequestOverrides,
 	type CredentialStatus,
 	type MultiAuthState,
+	type ProviderCredentialLeaseState,
 	type ProviderRotationState,
 	type ProviderStatus,
 	type RotationMode,
@@ -75,6 +79,7 @@ import {
 	rankKiroCredentialsByPlanTier,
 } from "./model-entitlements.js";
 import { createUsageCredentialCacheKey, UsageService } from "./usage/index.js";
+import { DEFAULT_USAGE_COORDINATION_CONFIG } from "./usage/usage-coordinator.js";
 import { usageProviders } from "./usage/providers.js";
 import type { UsageFetchOptions, UsageFetchResult, UsageSnapshot } from "./usage/types.js";
 import {
@@ -113,9 +118,11 @@ import {
 } from "./balancer/credential-backoff.js";
 import {
 	cloneMultiAuthExtensionConfig,
-	DEBUG_DIR,
+	CONFIG_PATH,
 	DEFAULT_MULTI_AUTH_CONFIG,
 	type MultiAuthExtensionConfig,
+	writeMultiAuthProviderHidden,
+	writeMultiAuthProviderRotationMode,
 } from "./config.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
@@ -131,6 +138,7 @@ import {
 import { extractCodexCredentialIdentity } from "./openai-codex-identity.js";
 import type { ChainResult, FailoverChain, FailoverChainState } from "./types-failover.js";
 import {
+	DEFAULT_OAUTH_CONFIG,
 	isOAuthRefreshFailureError,
 	OAuthRefreshFailureError,
 	UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE,
@@ -151,7 +159,18 @@ const CODEX_SELECTION_EXHAUSTED_USED_PERCENT = 99;
 const BLOCKED_RECONCILE_USAGE_MAX_AGE_MS = 10_000;
 const MODEL_INCOMPATIBILITY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const CODEX_PROCESS_CREDENTIAL_LEASE_TTL_MS = 30 * 60 * 1000;
 const USAGE_PROVIDER_IDS = new Set(usageProviders.map((provider) => provider.id));
+const INTERNAL_CASCADE_CONFIG = { ...DEFAULT_CASCADE_CONFIG };
+const INTERNAL_HEALTH_CONFIG = {
+	...DEFAULT_HEALTH_CONFIG,
+	weights: { ...DEFAULT_HEALTH_WEIGHTS },
+};
+const INTERNAL_OAUTH_REFRESH_CONFIG = {
+	...DEFAULT_OAUTH_CONFIG,
+	excludedProviders: [...DEFAULT_OAUTH_CONFIG.excludedProviders],
+};
+const INTERNAL_USAGE_COORDINATION_CONFIG = { ...DEFAULT_USAGE_COORDINATION_CONFIG };
 
 interface AutoActivateOptions {
 	avoidUsageApi?: boolean;
@@ -163,6 +182,11 @@ interface AddApiKeyCredentialOptions {
 
 interface AccountManagerRuntimeOptions {
 	startOAuthRefreshScheduler?: boolean;
+	configPath?: string;
+}
+
+function createProcessLeaseOwnerId(): string {
+	return `pid:${process.pid}:started:${Date.now().toString(36)}`;
 }
 
 export type CredentialRefreshDisposition = "refreshed" | "preserved_active_token" | "reused_current_token";
@@ -200,6 +224,10 @@ type UsageQuotaState =
 	| {
 		state: "unknown";
 	};
+
+type CredentialSelectionCommitResult =
+	| { committed: true; sharedLeaseFallback: boolean }
+	| { committed: false; sharedLeaseFallback: false };
 
 export type CredentialUsageSnapshotResult = {
 	snapshot: UsageSnapshot | null;
@@ -1152,9 +1180,12 @@ function normalizeProviderState(
 		state.manualActiveCredentialId = undefined;
 	}
 
+	pruneProviderCredentialLeases(state, Date.now());
+
 	if (state.credentialIds.length === 0) {
 		state.activeIndex = 0;
 		state.manualActiveCredentialId = undefined;
+		state.credentialLeases = undefined;
 		return;
 	}
 
@@ -1168,6 +1199,95 @@ function normalizeProviderState(
 			state.activeIndex = manualIndex;
 		}
 	}
+}
+
+function pruneProviderCredentialLeases(
+	state: ProviderRotationState,
+	now: number,
+	ownerIdToRemove?: string,
+): boolean {
+	const leases = state.credentialLeases;
+	if (!leases) {
+		return false;
+	}
+
+	const validIds = new Set(state.credentialIds);
+	let didChange = false;
+	for (const [ownerId, lease] of Object.entries(leases)) {
+		const normalizedOwnerId = lease.ownerId?.trim() || ownerId.trim();
+		const credentialId = lease.credentialId?.trim();
+		const shouldRemove =
+			(ownerIdToRemove !== undefined && ownerId === ownerIdToRemove) ||
+			!normalizedOwnerId ||
+			!credentialId ||
+			!validIds.has(credentialId) ||
+			typeof lease.expiresAt !== "number" ||
+			!Number.isFinite(lease.expiresAt) ||
+			lease.expiresAt <= now;
+		if (shouldRemove) {
+			delete leases[ownerId];
+			didChange = true;
+			continue;
+		}
+		if (normalizedOwnerId !== lease.ownerId || ownerId !== normalizedOwnerId) {
+			delete leases[ownerId];
+			leases[normalizedOwnerId] = {
+				...lease,
+				ownerId: normalizedOwnerId,
+				credentialId,
+			};
+			didChange = true;
+		}
+	}
+
+	if (Object.keys(leases).length === 0) {
+		state.credentialLeases = undefined;
+		didChange = true;
+	}
+	return didChange;
+}
+
+function getOwnedCredentialLease(
+	state: ProviderRotationState,
+	ownerId: string,
+	now: number,
+): ProviderCredentialLeaseState | undefined {
+	const lease = state.credentialLeases?.[ownerId];
+	if (!lease || lease.expiresAt <= now || !state.credentialIds.includes(lease.credentialId)) {
+		return undefined;
+	}
+	return lease;
+}
+
+function getCredentialIdsLeasedByOtherOwners(
+	state: ProviderRotationState,
+	ownerId: string,
+	now: number,
+): Set<string> {
+	const credentialIds = new Set<string>();
+	for (const [leaseOwnerId, lease] of Object.entries(state.credentialLeases ?? {})) {
+		if (leaseOwnerId === ownerId || lease.expiresAt <= now) {
+			continue;
+		}
+		if (state.credentialIds.includes(lease.credentialId)) {
+			credentialIds.add(lease.credentialId);
+		}
+	}
+	return credentialIds;
+}
+
+function buildCredentialLease(
+	ownerId: string,
+	credentialId: string,
+	now: number,
+): ProviderCredentialLeaseState {
+	return {
+		ownerId,
+		credentialId,
+		acquiredAt: now,
+		lastSeenAt: now,
+		expiresAt: now + CODEX_PROCESS_CREDENTIAL_LEASE_TTL_MS,
+	};
 }
 
 function buildAvailableSet(
@@ -1438,10 +1558,16 @@ function getEffectiveOAuthCredentialExpiration(
 	return determineTokenExpiration(credential.access, credential.expires).expiresAt;
 }
 
+const CODEX_REFRESH_LEAD_TIME_MS = 5 * 60_000;
+
 function getOAuthRefreshLeadTimeMs(provider: SupportedProviderId, defaultSafetyWindowMs: number): number {
-	return provider === "cline"
-		? Math.max(defaultSafetyWindowMs, CLINE_REFRESH_LEAD_TIME_MS)
-		: defaultSafetyWindowMs;
+	if (provider === "cline") {
+		return Math.max(defaultSafetyWindowMs, CLINE_REFRESH_LEAD_TIME_MS);
+	}
+	if (provider === "openai-codex") {
+		return Math.max(defaultSafetyWindowMs, CODEX_REFRESH_LEAD_TIME_MS);
+	}
+	return defaultSafetyWindowMs;
 }
 
 function getSchedulerExpirationForRefreshLeadTime(
@@ -1602,7 +1728,9 @@ export class AccountManager {
 	private readonly healthScorer: HealthScorer;
 	private readonly oauthRefreshScheduler: OAuthRefreshScheduler;
 	private readonly runtimeOptions: Readonly<Required<AccountManagerRuntimeOptions>>;
+	private readonly configPath: string;
 	private readonly oauthRefreshInFlight = new Map<string, Promise<StoredOAuthCredential>>();
+	private readonly processLeaseOwnerId: string;
 	private readonly lightweightRotationState: LightweightRotationState;
 	private readonly authWriter: AuthWriter;
 	private readonly storage: MultiAuthStorage;
@@ -1614,6 +1742,7 @@ export class AccountManager {
 		Promise<CloudflareCredentialIdentity | null>
 	>();
 	private readonly backgroundUsageRefreshes = new Set<Promise<void>>();
+	private rotationModeMigrationPromise: Promise<void> | null = null;
 	private initializationPromise: Promise<void> | null = null;
 	private shutdownPromise: Promise<void> | null = null;
 	private isShuttingDown = false;
@@ -1629,22 +1758,20 @@ export class AccountManager {
 	) {
 		this.authWriter = authWriter;
 		this.extensionConfig = cloneMultiAuthExtensionConfig(extensionConfig);
-		this.storage =
-			storage ??
-			new MultiAuthStorage(undefined, {
-				debugDir: DEBUG_DIR,
-				historyPersistence: this.extensionConfig.historyPersistence,
-			});
-		this.usageCoordinator = new UsageCoordinator(this.extensionConfig.usageCoordination);
+		this.processLeaseOwnerId = createProcessLeaseOwnerId();
+		this.configPath = runtimeOptions.configPath ?? CONFIG_PATH;
+		this.storage = storage ?? new MultiAuthStorage();
+		this.usageCoordinator = new UsageCoordinator(INTERNAL_USAGE_COORDINATION_CONFIG);
 		this.usageService = usageService;
 		this.usageService.setUsageCoordinator(this.usageCoordinator);
 		this.providerRegistry = providerRegistry;
 		this.lightweightRotationState = new LightweightRotationState(this.storage);
 		this.runtimeOptions = {
 			startOAuthRefreshScheduler: runtimeOptions.startOAuthRefreshScheduler !== false,
+			configPath: this.configPath,
 		};
-		this.cascadeStateManager = new CascadeStateManager(this.extensionConfig.cascade);
-		this.healthScorer = new HealthScorer(this.extensionConfig.health);
+		this.cascadeStateManager = new CascadeStateManager(INTERNAL_CASCADE_CONFIG);
+		this.healthScorer = new HealthScorer(INTERNAL_HEALTH_CONFIG);
 		const globalKeyDistributor = getGlobalKeyDistributor();
 		this.keyDistributor =
 			keyDistributor ??
@@ -1666,7 +1793,7 @@ export class AccountManager {
 		);
 		this.oauthRefreshScheduler = new OAuthRefreshScheduler(
 			async (credentialId, providerId) => this.refreshScheduledOAuthCredential(providerId, credentialId),
-			this.extensionConfig.oauthRefresh,
+			INTERNAL_OAUTH_REFRESH_CONFIG,
 		);
 		if (this.runtimeOptions.startOAuthRefreshScheduler) {
 			this.oauthRefreshScheduler.start();
@@ -1689,8 +1816,8 @@ export class AccountManager {
 
 	private isOAuthRefreshManagedForProvider(provider: SupportedProviderId): boolean {
 		return (
-			this.extensionConfig.oauthRefresh.enabled &&
-			!this.extensionConfig.oauthRefresh.excludedProviders.includes(provider)
+			INTERNAL_OAUTH_REFRESH_CONFIG.enabled &&
+			!INTERNAL_OAUTH_REFRESH_CONFIG.excludedProviders.includes(provider)
 		);
 	}
 
@@ -1698,10 +1825,10 @@ export class AccountManager {
 		if (this.isOAuthRefreshManagedForProvider(provider)) {
 			return;
 		}
-		if (!this.extensionConfig.oauthRefresh.enabled) {
-			throw new Error("OAuth token refresh is globally disabled in pi-multi-auth configuration.");
+		if (!INTERNAL_OAUTH_REFRESH_CONFIG.enabled) {
+			throw new Error("OAuth token refresh is disabled internally.");
 		}
-		throw new Error(`OAuth token refresh is explicitly disabled for provider ${provider}.`);
+		throw new Error(`OAuth token refresh is internally disabled for provider ${provider}.`);
 	}
 
 	async shutdown(): Promise<void> {
@@ -1712,8 +1839,82 @@ export class AccountManager {
 		this.isShuttingDown = true;
 		this.oauthRefreshScheduler.stop();
 		this.lightweightRotationState.shutdown();
-		this.shutdownPromise = this.drainBackgroundUsageRefreshes();
+		this.shutdownPromise = (async () => {
+			await this.releaseProcessCredentialLeases();
+			await this.drainBackgroundUsageRefreshes();
+		})();
 		return this.shutdownPromise;
+	}
+
+	private usesProcessCredentialLeases(rotationMode: RotationMode): boolean {
+		return rotationMode === "usage-based";
+	}
+
+	private async commitProcessCredentialLease(
+		provider: SupportedProviderId,
+		credentialId: string,
+		effectiveExcludedCredentialIds: ReadonlySet<string>,
+	): Promise<CredentialSelectionCommitResult> {
+		return this.storage.withLock<CredentialSelectionCommitResult>((stored) => {
+			const providerState = getProviderState(stored, provider);
+			const now = Date.now();
+			let sharedLeaseFallback = false;
+			pruneProviderCredentialLeases(providerState, now);
+			const leasedByOtherOwners = getCredentialIdsLeasedByOtherOwners(
+				providerState,
+				this.processLeaseOwnerId,
+				now,
+			);
+			const storedAvailable = buildAvailableSet(
+				providerState,
+				now,
+				new Set(effectiveExcludedCredentialIds),
+			);
+			if (!storedAvailable.has(credentialId)) {
+				return { result: { committed: false as const, sharedLeaseFallback: false } };
+			}
+			const selectedLeasedByOtherOwner = leasedByOtherOwners.has(credentialId);
+			if (selectedLeasedByOtherOwner) {
+				const hasUnleasedAlternative = [...storedAvailable].some(
+					(candidateCredentialId) =>
+						candidateCredentialId !== credentialId &&
+						!leasedByOtherOwners.has(candidateCredentialId),
+				);
+				if (hasUnleasedAlternative) {
+					return { result: { committed: false as const, sharedLeaseFallback: false } };
+				}
+				sharedLeaseFallback = true;
+			}
+
+			const currentLease = providerState.credentialLeases?.[this.processLeaseOwnerId];
+			const nextLease = buildCredentialLease(this.processLeaseOwnerId, credentialId, now);
+			providerState.credentialLeases = providerState.credentialLeases ?? {};
+			providerState.credentialLeases[this.processLeaseOwnerId] = {
+				...nextLease,
+				acquiredAt:
+					currentLease?.credentialId === credentialId &&
+					typeof currentLease.acquiredAt === "number" &&
+					Number.isFinite(currentLease.acquiredAt)
+						? currentLease.acquiredAt
+						: nextLease.acquiredAt,
+			};
+			return { result: { committed: true as const, sharedLeaseFallback }, next: stored };
+		});
+	}
+
+	private async releaseProcessCredentialLeases(): Promise<void> {
+		await this.storage.withLock((state) => {
+			let didChange = false;
+			const now = Date.now();
+			for (const providerState of Object.values(state.providers)) {
+				didChange = pruneProviderCredentialLeases(
+					providerState,
+					now,
+					this.processLeaseOwnerId,
+				) || didChange;
+			}
+			return didChange ? { result: undefined, next: state } : { result: undefined };
+		});
 	}
 
 	/**
@@ -1722,10 +1923,6 @@ export class AccountManager {
 	 */
 	refreshExtensionConfig(config: MultiAuthExtensionConfig): void {
 		this.extensionConfig = cloneMultiAuthExtensionConfig(config);
-		this.cascadeStateManager.updateConfig(this.extensionConfig.cascade);
-		this.healthScorer.updateConfig(this.extensionConfig.health);
-		this.oauthRefreshScheduler.updateConfig(this.extensionConfig.oauthRefresh);
-		this.usageCoordinator.updateConfig(this.extensionConfig.usageCoordination);
 	}
 
 	/**
@@ -1743,7 +1940,6 @@ export class AccountManager {
 		const state = await this.syncProviderState(provider);
 		return [...state.credentialIds];
 	}
-
 	/**
 	 * Returns whether another credential is actually selectable for the same request.
 	 * This mirrors acquisition filters without committing rotation state, so transient
@@ -1921,13 +2117,63 @@ export class AccountManager {
 		});
 	}
 
+	private async migrateLegacyRotationModesToConfig(
+		providers: readonly SupportedProviderId[],
+	): Promise<void> {
+		if (this.rotationModeMigrationPromise) {
+			return this.rotationModeMigrationPromise;
+		}
+
+		this.rotationModeMigrationPromise = (async () => {
+			const state = await this.storage.read();
+			for (const provider of providers) {
+				if (this.extensionConfig.rotationModes[provider]) {
+					continue;
+				}
+				const legacyRotationMode = state.providers[provider]?.rotationMode;
+				if (!legacyRotationMode || legacyRotationMode === resolveDefaultRotationMode(provider)) {
+					continue;
+				}
+				const rotationModes = writeMultiAuthProviderRotationMode(
+					provider,
+					legacyRotationMode,
+					this.configPath,
+				);
+				this.extensionConfig = {
+					...this.extensionConfig,
+					rotationModes,
+				};
+			}
+		})();
+
+		return this.rotationModeMigrationPromise;
+	}
+
+	private resolveProviderRotationMode(
+		provider: SupportedProviderId,
+		legacyRotationMode?: RotationMode,
+	): RotationMode {
+		return (
+			this.extensionConfig.rotationModes[provider] ??
+			legacyRotationMode ??
+			resolveDefaultRotationMode(provider)
+		);
+	}
+
+	private applyEffectiveProviderRotationMode(
+		provider: SupportedProviderId,
+		state: ProviderRotationState,
+		legacyRotationMode: RotationMode = state.rotationMode,
+	): ProviderRotationState {
+		state.rotationMode = this.resolveProviderRotationMode(provider, legacyRotationMode);
+		return state;
+	}
+
 	/**
 	 * Returns providers hidden from the /multi-auth modal and runtime work.
 	 */
 	async getHiddenProviders(): Promise<SupportedProviderId[]> {
-		return this.storage.withLock((state) => ({
-			result: [...state.ui.hiddenProviders],
-		}));
+		return [...this.extensionConfig.hiddenProviders];
 	}
 
 	private async readHiddenProviderSet(): Promise<ReadonlySet<SupportedProviderId>> {
@@ -1957,23 +2203,18 @@ export class AccountManager {
 	 * Hides or unhides a provider in the /multi-auth modal.
 	 */
 	async setProviderHidden(provider: SupportedProviderId, hidden: boolean): Promise<boolean> {
-		const result = await this.storage.withLock((state) => {
-			const currentHidden = new Set(state.ui.hiddenProviders);
-			if (hidden) {
-				currentHidden.add(provider);
-			} else {
-				currentHidden.delete(provider);
-			}
+		const hiddenProviders = writeMultiAuthProviderHidden(provider, hidden, this.configPath);
+		this.extensionConfig = {
+			...this.extensionConfig,
+			hiddenProviders,
+		};
 
-			state.ui.hiddenProviders = [...currentHidden];
-			return {
-				result: {
-					hidden: currentHidden.has(provider),
-					providerState: cloneProviderState(getProviderState(state, provider)),
-				},
-				next: state,
-			};
-		});
+		const result = await this.storage.withLock((state) => ({
+			result: {
+				hidden: hiddenProviders.includes(provider),
+				providerState: cloneProviderState(getProviderState(state, provider)),
+			},
+		}));
 
 		if (result.hidden) {
 			await this.cancelProviderOperationalWork(provider, result.providerState);
@@ -2133,7 +2374,37 @@ export class AccountManager {
 		}
 
 		const selectedCredentialIds = this.usageCoordinator.selectCredentialIds(uniqueCredentialIds, operation);
-		for (const credentialId of selectedCredentialIds) {
+		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, maxAgeMs);
+	}
+
+	private enqueueAllCredentialUsageRefresh(
+		provider: SupportedProviderId,
+		credentialIds: readonly string[],
+		operation: UsageCoordinationOperation,
+		maxAgeMs: number = SELECTION_USAGE_MAX_AGE_MS,
+	): number {
+		if (this.isShuttingDown) {
+			return 0;
+		}
+
+		const uniqueCredentialIds = [...new Set(credentialIds.map((credentialId) => credentialId.trim()).filter(Boolean))];
+		if (uniqueCredentialIds.length === 0) {
+			return 0;
+		}
+
+		const selectedCredentialIds = this.usageCoordinator
+			.selectCredentialIdWindows(uniqueCredentialIds, operation)
+			.flat();
+		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, maxAgeMs);
+	}
+
+	private queueCredentialUsageRefresh(
+		provider: SupportedProviderId,
+		credentialIds: readonly string[],
+		operation: UsageCoordinationOperation,
+		maxAgeMs: number,
+	): number {
+		for (const credentialId of credentialIds) {
 			const backgroundRequest = this.getCredentialUsageSnapshotWithContext(
 				provider,
 				credentialId,
@@ -2149,6 +2420,7 @@ export class AccountManager {
 					credentialRef: redactUsageCredentialIdentifier(credentialId),
 					hasSnapshot: usage.snapshot !== null,
 					hasError: Boolean(usage.error),
+					usageError: usage.error ?? undefined,
 				});
 			}).catch((error: unknown) => {
 				multiAuthDebugLogger.log("usage_background_refresh_failed", {
@@ -2160,7 +2432,7 @@ export class AccountManager {
 			});
 			this.trackBackgroundUsageRefresh(backgroundRequest);
 		}
-		return selectedCredentialIds.length;
+		return credentialIds.length;
 	}
 
 	selectUsageRefreshCandidates<TRequest extends { provider: SupportedProviderId; credentialId: string }>(
@@ -2402,6 +2674,82 @@ export class AccountManager {
 				fromCache: false,
 			};
 		}
+		// codex-lb parity: on auth error during usage fetch, force-refresh token and retry once
+		if (usage.error && usage.error.length > 0 && freshCredential.type === "oauth") {
+			const isAuthLikeUsageError =
+				/\b401\b|\b403\b|expired|invalid|denied|missing required usage scope|token|unauthorized/i.test(
+					usage.error,
+				);
+			if (isAuthLikeUsageError && !options?.signal?.aborted) {
+				multiAuthDebugLogger.log("usage_fetch_auth_error_force_refresh", {
+					provider,
+					credentialRef: redactUsageCredentialIdentifier(credentialId),
+					message: usage.error,
+				});
+				try {
+					const forceRefreshed = await this.refreshCredentialToken(
+						provider,
+						credentialId,
+						freshCredential,
+						context?.signal ?? options?.signal,
+					);
+					this.registerCurrentUsageCredentialCacheKey(
+						provider,
+						credentialId,
+						forceRefreshed,
+					);
+					const forcedUsage = await raceWithSignal(
+						this.usageService.fetchUsage(
+							provider,
+							credentialId,
+							{
+								accessToken: getCredentialSecret(forceRefreshed),
+								accountId:
+									forceRefreshed.type === "oauth" &&
+									typeof forceRefreshed.accountId === "string" &&
+									forceRefreshed.accountId.trim().length > 0
+										? forceRefreshed.accountId
+										: undefined,
+								credential: { ...forceRefreshed },
+							},
+							options,
+						),
+						context?.signal ?? options?.signal,
+						`Usage fetch retry aborted for ${provider}/${credentialId}.`,
+					);
+					if (context) {
+						context.credentialsByIdPromise ??= this.authWriter.getCredentials(
+							context.credentialIds,
+						);
+						const credentialsById = await context.credentialsByIdPromise;
+						credentialsById.set(credentialId, forceRefreshed);
+					}
+					if (!forcedUsage.fromCache) {
+						await this.reconcileQuotaStateFromUsage(
+							provider,
+							credentialId,
+							forcedUsage.snapshot,
+						);
+					}
+					return {
+						snapshot: forcedUsage.snapshot,
+						error: forcedUsage.error,
+						fromCache: forcedUsage.fromCache,
+					};
+				} catch (retryError: unknown) {
+					if (retryError instanceof Error && retryError.name === "AbortError") {
+						throw retryError;
+					}
+					multiAuthDebugLogger.log("usage_fetch_auth_retry_failed", {
+						provider,
+						credentialRef: redactUsageCredentialIdentifier(credentialId),
+						message: getErrorMessage(retryError),
+					});
+					// Fall through to original error handling
+				}
+			}
+		}
+
 		if (isCodexUsageAuthenticationFailure(provider, usage)) {
 			const usageError = usage.error;
 			try {
@@ -3355,7 +3703,7 @@ export class AccountManager {
 		if (shouldPersistRefreshSchedule) {
 			await this.persistOAuthRefreshSchedule(provider);
 		}
-		this.usageService.clearOperationalCredential(provider, credentialId);
+		this.registerCurrentUsageCredentialCacheKey(provider, credentialId, effectiveCredential);
 
 		return {
 			credential: effectiveCredential,
@@ -3490,6 +3838,14 @@ export class AccountManager {
 					warning: `Usage reconciliation failed (${message})`,
 				});
 			}
+		}
+
+		if (this.usageService.hasProvider(provider)) {
+			this.enqueueAllCredentialUsageRefresh(
+				provider,
+				state.credentialIds.filter((credentialId) => !usageReconciliationCredentialIds.has(credentialId)),
+				"manual-provider-refresh",
+			);
 		}
 
 		return {
@@ -3991,6 +4347,43 @@ export class AccountManager {
 				);
 			}
 
+			let selectableAvailable = available;
+			if (this.usesProcessCredentialLeases(state.rotationMode)) {
+				const ownLease = getOwnedCredentialLease(state, this.processLeaseOwnerId, now);
+				const leasedByOtherOwners = getCredentialIdsLeasedByOtherOwners(
+					state,
+					this.processLeaseOwnerId,
+					now,
+				);
+				const unleasedAvailable = new Set(
+					[...available].filter((credentialId) => !leasedByOtherOwners.has(credentialId)),
+				);
+				if (
+					ownLease &&
+					available.has(ownLease.credentialId) &&
+					!leasedByOtherOwners.has(ownLease.credentialId)
+				) {
+					// Process already holds a lease on this credential. Don't short-circuit
+					// rotation — let the normal selection logic run so the usage-based
+					// ranking can still rotate fairly within the same process. The lease
+					// will be transferred to the selected credential in the commit step.
+					selectableAvailable = unleasedAvailable;
+				} else if (unleasedAvailable.size > 0) {
+					selectableAvailable = unleasedAvailable;
+				} else {
+					if (ownLease && available.has(ownLease.credentialId)) {
+						selectedIndex = state.credentialIds.indexOf(ownLease.credentialId);
+					}
+					if (leasedByOtherOwners.size > 0) {
+						multiAuthDebugLogger.log("credential_lease_shared_fallback", {
+							provider,
+							availableCount: available.size,
+							leasedCredentialCount: leasedByOtherOwners.size,
+						});
+					}
+				}
+			}
+
 			// Build the ordered list of selection passes. When the eligibility result
 			// includes plan-tier ranking (BlazeAPI: Premium → Pro → Free), each non-empty
 			// tier becomes its own pass so a higher tier is fully tried (and exhausted)
@@ -3999,10 +4392,12 @@ export class AccountManager {
 			// (e.g. unknown plan type) still gets a chance.
 			const selectionPasses: Set<string>[] = [];
 			const preferredTiers = modelEligibility.preferredCredentialTiers;
-			if (preferredTiers && preferredTiers.length > 0) {
+			if (selectedIndex !== undefined) {
+				selectionPasses.push(new Set([state.credentialIds[selectedIndex]]));
+			} else if (preferredTiers && preferredTiers.length > 0) {
 				for (const tier of preferredTiers) {
 					const tierAvailable = new Set(
-						[...available].filter((credentialId) => tier.includes(credentialId)),
+						[...selectableAvailable].filter((credentialId) => tier.includes(credentialId)),
 					);
 					if (tierAvailable.size > 0) {
 						selectionPasses.push(tierAvailable);
@@ -4010,7 +4405,7 @@ export class AccountManager {
 				}
 			} else {
 				const preferredAvailable = new Set(
-					[...available].filter((credentialId) =>
+					[...selectableAvailable].filter((credentialId) =>
 						modelEligibility.preferredCredentialIds?.includes(credentialId),
 					),
 				);
@@ -4018,7 +4413,7 @@ export class AccountManager {
 					selectionPasses.push(preferredAvailable);
 				}
 			}
-			selectionPasses.push(available);
+			selectionPasses.push(selectableAvailable);
 			for (const selectionAvailable of selectionPasses) {
 				const pooledSelection = await this.selectPooledCredential(
 					provider,
@@ -4115,7 +4510,35 @@ export class AccountManager {
 			options?.signal,
 		);
 		const effectiveRotationMode = selectedRotationMode ?? state.rotationMode;
+		const shouldUseProcessCredentialLease =
+			this.usesProcessCredentialLeases(effectiveRotationMode) &&
+			pinnedCredentialId === undefined &&
+			state.manualActiveCredentialId === undefined;
 		throwIfAborted(options?.signal, `Credential acquisition aborted for ${provider}.`);
+
+		if (shouldUseProcessCredentialLease) {
+			const leaseCommit = await this.commitProcessCredentialLease(
+				provider,
+				credentialId,
+				effectiveExcludedCredentialIds,
+			);
+			if (!leaseCommit.committed) {
+				const nextExcludedCredentialIds = new Set(effectiveExcludedCredentialIds);
+				nextExcludedCredentialIds.add(credentialId);
+				return this.acquireCredential(provider, {
+					excludedCredentialIds: nextExcludedCredentialIds,
+					modelId: options?.modelId,
+					selectionCache,
+					signal: options?.signal,
+				});
+			}
+			if (leaseCommit.sharedLeaseFallback) {
+				multiAuthDebugLogger.log("credential_lease_shared_committed", {
+					provider,
+					credentialRef: redactUsageCredentialIdentifier(credentialId),
+				});
+			}
+		}
 
 		const selectedAt = Date.now();
 		const hasSelectionExclusions = effectiveExcludedCredentialIds.size > 0 || pinnedCredentialId !== undefined;
@@ -4517,9 +4940,14 @@ export class AccountManager {
 	 */
 	async setRotationMode(provider: SupportedProviderId, rotationMode: RotationMode): Promise<void> {
 		await this.flushLightweightRotationStateIfNeeded(provider);
+		const rotationModes = writeMultiAuthProviderRotationMode(provider, rotationMode, this.configPath);
+		this.extensionConfig = {
+			...this.extensionConfig,
+			rotationModes,
+		};
 		await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);
-			providerState.rotationMode = rotationMode;
+			providerState.rotationMode = resolveDefaultRotationMode(provider);
 			return { result: undefined, next: state };
 		});
 	}
@@ -5451,7 +5879,7 @@ export class AccountManager {
 
 		const safetyWindowMs = getOAuthRefreshLeadTimeMs(
 			provider,
-			this.extensionConfig.oauthRefresh.safetyWindowMs,
+			INTERNAL_OAUTH_REFRESH_CONFIG.safetyWindowMs,
 		);
 		if (Date.now() < credential.expires - safetyWindowMs) {
 			return credential;
@@ -5502,7 +5930,7 @@ export class AccountManager {
 			let refreshed: OAuthCredentials;
 			try {
 				refreshed = await refreshOAuthCredential(provider, credential, {
-					requestTimeoutMs: this.extensionConfig.oauthRefresh.requestTimeoutMs,
+					requestTimeoutMs: INTERNAL_OAUTH_REFRESH_CONFIG.requestTimeoutMs,
 				});
 			} catch (error) {
 				const recoveredCredential = await this.tryRecoverConcurrentCodexRefresh(
@@ -5619,8 +6047,10 @@ export class AccountManager {
 		const currentProviderState = cloneProviderState(
 			await this.storage.readProviderState(provider),
 		);
+		const legacyRotationMode = currentProviderState.rotationMode;
 		const normalizedProviderState = cloneProviderState(currentProviderState);
 		normalizedProviderState.credentialIds = [...normalizedCredentialIds];
+		normalizedProviderState.rotationMode = resolveDefaultRotationMode(provider);
 		normalizeProviderState(normalizedProviderState, provider);
 		clearRecoveredOAuthRefreshFailureStateForProvider(
 			provider,
@@ -5632,9 +6062,13 @@ export class AccountManager {
 		}
 
 		if (haveEquivalentProviderState(currentProviderState, normalizedProviderState)) {
-			const effectiveProviderState = isLightweightProvider
-				? this.applyLightweightRotationState(provider, cloneProviderState(currentProviderState))
-				: currentProviderState;
+			const effectiveProviderState = this.applyEffectiveProviderRotationMode(
+				provider,
+				isLightweightProvider
+					? this.applyLightweightRotationState(provider, cloneProviderState(currentProviderState))
+					: currentProviderState,
+				legacyRotationMode,
+			);
 			if (isHiddenProvider) {
 				await this.cancelProviderOperationalWork(provider, effectiveProviderState);
 				return effectiveProviderState;
@@ -5647,6 +6081,7 @@ export class AccountManager {
 		const providerState = await this.storage.withLock((state) => {
 			const storedProviderState = getProviderState(state, provider);
 			storedProviderState.credentialIds = [...normalizedCredentialIds];
+			storedProviderState.rotationMode = resolveDefaultRotationMode(provider);
 			normalizeProviderState(storedProviderState, provider);
 			clearRecoveredOAuthRefreshFailureStateForProvider(
 				provider,
@@ -5661,9 +6096,13 @@ export class AccountManager {
 				next: state,
 			};
 		});
-		const effectiveProviderState = isLightweightProvider
-			? this.applyLightweightRotationState(provider, cloneProviderState(providerState))
-			: providerState;
+		const effectiveProviderState = this.applyEffectiveProviderRotationMode(
+			provider,
+			isLightweightProvider
+				? this.applyLightweightRotationState(provider, cloneProviderState(providerState))
+				: providerState,
+			legacyRotationMode,
+		);
 		if (isHiddenProvider) {
 			await this.cancelProviderOperationalWork(provider, effectiveProviderState);
 			return effectiveProviderState;
@@ -5683,6 +6122,7 @@ export class AccountManager {
 
 		const initializationPromise = (async () => {
 			const providers = await this.providerRegistry.discoverProviderIds();
+			await this.migrateLegacyRotationModesToConfig(providers);
 			const hiddenProviders = await this.readHiddenProviderSet();
 			const operationalProviders = providers.filter((provider) => !hiddenProviders.has(provider));
 			const normalizedProviders = await this.authWriter.normalizeProviderCredentials(operationalProviders, {
@@ -5762,6 +6202,7 @@ export class AccountManager {
 						continue;
 					}
 					providerState.credentialIds = [...(credentialIdsByProvider.get(provider) ?? [])];
+					providerState.rotationMode = resolveDefaultRotationMode(provider);
 					normalizeProviderState(providerState, provider);
 					if (provider === "cline" || !this.isOAuthRefreshManagedForProvider(provider)) {
 						clearDisabledOAuthRefreshFailureStateForProvider(provider, providerState);
@@ -5772,7 +6213,6 @@ export class AccountManager {
 					applyCredentialNormalization(result.provider, providerState, result);
 				}
 
-				state.ui.hiddenProviders = [...new Set(state.ui.hiddenProviders)];
 				return {
 					result: Object.fromEntries(
 						operationalProviders.map((provider) => [provider, cloneProviderState(getProviderState(state, provider))]),
@@ -5786,10 +6226,11 @@ export class AccountManager {
 				}
 			}
 			for (const [provider, providerState] of Object.entries(persistedProviders)) {
-				this.loadProviderTelemetry(provider, providerState);
+				const effectiveProviderState = this.applyEffectiveProviderRotationMode(provider, providerState);
+				this.loadProviderTelemetry(provider, effectiveProviderState);
 				await this.syncProviderOAuthSchedules(
 					provider,
-					providerState,
+					effectiveProviderState,
 					credentialEntriesByProvider.get(provider),
 				);
 			}
@@ -5858,7 +6299,7 @@ export class AccountManager {
 		const scheduledExpiration = getSchedulerExpirationForRefreshLeadTime(
 			provider,
 			expiration.expiresAt,
-			this.extensionConfig.oauthRefresh.safetyWindowMs,
+			INTERNAL_OAUTH_REFRESH_CONFIG.safetyWindowMs,
 		);
 		this.oauthRefreshScheduler.scheduleRefresh(credentialId, provider, scheduledExpiration);
 	}
@@ -5941,6 +6382,7 @@ export class AccountManager {
 			const refreshed = await this.refreshCredentialToken(provider, credentialId, credential);
 			this.scheduleOAuthRefresh(provider, credentialId, refreshed);
 			await this.persistOAuthRefreshSchedule(provider);
+			this.enqueueCredentialUsageRefresh(provider, [credentialId], "manual-account-refresh");
 			return determineTokenExpiration(refreshed.access, refreshed.expires).expiresAt;
 		} catch (error) {
 			if (isOAuthRefreshFailureError(error) && error.details.permanent) {
@@ -6056,6 +6498,21 @@ export class AccountManager {
 			}
 		};
 
+		// Quota recovery bypass: check which credentials have stale quota cooldown
+		const providerState = await this.storage.readProviderState(provider);
+		const now = Date.now();
+		const quotaRecoveryCandidates = new Set<string>();
+		for (const id of credentialIds) {
+			const exhaustedUntil = providerState.quotaExhaustedUntil?.[id] ?? 0;
+			const quotaState = providerState.quotaStates?.[id];
+			if (exhaustedUntil > 0 && exhaustedUntil <= now) {
+				quotaRecoveryCandidates.add(id);
+			}
+			if (quotaState?.resetAt && typeof quotaState.resetAt === "number" && quotaState.resetAt <= now) {
+				quotaRecoveryCandidates.add(id);
+			}
+		}
+
 		for (const credentialId of credentialIds) {
 			const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
 			let usage = cachedUsage.usage;
@@ -6082,7 +6539,18 @@ export class AccountManager {
 			) {
 				pushUnique(bootstrapCandidateCredentialIds, credentialId);
 			}
-			processUsage(credentialId, usage, { planOnly: cachedUsage.needsRefresh });
+			// Force re-verification for credentials whose quota cooldown has expired
+			if (quotaRecoveryCandidates.has(credentialId)) {
+				if (usage?.snapshot) {
+					// Mark as stale so processUsage uses planOnly mode, which triggers bootstrap
+					processUsage(credentialId, usage, { planOnly: true });
+					pushUnique(bootstrapCandidateCredentialIds, credentialId);
+				} else {
+					processUsage(credentialId, usage);
+				}
+			} else {
+				processUsage(credentialId, usage, { planOnly: cachedUsage.needsRefresh });
+			}
 		}
 
 		let bootstrapPerformed = false;
@@ -6151,9 +6619,7 @@ export class AccountManager {
 		);
 
 		let eligibleCredentialIds = [...verifiedEligibleCredentialIds];
-		const allowUnverifiedOnUsageFailure =
-			requiresEntitlement &&
-			this.extensionConfig.modelEntitlements.codex.usageLookupFailureMode === "allow-unverified";
+		const allowUnverifiedOnUsageFailure = false;
 		if (requiresEntitlement) {
 			const unverifiedCredentialIds = [...usageFailureCredentialIds];
 			for (const credentialId of unknownPlanCredentialIds) {
@@ -6264,10 +6730,7 @@ export class AccountManager {
 		let hasUnknownPlanType = false;
 		let hasUsageFailure = false;
 		let hasQuotaExhausted = false;
-		const allowUnverifiedOnUsageFailure =
-			requiresEntitlement &&
-			provider === "openai-codex" &&
-			this.extensionConfig.modelEntitlements.codex.usageLookupFailureMode === "allow-unverified";
+		const allowUnverifiedOnUsageFailure = false;
 
 		// Provider-aware plan classification: codex paths use `normalizeCodexPlanType` +
 		// `isPlanEligibleForModel`; BlazeAPI and Kiro paths route through their own

@@ -19,6 +19,7 @@ export interface UsageCoordinationConfig {
 	modalRefreshCandidateWindow: number;
 	manualProviderRefreshCandidateWindow: number;
 	accountCooldownMs: number;
+	authCooldownMs: number;
 	providerCooldownMs: number;
 	circuitBreakerFailureThreshold: number;
 	circuitBreakerCooldownMs: number;
@@ -36,6 +37,7 @@ export const DEFAULT_USAGE_COORDINATION_CONFIG: UsageCoordinationConfig = {
 	modalRefreshCandidateWindow: 8,
 	manualProviderRefreshCandidateWindow: 10,
 	accountCooldownMs: 30_000,
+	authCooldownMs: 5_000,
 	providerCooldownMs: 60_000,
 	circuitBreakerFailureThreshold: 3,
 	circuitBreakerCooldownMs: 120_000,
@@ -48,7 +50,7 @@ export interface UsageRequestDescriptor {
 	operation: UsageCoordinationOperation;
 }
 
-export type UsageRequestDeferralReason = "credential_cooldown";
+export type UsageRequestDeferralReason = "credential_cooldown" | "auth_cooldown";
 
 interface UsageRequestDeferral {
 	reason: UsageRequestDeferralReason;
@@ -176,6 +178,7 @@ export class UsageCoordinator {
 	private globalInFlight = 0;
 	private readonly providerState = new Map<string, ProviderPolicyState>();
 	private readonly accountCooldownUntil = new Map<string, number>();
+	private readonly authCooldownUntil = new Map<string, number>();
 	private readonly queue: QueueEntry[] = [];
 	private readonly progressiveWindowCursors = new Map<string, number>();
 
@@ -396,6 +399,7 @@ export class UsageCoordinator {
 
 		const nonNegativeFields: Array<keyof UsageCoordinationConfig> = [
 			"accountCooldownMs",
+			"authCooldownMs",
 			"providerCooldownMs",
 			"circuitBreakerCooldownMs",
 			"jitterMs",
@@ -428,14 +432,21 @@ export class UsageCoordinator {
 		descriptor: UsageRequestDescriptor,
 		now: number,
 	): UsageRequestDeferral | null {
-		const accountCooldown = this.accountCooldownUntil.get(
-			this.accountKey(descriptor.provider, descriptor.credentialId),
-		) ?? 0;
+		const key = this.accountKey(descriptor.provider, descriptor.credentialId);
+		const accountCooldown = this.accountCooldownUntil.get(key) ?? 0;
 		if (accountCooldown > now) {
 			return {
 				reason: "credential_cooldown",
 				retryAt: accountCooldown,
 				message: `Fresh usage request deferred for ${descriptor.provider}: credential usage cooldown is active until ${new Date(accountCooldown).toISOString()}.`,
+			};
+		}
+		const authCooldown = this.authCooldownUntil.get(key) ?? 0;
+		if (authCooldown > now) {
+			return {
+				reason: "auth_cooldown",
+				retryAt: authCooldown,
+				message: `Fresh usage request deferred for ${descriptor.provider}: auth cooldown is active until ${new Date(authCooldown).toISOString()}.`,
 			};
 		}
 		return null;
@@ -519,18 +530,31 @@ export class UsageCoordinator {
 		// Usage lookups are advisory; successful metadata refreshes do not need provider-level recovery state.
 	}
 
-	private recordFailure(descriptor: UsageRequestDescriptor, _error: unknown): void {
+	private recordFailure(descriptor: UsageRequestDescriptor, error: unknown): void {
 		const now = Date.now();
+		const key = this.accountKey(descriptor.provider, descriptor.credentialId);
+		if (this.isAuthLikeError(error)) {
+			const authCooldownMs = Math.max(0, this.config.authCooldownMs + this.resolveJitterMs(descriptor.provider, descriptor.credentialId));
+			if (authCooldownMs > 0) {
+				this.authCooldownUntil.set(key, now + authCooldownMs);
+			}
+			return;
+		}
 		const jitter = this.resolveJitterMs(descriptor.provider, descriptor.credentialId);
 		const accountCooldownMs = this.config.accountCooldownMs + jitter;
 		if (accountCooldownMs <= 0) {
-			this.accountCooldownUntil.delete(this.accountKey(descriptor.provider, descriptor.credentialId));
+			this.accountCooldownUntil.delete(key);
 			return;
 		}
-		this.accountCooldownUntil.set(
-			this.accountKey(descriptor.provider, descriptor.credentialId),
-			now + accountCooldownMs,
-		);
+		this.accountCooldownUntil.set(key, now + accountCooldownMs);
+	}
+
+	private isAuthLikeError(error: unknown): boolean {
+		if (error instanceof Error) {
+			const message = error.message ?? "";
+			return /\b401\b|\b403\b|expired|invalid|denied|missing required usage scope|token|unauthorized/i.test(message);
+		}
+		return false;
 	}
 
 	private getProviderState(provider: string): ProviderPolicyState {
@@ -549,8 +573,9 @@ export class UsageCoordinator {
 		provider: string;
 		credentialRef: string;
 		retryAt: number;
+		reason: string;
 	}> {
-		const cooldowns: Array<{ provider: string; credentialRef: string; retryAt: number }> = [];
+		const cooldowns: Array<{ provider: string; credentialRef: string; retryAt: number; reason: string }> = [];
 		for (const [key, retryAt] of this.accountCooldownUntil.entries()) {
 			if (retryAt <= now) {
 				continue;
@@ -562,6 +587,21 @@ export class UsageCoordinator {
 				provider,
 				credentialRef: redactIdentifier(credentialId),
 				retryAt,
+				reason: "credential_cooldown",
+			});
+		}
+		for (const [key, retryAt] of this.authCooldownUntil.entries()) {
+			if (retryAt <= now) {
+				continue;
+			}
+			const separatorIndex = key.indexOf("\u0000");
+			const provider = separatorIndex >= 0 ? key.slice(0, separatorIndex) : "unknown";
+			const credentialId = separatorIndex >= 0 ? key.slice(separatorIndex + 1) : key;
+			cooldowns.push({
+				provider,
+				credentialRef: redactIdentifier(credentialId),
+				retryAt,
+				reason: "auth_cooldown",
 			});
 		}
 		return cooldowns;
