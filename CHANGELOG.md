@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.0 - 2026-05-26
+
+### Added
+- Added process-scoped credential leases that track which credentials are held by each running process, preventing concurrent credential reuse across parallel Pi sessions while allowing shared-lease fallback when no unleased alternatives exist.
+- Added `ProviderCredentialLeaseState` type and `credentialLeases` field on `ProviderRotationState` in `multi-auth.json` for persistent lease tracking.
+- Added automatic migration of legacy per-provider rotation modes from `multi-auth.json` to `config.json` `rotationModes` on first initialization, preserving user overrides.
+- Added exhausted-quota credential detection in the multi-auth modal that marks credentials with five or more consecutive quota errors and a lingering `lastQuotaError` as "Exhaust" instead of "Ready".
+- Added `enqueueAllCredentialUsageRefresh` for bulk usage refresh scheduling across all provider credentials.
+
+### Changed
+- Simplified `config.json` to expose only `debug`, `hiddenProviders`, and `rotationModes` configuration keys; removed `excludeProviders`, `cascade`, `health`, `historyPersistence`, `modelEntitlements`, `oauthRefresh`, and `usageCoordination` keys from the user-facing configuration surface.
+- Moved hidden-provider state from `multi-auth.json` `ui.hiddenProviders` to `config.json` `hiddenProviders` so provider visibility survives `multi-auth.json` resets.
+- Moved cascade, health, OAuth-refresh, and usage-coordination configuration to internal defaults so the extension no longer depends on user-facing configuration for subsystem tuning.
+- Updated Codex OAuth refresh lead time to five minutes to reduce last-second token refresh failures.
+- Widened Pi peer dependency ranges to `^0.74.0 || ^0.75.0` and bumped dev dependencies to `^0.75.5`.
+
+### Removed
+- Removed `src/history-storage.ts` module and `MultiAuthHistoryStore`; health and cascade history persistence is no longer user-configurable.
+- Removed `MultiAuthUiState` interface and `ui` top-level key from `MultiAuthState` in `multi-auth.json`.
+
 ## 0.8.0 - 2026-05-22
 
 ### Added
