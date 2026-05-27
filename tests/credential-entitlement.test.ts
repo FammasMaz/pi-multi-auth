@@ -22,6 +22,7 @@ import {
 import { ProviderRegistry } from "../src/provider-registry.js";
 import { MultiAuthStorage } from "../src/storage.js";
 import { UsageService } from "../src/usage/index.js";
+import { DEFAULT_USAGE_COORDINATION_CONFIG } from "../src/usage/usage-coordinator.js";
 import type { UsageAuth, UsageSnapshot } from "../src/usage/types.js";
 
 const CODEX_PROVIDER_ID = "openai-codex";
@@ -350,27 +351,23 @@ test("account manager scans later entitlement windows for paid codex credentials
 });
 
 test("codex zero-evidence paid entitlement bootstrap scans later bounded windows", async (t) => {
-	const credentials = Array.from({ length: 5 }, (_unused, index): TestCredential => ({
+	const entitlementCandidateWindow = DEFAULT_USAGE_COORDINATION_CONFIG.entitlementCandidateWindow;
+	const firstWindowStartTarget = Math.min(
+		DEFAULT_USAGE_COORDINATION_CONFIG.globalMaxConcurrentFreshRequests,
+		DEFAULT_USAGE_COORDINATION_CONFIG.perProviderMaxConcurrentFreshRequests,
+		entitlementCandidateWindow,
+	);
+	const credentials = Array.from({ length: entitlementCandidateWindow + 2 }, (_unused, index): TestCredential => ({
 		credentialId: index === 0 ? CODEX_PROVIDER_ID : `${CODEX_PROVIDER_ID}-${index}`,
 		secret: `codex-bootstrap-token-${index}`,
-		planType: index === 4 ? "ChatGPT Plus" : "free",
+		planType: index === entitlementCandidateWindow + 1 ? "ChatGPT Plus" : "free",
 	}));
-	const extensionConfig: MultiAuthExtensionConfig = {
-		...DEFAULT_MULTI_AUTH_CONFIG,
-		usageCoordination: {
-			...DEFAULT_MULTI_AUTH_CONFIG.usageCoordination,
-			globalMaxConcurrentFreshRequests: 3,
-			perProviderMaxConcurrentFreshRequests: 3,
-			entitlementCandidateWindow: 3,
-		},
-	};
 	const fetchedCredentialIds: string[] = [];
 	const earlyLaterWindowCredentialIds: string[] = [];
 	const firstWindowGate = createDeferred();
 	let firstWindowStartCount = 0;
 	let firstWindowReleased = false;
 	const accountManager = await createCodexAccountManager(t, credentials, {
-		extensionConfig,
 		onFetchUsage: async (credential) => {
 			if (!credential) {
 				throw new Error("Expected usage lookup to resolve a known test credential.");
@@ -379,12 +376,12 @@ test("codex zero-evidence paid entitlement bootstrap scans later bounded windows
 				(candidate) => candidate.credentialId === credential.credentialId,
 			);
 			fetchedCredentialIds.push(credential.credentialId);
-			if (credentialIndex >= extensionConfig.usageCoordination.entitlementCandidateWindow && !firstWindowReleased) {
+			if (credentialIndex >= entitlementCandidateWindow && !firstWindowReleased) {
 				earlyLaterWindowCredentialIds.push(credential.credentialId);
 			}
-			if (credentialIndex < extensionConfig.usageCoordination.entitlementCandidateWindow) {
+			if (credentialIndex < entitlementCandidateWindow) {
 				firstWindowStartCount += 1;
-				if (firstWindowStartCount === extensionConfig.usageCoordination.entitlementCandidateWindow) {
+				if (firstWindowStartCount === firstWindowStartTarget) {
 					firstWindowReleased = true;
 					firstWindowGate.resolve();
 				}
@@ -396,7 +393,7 @@ test("codex zero-evidence paid entitlement bootstrap scans later bounded windows
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5-mini",
 	});
-	assert.equal(selected.credentialId, "openai-codex-4");
+	assert.equal(selected.credentialId, `openai-codex-${entitlementCandidateWindow + 1}`);
 	const expectedFetchedCredentialIds = credentials.map((credential) => credential.credentialId);
 	assert.equal(fetchedCredentialIds.length, expectedFetchedCredentialIds.length);
 	assert.equal(new Set(fetchedCredentialIds).size, expectedFetchedCredentialIds.length);
@@ -407,7 +404,7 @@ test("codex zero-evidence paid entitlement bootstrap scans later bounded windows
 	const cacheFirstSelected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5-mini",
 	});
-	assert.equal(cacheFirstSelected.credentialId, "openai-codex-4");
+	assert.equal(cacheFirstSelected.credentialId, `openai-codex-${entitlementCandidateWindow + 1}`);
 	assert.deepEqual(fetchedCredentialIds, []);
 });
 

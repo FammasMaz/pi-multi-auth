@@ -25,6 +25,8 @@ function createLoginCallbacks(): OAuthLoginCallbacks & {
 			authCalls.push(info);
 		},
 		onPrompt: async () => "",
+		onDeviceCode: () => {},
+		onSelect: async () => undefined,
 		onProgress: (message) => {
 			progressMessages.push(message);
 		},

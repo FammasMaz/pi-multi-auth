@@ -156,7 +156,7 @@ test("debug logger redacts OAuth access and refresh fields", async (t) => {
 	assert.equal(JSON.stringify(entry).includes(oauthR), false);
 });
 
-test("multi-auth config defaults keep history disabled and Codex entitlement lookups strict", async (t) => {
+test("multi-auth config defaults only expose debug, hidden providers, and rotation modes", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-defaults-"));
 	t.after(async () => {
 		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
@@ -166,10 +166,7 @@ test("multi-auth config defaults keep history disabled and Codex entitlement loo
 	const configResult = loadMultiAuthConfig(configPath);
 	const configContent = JSON.parse(await readFile(configPath, "utf-8")) as typeof DEFAULT_MULTI_AUTH_CONFIG;
 
-	assert.equal(DEFAULT_MULTI_AUTH_CONFIG.historyPersistence.enabled, false);
-	assert.equal(DEFAULT_MULTI_AUTH_CONFIG.modelEntitlements.codex.usageLookupFailureMode, "strict");
-	assert.equal(configResult.config.historyPersistence.enabled, false);
-	assert.equal(configResult.config.modelEntitlements.codex.usageLookupFailureMode, "strict");
-	assert.equal(configContent.historyPersistence.enabled, false);
-	assert.equal(configContent.modelEntitlements.codex.usageLookupFailureMode, "strict");
+	assert.deepEqual(DEFAULT_MULTI_AUTH_CONFIG, { debug: false, hiddenProviders: [], rotationModes: {} });
+	assert.deepEqual(configResult.config, DEFAULT_MULTI_AUTH_CONFIG);
+	assert.deepEqual(configContent, DEFAULT_MULTI_AUTH_CONFIG);
 });

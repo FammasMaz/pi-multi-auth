@@ -56,9 +56,7 @@ test("LightweightRotationState stages and flushes lightweight provider updates",
 	const credentialIds = ["custom-provider:1", "custom-provider:2"] as const;
 	const selectedAt = 1_717_171_717_000;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-lightweight-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const rotationState = new LightweightRotationState(storage, {
 		flushIntervalMs: 60_000,
 		maxPendingSelections: 8,
@@ -170,9 +168,7 @@ test("LightweightRotationState stages and flushes lightweight provider updates",
 test("KeyDistributor bypasses delegated subagent acquisition when only one credential remains structurally eligible", async () => {
 	const providerId = "cline";
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-delegation-bypass-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -216,9 +212,7 @@ test("KeyDistributor accepts delegated credential request objects and preserves 
 	const providerId = "custom-provider";
 	const credentialIds = [providerId, `${providerId}-1`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-delegated-request-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -261,9 +255,7 @@ test("KeyDistributor exposes redacted delegated routing capabilities", async () 
 	const providerId = "openai-codex";
 	const credentialIds = ["codex-free-credential", "codex-paid-credential"] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-routing-capability-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -321,9 +313,7 @@ test("KeyDistributor uses balancer usage snapshots to avoid exhausted Codex cred
 	const providerId = "openai-codex";
 	const credentialIds = [providerId, `${providerId}-alt`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-codex-balancer-usage-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -365,9 +355,7 @@ test("KeyDistributor drains near-exhausted Codex credentials with hysteresis", a
 	const providerId = "openai-codex";
 	const credentialIds = [providerId, `${providerId}-alt`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-codex-balancer-drain-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -432,9 +420,7 @@ test("KeyDistributor reuses lightweight parent-session leases and invalidates th
 	const providerId = "custom-provider";
 	const credentialIds = [providerId, `${providerId}-1`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-lightweight-lease-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -498,9 +484,7 @@ test("KeyDistributor releases lightweight parent-session leases explicitly and p
 	const lightweightProviderId = "custom-provider";
 	const standardProviderId = "oauth-provider";
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-lightweight-release-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -580,9 +564,7 @@ test("KeyDistributor honors standard round-robin rotation for delegated subagent
 	const providerId = "oauth-round-robin-provider";
 	const credentialIds = [providerId, `${providerId}-1`, `${providerId}-2`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-standard-round-robin-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -639,9 +621,7 @@ test("KeyDistributor honors standard usage-based rotation for delegated subagent
 	const providerId = "oauth-usage-provider";
 	const credentialIds = [providerId, `${providerId}-1`, `${providerId}-2`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-standard-usage-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -697,9 +677,7 @@ test("KeyDistributor reselects standard delegated credential rejected by selecti
 	const providerId = "oauth-validation-provider";
 	const credentialIds = [providerId, `${providerId}-1`] as const;
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-standard-validation-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 25,
@@ -749,9 +727,7 @@ test("KeyDistributor reselects standard delegated credential rejected by selecti
 test("KeyDistributor serializes standard delegated acquisition critical sections", async () => {
 	const providerId = "oauth-concurrency-provider";
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-standard-concurrency-"));
-	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
-		debugDir: join(tempDir, "debug"),
-	});
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"));
 	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
 	const distributor = new KeyDistributor(storage, authWriter, {
 		waitTimeoutMs: 50,

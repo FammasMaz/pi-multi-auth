@@ -26,7 +26,6 @@ import { AsyncBufferedLogWriter } from "../src/async-buffered-log-writer.js";
 import { AuthWriter } from "../src/auth-writer.js";
 import {
 	DEFAULT_MULTI_AUTH_CONFIG,
-	resolveStateHistoryPersistencePaths,
 	type MultiAuthExtensionConfig,
 } from "../src/config.js";
 import { multiAuthDebugLogger } from "../src/debug-logger.js";
@@ -193,17 +192,7 @@ function createCodexIdentityJwt(options: {
 function cloneExtensionConfig(): MultiAuthExtensionConfig {
 	return {
 		...DEFAULT_MULTI_AUTH_CONFIG,
-		excludeProviders: [...DEFAULT_MULTI_AUTH_CONFIG.excludeProviders],
-		cascade: { ...DEFAULT_MULTI_AUTH_CONFIG.cascade },
-		health: {
-			...DEFAULT_MULTI_AUTH_CONFIG.health,
-			weights: { ...DEFAULT_MULTI_AUTH_CONFIG.health.weights },
-		},
-		historyPersistence: { ...DEFAULT_MULTI_AUTH_CONFIG.historyPersistence },
-		oauthRefresh: {
-			...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh,
-			excludedProviders: [...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh.excludedProviders],
-		},
+		hiddenProviders: [...DEFAULT_MULTI_AUTH_CONFIG.hiddenProviders],
 	};
 }
 
@@ -222,13 +211,11 @@ async function createAccountManagerHarness(
 	authPath: string;
 	storagePath: string;
 	modelsPath: string;
-	debugDir: string;
 }> {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-core-"));
 	const authPath = join(tempRoot, "auth.json");
 	const storagePath = join(tempRoot, "multi-auth.json");
 	const modelsPath = join(tempRoot, "models.json");
-	const debugDir = join(tempRoot, "debug");
 
 	await writeFile(authPath, JSON.stringify(options.authData, null, 2), "utf-8");
 	await writeFile(
@@ -239,10 +226,7 @@ async function createAccountManagerHarness(
 
 	const authWriter = new AuthWriter(authPath);
 	const extensionConfig = options.extensionConfig ?? cloneExtensionConfig();
-	const storage = new MultiAuthStorage(storagePath, {
-		debugDir,
-		historyPersistence: extensionConfig.historyPersistence,
-	});
+	const storage = new MultiAuthStorage(storagePath);
 	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	if (options.usageFetcher) {
 		usageService.register({
@@ -275,7 +259,6 @@ async function createAccountManagerHarness(
 		authPath,
 		storagePath,
 		modelsPath,
-		debugDir,
 	};
 }
 
@@ -2404,7 +2387,9 @@ test("account manager updates an existing Cline OAuth credential instead of addi
 
 	const result = await accountManager.loginProvider("cline", {
 		onAuth: () => {},
+		onDeviceCode: () => {},
 		onPrompt: async () => "unused",
+		onSelect: async () => undefined,
 	});
 	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
 
@@ -2467,11 +2452,15 @@ test("account manager keeps same-email Kiro OAuth credentials separate by auth m
 
 	const first = await accountManager.loginProvider("kiro", {
 		onAuth: () => {},
+		onDeviceCode: () => {},
 		onPrompt: async () => "unused",
+		onSelect: async () => undefined,
 	});
 	const second = await accountManager.loginProvider("kiro", {
 		onAuth: () => {},
+		onDeviceCode: () => {},
 		onPrompt: async () => "unused",
+		onSelect: async () => undefined,
 	});
 	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
 	const status = await accountManager.getProviderStatus("kiro");
@@ -2529,7 +2518,9 @@ test("account manager updates same-method Kiro OAuth credentials instead of dupl
 
 	const result = await accountManager.loginProvider("kiro", {
 		onAuth: () => {},
+		onDeviceCode: () => {},
 		onPrompt: async () => "unused",
+		onSelect: async () => undefined,
 	});
 	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
 
@@ -2778,7 +2769,6 @@ test("provider registry refreshes models metadata after models.json changes", as
 test("cascade retry state persists across account-manager restarts and clears on success", async (t) => {
 	const providerId = "cascade-provider";
 	const extensionConfig = cloneExtensionConfig();
-	extensionConfig.historyPersistence.enabled = true;
 	const harness = await createAccountManagerHarness(t, {
 		providerId,
 		authData: {
@@ -2788,11 +2778,6 @@ test("cascade retry state persists across account-manager restarts and clears on
 		},
 		extensionConfig,
 	});
-	const historyPaths = resolveStateHistoryPersistencePaths(
-		extensionConfig.historyPersistence,
-		harness.debugDir,
-	);
-
 	await harness.accountManager.ensureInitialized();
 	const initialSelection = await harness.accountManager.acquireCredential(providerId);
 	await harness.accountManager.markTransientProviderError(
@@ -2824,10 +2809,7 @@ test("cascade retry state persists across account-manager restarts and clears on
 
 	const restarted = new AccountManager(
 		new AuthWriter(harness.authPath),
-		new MultiAuthStorage(harness.storagePath, {
-			debugDir: harness.debugDir,
-			historyPersistence: extensionConfig.historyPersistence,
-		}),
+		new MultiAuthStorage(harness.storagePath),
 		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(harness.authPath), harness.modelsPath, [providerId]),
 		undefined,
@@ -2843,49 +2825,55 @@ test("cascade retry state persists across account-manager restarts and clears on
 
 	await restarted.recordCredentialSuccess(providerId, restartedSelection.credentialId, 25);
 	const stateAfterSuccess = JSON.parse(await readFile(harness.storagePath, "utf-8")) as {
-		providers: Record<string, { cascadeState?: Record<string, { active?: unknown }> }>;
-	};
-	const cascadeHistory = JSON.parse(await readFile(historyPaths.cascadePath, "utf-8")) as {
-		providers?: Record<string, Record<string, Array<{ attemptCount: number }>>>;
-	};
-	assert.equal(stateAfterSuccess.providers[providerId]?.cascadeState?.[providerId]?.active, undefined);
-	assert.equal(stateAfterSuccess.providers[providerId]?.cascadeState, undefined);
-	assert.equal(cascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.attemptCount, 1);
-});
-
-test("account manager applies configured cascade history retention", async (t) => {
-	const providerId = "cascade-config-provider";
-	const extensionConfig = cloneExtensionConfig();
-	extensionConfig.historyPersistence.enabled = true;
-	extensionConfig.cascade.maxHistoryEntries = 1;
-	const { accountManager, storagePath, debugDir } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: { type: "api_key", key: "alpha" },
-		},
-		extensionConfig,
-	});
-	const historyPaths = resolveStateHistoryPersistencePaths(extensionConfig.historyPersistence, debugDir);
-
-	await accountManager.ensureInitialized();
-	await accountManager.recordCredentialFailure(providerId, providerId, 25, "provider_transient", "burst 1");
-	await accountManager.recordCredentialSuccess(providerId, providerId, 25);
-	await accountManager.recordCredentialFailure(providerId, providerId, 25, "provider_transient", "burst 2");
-	await accountManager.recordCredentialSuccess(providerId, providerId, 25);
-
-	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
-		providers: Record<string, { cascadeState?: Record<string, unknown> }>;
-	};
-	const cascadeHistory = JSON.parse(await readFile(historyPaths.cascadePath, "utf-8")) as {
-		providers?: Record<
+		providers: Record<
 			string,
-			Record<string, Array<{ cascadePath: Array<{ errorMessage: string }> }>>
+			{ cascadeState?: Record<string, { active?: unknown; history?: Array<{ attemptCount: number }> }> }
 		>;
 	};
-	const history = cascadeHistory.providers?.[providerId]?.[providerId] ?? [];
-	assert.equal(stored.providers[providerId]?.cascadeState, undefined);
-	assert.equal(history.length, 1);
-	assert.equal(history[0]?.cascadePath[0]?.errorMessage, "burst 2");
+	assert.equal(stateAfterSuccess.providers[providerId]?.cascadeState?.[providerId]?.active, undefined);
+	assert.equal(stateAfterSuccess.providers[providerId]?.cascadeState?.[providerId]?.history?.[0]?.attemptCount, 1);
+});
+
+test("account manager persists provider rotation mode in config instead of multi-auth state", async (t) => {
+	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-rotation-config-"));
+	const providerId = "rotation-config-provider";
+	const authPath = join(tempRoot, "auth.json");
+	const storagePath = join(tempRoot, "multi-auth.json");
+	const modelsPath = join(tempRoot, "models.json");
+	const configPath = join(tempRoot, "config.json");
+	await writeFile(authPath, JSON.stringify({ [providerId]: { type: "api_key", key: "alpha" } }, null, 2), "utf-8");
+	await writeFile(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf-8");
+	await writeFile(configPath, JSON.stringify(DEFAULT_MULTI_AUTH_CONFIG, null, 2), "utf-8");
+
+	const authWriter = new AuthWriter(authPath);
+	const accountManager = new AccountManager(
+		authWriter,
+		new MultiAuthStorage(storagePath),
+		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
+		new ProviderRegistry(authWriter, modelsPath, [providerId]),
+		undefined,
+		cloneExtensionConfig(),
+		{ configPath },
+	);
+	t.after(async () => {
+		await accountManager.shutdown();
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	await accountManager.ensureInitialized();
+	await accountManager.setRotationMode(providerId, "usage-based");
+
+	const config = JSON.parse(await readFile(configPath, "utf-8")) as {
+		rotationModes?: Record<string, string>;
+	};
+	const state = JSON.parse(await readFile(storagePath, "utf-8")) as {
+		providers: Record<string, { rotationMode?: string }>;
+	};
+	const status = await accountManager.getProviderStatus(providerId);
+
+	assert.equal(config.rotationModes?.[providerId], "usage-based");
+	assert.equal(state.providers[providerId]?.rotationMode, "round-robin");
+	assert.equal(status.rotationMode, "usage-based");
 });
 
 test("health scoring favors reliable credentials in weighted selection", () => {
@@ -2934,192 +2922,6 @@ test("health scoring favors reliable credentials in weighted selection", () => {
 	);
 
 	assert.equal(selected, "healthy");
-});
-
-test("account manager applies configured health scoring thresholds", async (t) => {
-	const providerId = "health-config-provider";
-	const extensionConfig = cloneExtensionConfig();
-	extensionConfig.historyPersistence.enabled = true;
-	extensionConfig.health.minRequests = 1;
-	extensionConfig.health.maxLatencyMs = 1_000;
-	const { accountManager, storagePath, debugDir } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: { type: "api_key", key: "alpha" },
-		},
-		extensionConfig,
-	});
-	const historyPaths = resolveStateHistoryPersistencePaths(extensionConfig.historyPersistence, debugDir);
-
-	await accountManager.ensureInitialized();
-	await accountManager.recordCredentialSuccess(providerId, providerId, 50);
-
-	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
-		providers: Record<
-			string,
-			{
-				healthState?: {
-					scores?: Record<string, { score: number; isStale: boolean }>;
-					history?: Record<string, unknown>;
-					configHash?: string;
-				};
-			}
-		>;
-	};
-	const healthHistory = JSON.parse(await readFile(historyPaths.healthPath, "utf-8")) as {
-		providers?: Record<
-			string,
-			Record<string, { requests?: Array<{ success: boolean }> }>
-		>;
-	};
-	const extractedHealthEntry = Object.values(healthHistory.providers?.[providerId] ?? {})[0];
-	const score = stored.providers[providerId]?.healthState?.scores?.[providerId];
-	assert.ok(score);
-	assert.ok(score.score > 0.6);
-	assert.equal(score.isStale, false);
-	assert.equal(stored.providers[providerId]?.healthState?.history, undefined);
-	assert.equal(extractedHealthEntry?.requests?.length, 1);
-	assert.equal(extractedHealthEntry?.requests?.[0]?.success, true);
-	assert.match(stored.providers[providerId]?.healthState?.configHash ?? "", /"minRequests":1/);
-});
-
-test("storage hydrates embedded telemetry history and migrates it into extracted history files", async () => {
-	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-history-migration-"));
-	const storagePath = join(tempRoot, "multi-auth.json");
-	const debugDir = join(tempRoot, "debug");
-	const historyPersistence = {
-		...DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
-		enabled: true,
-	};
-	const historyPaths = resolveStateHistoryPersistencePaths(
-		historyPersistence,
-		debugDir,
-	);
-
-	try {
-		const providerId = "migration-provider";
-		const credentialRef = "migration-credential-ref";
-		const state = createDefaultMultiAuthState([providerId]);
-		const providerState = getProviderState(state, providerId);
-		providerState.credentialIds = [credentialRef];
-		providerState.healthState = {
-			scores: {
-				[credentialRef]: {
-					credentialId: credentialRef,
-					score: 0.82,
-					calculatedAt: 1_717_000_000_000,
-					components: {
-						successRate: 1,
-						latencyFactor: 0.9,
-						uptimeFactor: 1,
-						recoveryFactor: 0.8,
-					},
-					isStale: false,
-				},
-			},
-			history: {
-				[credentialRef]: {
-					credentialId: credentialRef,
-					requests: [{ timestamp: 1_717_000_000_000, success: true, latencyMs: 42 }],
-					cooldowns: [],
-					lastScore: 0.82,
-					lastCalculatedAt: 1_717_000_000_000,
-				},
-			},
-			configHash: '{"windowSize":100}',
-		};
-		providerState.cascadeState = {
-			[providerId]: {
-				history: [
-					{
-						cascadeId: "cascade-1",
-						cascadePath: [
-							{
-								providerId,
-								credentialId: credentialRef,
-								attemptedAt: 1_717_000_000_100,
-								errorKind: "provider_transient",
-								errorMessage: "legacy embedded history",
-								recoveryAction: "none",
-							},
-						],
-						attemptCount: 1,
-						startedAt: 1_717_000_000_100,
-						lastAttemptAt: 1_717_000_000_100,
-						nextRetryAt: 1_717_000_001_100,
-						isActive: false,
-					},
-				],
-			},
-		};
-		await writeFile(storagePath, JSON.stringify(state, null, 2), "utf-8");
-
-		const storage = new MultiAuthStorage(storagePath, {
-			debugDir,
-			historyPersistence,
-		});
-		const hydrated = await storage.read();
-		assert.equal(
-			hydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
-			1,
-		);
-		assert.equal(
-			hydrated.providers[providerId]?.cascadeState?.[providerId]?.history?.[0]?.attemptCount,
-			1,
-		);
-
-		await storage.withLock((current) => {
-			const currentProviderState = getProviderState(current, providerId);
-			currentProviderState.lastUsedAt[credentialRef] = 1_717_000_002_000;
-			return { result: undefined, next: current };
-		});
-
-		const compactState = JSON.parse(await readFile(storagePath, "utf-8")) as {
-			providers: Record<
-				string,
-				{
-					healthState?: { history?: Record<string, unknown> };
-					cascadeState?: Record<string, { history?: Array<unknown> }>;
-				}
-			>;
-		};
-		const extractedHealthHistoryContent = await readFile(historyPaths.healthPath, "utf-8");
-		const extractedCascadeHistoryContent = await readFile(historyPaths.cascadePath, "utf-8");
-		const extractedHealthHistory = JSON.parse(extractedHealthHistoryContent) as {
-			providers?: Record<string, Record<string, { credentialId?: string; requests?: Array<unknown> }>>;
-		};
-		const extractedCascadeHistory = JSON.parse(extractedCascadeHistoryContent) as {
-			providers?: Record<
-				string,
-				Record<string, Array<{ cascadePath: Array<{ credentialId?: string; errorMessage: string }> }>>
-			>;
-		};
-		const extractedProviderHealth = extractedHealthHistory.providers?.[providerId] ?? {};
-		const extractedHealthEntry = Object.values(extractedProviderHealth)[0];
-		const extractedCascadeAttempt =
-			extractedCascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.cascadePath[0];
-		const rehydrated = await storage.read();
-
-		assert.equal(compactState.providers[providerId]?.healthState?.history, undefined);
-		assert.equal(compactState.providers[providerId]?.cascadeState, undefined);
-		assert.equal(Object.hasOwn(extractedProviderHealth, credentialRef), false);
-		assert.notEqual(extractedHealthEntry?.credentialId, credentialRef);
-		assert.equal(extractedHealthEntry?.requests?.length, 1);
-		assert.notEqual(extractedCascadeAttempt?.credentialId, credentialRef);
-		assert.equal(extractedCascadeAttempt?.errorMessage, "legacy embedded history");
-		assert.equal(extractedHealthHistoryContent.includes(credentialRef), false);
-		assert.equal(extractedCascadeHistoryContent.includes(credentialRef), false);
-		assert.equal(
-			rehydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
-			1,
-		);
-		assert.equal(
-			rehydrated.providers[providerId]?.cascadeState?.[providerId]?.history?.[0]?.attemptCount,
-			1,
-		);
-	} finally {
-		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-	}
 });
 
 test("pool manager stays opt-in and selects the highest-priority healthy pool", () => {
@@ -3408,7 +3210,6 @@ test("storage validates and persists explicit provider pool configuration", asyn
 							},
 						},
 					},
-					ui: { hiddenProviders: [] },
 				},
 				null,
 				2,
@@ -4076,33 +3877,6 @@ test("account manager persists scheduled oauth refresh timestamps for oauth cred
 	assert.ok(typeof scheduledAt === "number");
 	assert.ok(scheduledAt < expiresAt);
 	assert.ok(scheduledAt > Date.now());
-});
-
-test("account manager disables background oauth scheduling when configured", async (t) => {
-	const providerId = "openai-codex";
-	const expiresAt = Date.now() + 10 * 60_000;
-	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
-	const extensionConfig = cloneExtensionConfig();
-	extensionConfig.oauthRefresh.enabled = false;
-	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: {
-				type: "oauth",
-				access: jwt,
-				refresh: "refresh-token",
-				expires: expiresAt,
-			},
-		},
-		extensionConfig,
-	});
-
-	await accountManager.ensureInitialized();
-
-	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
-		providers: Record<string, { oauthRefreshScheduled?: Record<string, number> }>;
-	};
-	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
 });
 
 test("account manager schedules cline oauth refresh and clears stale refresh disable state", async (t) => {

@@ -26,6 +26,8 @@ function createLoginCallbacks(
 		},
 		onPrompt: async () => manualInput,
 		onManualCodeInput: async () => manualInput,
+		onDeviceCode: () => {},
+		onSelect: async () => undefined,
 		onProgress: (message) => {
 			progressMessages.push(message);
 		},
@@ -187,8 +189,10 @@ test("createClineOAuthProvider accepts refreshToken and idToken callback paramet
 		const pendingManualInput = async (): Promise<string> => new Promise(() => {});
 		return {
 			onAuth: () => {},
+			onDeviceCode: () => {},
 			onPrompt: pendingManualInput,
 			onManualCodeInput: pendingManualInput,
+			onSelect: async () => undefined,
 		};
 	}
 

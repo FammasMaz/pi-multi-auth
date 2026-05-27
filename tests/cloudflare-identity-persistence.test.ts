@@ -24,7 +24,6 @@ test("Cloudflare API-key add persists resolved email as provider friendly name",
 	const authPath = join(tempRoot, "auth.json");
 	const storagePath = join(tempRoot, "multi-auth.json");
 	const modelsPath = join(tempRoot, "models.json");
-	const debugDir = join(tempRoot, "debug");
 	const originalFetch = globalThis.fetch;
 	const requestedUrls: string[] = [];
 
@@ -33,10 +32,7 @@ test("Cloudflare API-key add persists resolved email as provider friendly name",
 
 	const accountManager = new AccountManager(
 		new AuthWriter(authPath),
-		new MultiAuthStorage(storagePath, {
-			debugDir,
-			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
-		}),
+		new MultiAuthStorage(storagePath),
 		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(authPath), modelsPath, ["cloudflare"]),
 		undefined,
@@ -87,7 +83,6 @@ test("Cloudflare credential identity refresh persists refreshed email as provide
 	const authPath = join(tempRoot, "auth.json");
 	const storagePath = join(tempRoot, "multi-auth.json");
 	const modelsPath = join(tempRoot, "models.json");
-	const debugDir = join(tempRoot, "debug");
 	const originalFetch = globalThis.fetch;
 	let userLookupCount = 0;
 
@@ -96,10 +91,7 @@ test("Cloudflare credential identity refresh persists refreshed email as provide
 
 	const accountManager = new AccountManager(
 		new AuthWriter(authPath),
-		new MultiAuthStorage(storagePath, {
-			debugDir,
-			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
-		}),
+		new MultiAuthStorage(storagePath),
 		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(authPath), modelsPath, ["cloudflare"]),
 		undefined,

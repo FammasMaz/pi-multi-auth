@@ -307,6 +307,112 @@ test("usage service hydrates display snapshots after operational entries expire"
 	);
 });
 
+test("usage service retains display snapshots past displayUntil", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const now = Date.now();
+	const providerId = "display-retention-provider";
+	const credentialId = "credential-a";
+	const credentialCacheKey = "cache:credential-a";
+	const snapshot = { ...createUsageSnapshot(providerId, now - 86_400_000 * 60), planType: "pro" };
+	const persisted: PersistedUsageCacheTestFile = {
+		schemaVersion: USAGE_CACHE_SCHEMA_VERSION,
+		generatedAt: now,
+		maxEntries: 10,
+		maxDisplayEntries: 10,
+		displayRetentionMs: 86_400_000,
+		entries: [],
+		displayEntries: [
+			{
+				provider: providerId,
+				credentialId,
+				credentialCacheKey,
+				fetchedAt: now - 86_400_000 * 60,
+				displayUntil: now - 1,
+				snapshot,
+			},
+		],
+	};
+	await writeFile(cachePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf-8");
+
+	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({ filePath: cachePath, maxEntries: 10 }),
+	});
+	await usageService.hydratePersistedCache({
+		isDisplayCredentialValid: (_provider, id) => id === credentialId,
+		pruneInvalidEntries: true,
+	});
+
+	const display = usageService.readDisplayUsage(providerId, credentialId);
+	const pruned = await readPersistedCache(cachePath);
+
+	assert.equal(display?.fromCache, true);
+	assert.equal(display?.snapshot?.planType, "pro");
+	assert.equal(pruned.displayEntries?.length, 1);
+	assert.equal(pruned.displayEntries?.[0].credentialId, credentialId);
+});
+
+test("usage service replaces display snapshots for same credential regardless of cache key", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	});
+
+	const now = Date.now();
+	const providerId = "display-dedup-provider";
+	const credentialId = "credential-b";
+	const oldCacheKey = "cache:old-token";
+	const newCacheKey = "cache:new-token";
+	const oldSnapshot = { ...createUsageSnapshot(providerId, now - 10_000), planType: "free" };
+	const newSnapshot = { ...createUsageSnapshot(providerId, now), planType: "plus" };
+	const persisted: PersistedUsageCacheTestFile = {
+		schemaVersion: USAGE_CACHE_SCHEMA_VERSION,
+		generatedAt: now,
+		maxEntries: 10,
+		maxDisplayEntries: 10,
+		displayRetentionMs: 86_400_000,
+		entries: [],
+		displayEntries: [
+			{
+				provider: providerId,
+				credentialId,
+				credentialCacheKey: oldCacheKey,
+				fetchedAt: now - 10_000,
+				displayUntil: now + 86_400_000,
+				snapshot: oldSnapshot,
+			},
+			{
+				provider: providerId,
+				credentialId,
+				credentialCacheKey: newCacheKey,
+				fetchedAt: now,
+				displayUntil: now + 86_400_000,
+				snapshot: newSnapshot,
+			},
+		],
+	};
+	await writeFile(cachePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf-8");
+
+	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({ filePath: cachePath, maxEntries: 10 }),
+	});
+	await usageService.hydratePersistedCache({
+		isDisplayCredentialValid: (_provider, id) => id === credentialId,
+		pruneInvalidEntries: true,
+	});
+
+	const display = usageService.readDisplayUsage(providerId, credentialId);
+	const pruned = await readPersistedCache(cachePath);
+
+	assert.equal(display?.fromCache, true);
+	assert.equal(display?.snapshot?.planType, "plus");
+	assert.equal(pruned.displayEntries?.length, 1);
+	assert.equal(pruned.displayEntries?.[0].credentialCacheKey, newCacheKey);
+});
+
 test("usage service migrates safely associated schema-v1 cache entries to credential-keyed schema-v2", async (t) => {
 	const { tempRoot, cachePath } = await createTempUsageCachePath();
 	t.after(async () => {

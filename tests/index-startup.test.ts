@@ -195,15 +195,17 @@ test("multi-auth config initializes with documented module defaults", async (t) 
 	assert.deepEqual(configResult.config, DEFAULT_MULTI_AUTH_CONFIG);
 	assert.equal(configResult.warning, undefined);
 	assert.match(configContent, /"debug": false/);
-	assert.match(configContent, /"cascade": \{/);
-	assert.match(configContent, /"health": \{/);
-	assert.match(configContent, /"historyPersistence": \{/);
-	assert.match(configContent, /"oauthRefresh": \{/);
-	assert.match(configContent, /"excludedProviders": \[\]/);
+	assert.match(configContent, /"hiddenProviders": \[\]/);
+	assert.match(configContent, /"rotationModes": \{\}/);
+	assert.doesNotMatch(configContent, /"cascade"/);
+	assert.doesNotMatch(configContent, /"health"/);
+	assert.doesNotMatch(configContent, /"historyPersistence"/);
+	assert.doesNotMatch(configContent, /"oauthRefresh"/);
+	assert.doesNotMatch(configContent, /"excludeProviders"/);
 });
 
 
-test("multi-auth config validates nested documented options and falls back with warnings", async (t) => {
+test("multi-auth config validates supported options and ignores removed settings", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-invalid-"));
 	t.after(async () => {
 		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
@@ -215,39 +217,13 @@ test("multi-auth config validates nested documented options and falls back with 
 		JSON.stringify(
 			{
 				debug: "yes",
-				excludeProviders: ["openai-codex", 42, "   ", "anthropic"],
-				cascade: {
-					initialBackoffMs: -1,
-					maxBackoffMs: 10,
-					backoffMultiplier: 0,
-					maxHistoryEntries: 0,
-				},
-				health: {
-					windowSize: 0,
-					maxLatencyMs: 0,
-					uptimeWindowMs: -1,
-					minRequests: 0,
-					staleThresholdMs: 0,
-					weights: {
-						successRate: -1,
-						latencyFactor: 0,
-						uptimeFactor: 0,
-						recoveryFactor: 0,
-					},
-				},
-				historyPersistence: {
-					enabled: "always",
-					healthFileName: "../health.txt",
-					cascadeFileName: " nested/cascade.json ",
-				},
-				oauthRefresh: {
-					safetyWindowMs: -1,
-					minRefreshWindowMs: -1,
-					checkIntervalMs: 0,
-					maxConcurrentRefreshes: 0,
-					enabled: "sometimes",
-					excludedProviders: ["cline", 42, "   "],
-				},
+				hiddenProviders: ["openai-codex", 42, "   ", "anthropic", "openai-codex"],
+				rotationModes: { "openai-codex": "usage-based", anthropic: "invalid" },
+				excludeProviders: ["removed"],
+				cascade: { initialBackoffMs: -1 },
+				health: { windowSize: 0 },
+				historyPersistence: { enabled: true },
+				oauthRefresh: { enabled: false },
 			},
 			null,
 			2,
@@ -257,70 +233,19 @@ test("multi-auth config validates nested documented options and falls back with 
 
 	const configResult = loadMultiAuthConfig(configPath);
 
-	assert.deepEqual(configResult.config.excludeProviders, ["openai-codex", "anthropic"]);
-	assert.deepEqual(configResult.config.cascade, {
-		...DEFAULT_MULTI_AUTH_CONFIG.cascade,
-		maxBackoffMs: DEFAULT_MULTI_AUTH_CONFIG.cascade.initialBackoffMs,
-	});
-	assert.deepEqual(configResult.config.health, {
-		...DEFAULT_MULTI_AUTH_CONFIG.health,
-		weights: {
-			...DEFAULT_MULTI_AUTH_CONFIG.health.weights,
-			latencyFactor: 0,
-			uptimeFactor: 0,
-			recoveryFactor: 0,
-		},
-	});
-	assert.deepEqual(
-		configResult.config.historyPersistence,
-		DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
-	);
-	assert.deepEqual(configResult.config.oauthRefresh, {
-		...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh,
-		excludedProviders: ["cline"],
+	assert.deepEqual(configResult.config, {
+		debug: false,
+		hiddenProviders: ["openai-codex", "anthropic"],
+		rotationModes: { "openai-codex": "usage-based" },
 	});
 	assert.match(configResult.warning ?? "", /debug/);
-	assert.match(configResult.warning ?? "", /excludeProviders/);
-	assert.match(configResult.warning ?? "", /cascade\.initialBackoffMs/);
-	assert.match(configResult.warning ?? "", /health\.weights/);
-	assert.match(configResult.warning ?? "", /historyPersistence\.enabled/);
-	assert.match(configResult.warning ?? "", /historyPersistence\.healthFileName/);
-	assert.match(configResult.warning ?? "", /historyPersistence\.cascadeFileName/);
-	assert.match(configResult.warning ?? "", /oauthRefresh\.enabled/);
-	assert.match(configResult.warning ?? "", /oauthRefresh\.excludedProviders/);
-});
-
-test("multi-auth config accepts custom history persistence file names", async (t) => {
-	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-history-"));
-	t.after(async () => {
-		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-	});
-
-	const configPath = join(tempRoot, "config.json");
-	await writeFile(
-		configPath,
-		JSON.stringify(
-			{
-				historyPersistence: {
-					enabled: false,
-					healthFileName: "custom-health-history.json",
-					cascadeFileName: "custom-cascade-history.json",
-				},
-			},
-			null,
-			2,
-		),
-		"utf-8",
-	);
-
-	const configResult = loadMultiAuthConfig(configPath);
-
-	assert.deepEqual(configResult.config.historyPersistence, {
-		enabled: false,
-		healthFileName: "custom-health-history.json",
-		cascadeFileName: "custom-cascade-history.json",
-	});
-	assert.equal(configResult.warning, undefined);
+	assert.match(configResult.warning ?? "", /hiddenProviders/);
+	assert.match(configResult.warning ?? "", /rotationModes/);
+	assert.doesNotMatch(configResult.warning ?? "", /excludeProviders/);
+	assert.doesNotMatch(configResult.warning ?? "", /cascade/);
+	assert.doesNotMatch(configResult.warning ?? "", /health/);
+	assert.doesNotMatch(configResult.warning ?? "", /historyPersistence/);
+	assert.doesNotMatch(configResult.warning ?? "", /oauthRefresh/);
 });
 
 test("multi-auth debug logger writes JSONL entries under the debug directory when enabled", async (t) => {

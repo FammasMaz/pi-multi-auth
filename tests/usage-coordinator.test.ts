@@ -16,6 +16,7 @@ function createConfig(overrides: Partial<UsageCoordinationConfig> = {}): UsageCo
 		modalRefreshCandidateWindow: 2,
 		manualProviderRefreshCandidateWindow: 2,
 		accountCooldownMs: 0,
+		authCooldownMs: 0,
 		providerCooldownMs: 0,
 		circuitBreakerFailureThreshold: 3,
 		circuitBreakerCooldownMs: 0,
