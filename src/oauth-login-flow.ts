@@ -9,6 +9,7 @@ import {
 } from "./formatters/responsive-modal.js";
 import type { AccountManager } from "./account-manager.js";
 import type { OAuthLoginCallbacks } from "./oauth-compat.js";
+import type { OAuthDeviceCodeInfo } from "./oauth-compat.js";
 import type { SupportedProviderId } from "./types.js";
 
 export const MANUAL_CODE_INPUT_PROMPT = "Paste authorization code or callback URL:";
@@ -138,6 +139,10 @@ export class OAuthDialogCallbackBridge {
 					return;
 				}
 				this.dialog.showProgress(normalizedMessage);
+			},
+			onDeviceCode: ({ verificationUri, userCode }: OAuthDeviceCodeInfo) => {
+				this.hasShownWaitingState = false;
+				this.dialog.showAuth(verificationUri, `Enter code: ${userCode}`);
 			},
 			onManualCodeInput: async () => {
 				this.hasShownWaitingState = false;

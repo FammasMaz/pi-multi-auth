@@ -120,6 +120,7 @@ const QUOTA_PATTERNS: RegExp[] = [
 	/insufficient[_-]?quota/i,
 	/exceeded your current quota/i,
 	/quota exceeded/i,
+	/quota\s+exhausted/i,
 	/usage limit/i,
 	/you\s+have\s+reached\s+(?:(?:your|the)\s+)?(?:usage\s+)?limit/i,
 	/credit balance/i,

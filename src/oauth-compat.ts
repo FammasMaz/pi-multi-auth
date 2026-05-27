@@ -5,6 +5,7 @@ import {
 	resetOAuthProviders as resetOAuthProvidersFromPiAi,
 	unregisterOAuthProvider as unregisterOAuthProviderFromPiAi,
 	type OAuthCredentials,
+	type OAuthDeviceCodeInfo,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
 	type OAuthProviderInterface,
@@ -343,6 +344,7 @@ export async function refreshOAuthCredential(
 
 export type {
 	OAuthCredentials,
+	OAuthDeviceCodeInfo,
 	OAuthLoginCallbacks,
 	OAuthProviderId,
 	OAuthProviderInterface,
