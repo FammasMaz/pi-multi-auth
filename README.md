@@ -112,13 +112,8 @@ Runtime configuration lives in `config.json` at the extension root. The extensio
 | Key | Type | Default | Purpose |
 |-----|------|---------|---------|
 | `debug` | `boolean` | `false` | Enables JSONL debug logging under `debug/pi-multi-auth-debug.jsonl` |
-| `excludeProviders` | `string[]` | `[]` | Prevents selected providers from being wrapped by multi-auth |
-| `cascade` | `object` | built-in defaults | Tunes retry backoff and retained failure history |
-| `health` | `object` | built-in defaults | Tunes rolling health windows and scoring weights |
-| `historyPersistence` | `object` | built-in defaults | Controls extracted health and cascade history file names under `debug/` |
-| `modelEntitlements` | `object` | built-in defaults | Controls provider-specific model entitlement behavior such as Codex usage lookup failures |
-| `oauthRefresh` | `object` | built-in defaults | Controls proactive OAuth token refresh scheduling, concurrency, and excluded providers |
-| `usageCoordination` | `object` | built-in defaults | Bounds fresh usage lookups with global/per-provider concurrency, operation-specific candidate windows, account/provider cooldowns, and circuit breakers |
+| `hiddenProviders` | `string[]` | `[]` | Hides selected providers from the multi-auth UI and runtime work |
+| `rotationModes` | `Record<string, "round-robin" \| "usage-based" \| "balancer">` | `{}` | Overrides provider rotation modes outside `multi-auth.json` |
 
 The published package intentionally excludes `config.json` and `debug/`; both are created locally as needed by the running extension. Usage snapshots are cached in Pi's runtime directory as `multi-auth-usage-cache.json` so operational and display-only usage state can survive extension restarts without publishing local state.
 
