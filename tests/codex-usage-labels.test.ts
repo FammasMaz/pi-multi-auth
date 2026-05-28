@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveUsageWindowLabel } from "../src/commands.js";
+import { buildCodexGlobalCreditLines, resolveUsageWindowLabel } from "../src/commands.js";
+import { getCodexWindowCredits } from "../src/usage/codex.js";
+import type { CredentialStatus } from "../src/types.js";
 import type { UsageSnapshot } from "../src/usage/types.js";
 
 function createSnapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
@@ -34,4 +36,38 @@ test("usage window labels disambiguate matching duration windows generically", (
 
 	assert.equal(resolveUsageWindowLabel(snapshot, "primary"), "5-hour window (window 1)");
 	assert.equal(resolveUsageWindowLabel(snapshot, "secondary"), "5-hour window (window 2)");
+});
+
+test("Codex global credit lines aggregate visible account capacity", () => {
+	const snapshot = createSnapshot({
+		credits: { hasCredits: true, unlimited: false, balance: "12" },
+	});
+	const credential = {
+		credentialId: "openai-codex",
+		usageSnapshot: snapshot,
+	} as CredentialStatus;
+
+	assert.deepEqual(buildCodexGlobalCreditLines([credential]), [
+		"5h pool: 203/225 remaining (90% left, 1 acct)",
+		"7d pool: 6,048/7,560 remaining (80% left, 1 acct)",
+		"Upstream balance: 12 credits",
+	]);
+});
+
+test("Codex credit helper treats weekly-only primary rows as weekly capacity", () => {
+	const snapshot = createSnapshot({
+		planType: "free",
+		primary: { usedPercent: 50, windowMinutes: 10_080, resetsAt: null },
+		secondary: null,
+	});
+
+	assert.equal(getCodexWindowCredits(snapshot, "primary"), null);
+	assert.deepEqual(getCodexWindowCredits(snapshot, "secondary"), {
+		capacity: 1134,
+		used: 567,
+		remaining: 567,
+		usedPercent: 50,
+		windowMinutes: 10_080,
+		resetsAt: null,
+	});
 });

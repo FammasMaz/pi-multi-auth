@@ -1,6 +1,7 @@
 import {
 	getOAuthProvider as getOAuthProviderFromPiAi,
 	getOAuthProviders as getOAuthProvidersFromPiAi,
+	loginOpenAICodex,
 	registerOAuthProvider as registerOAuthProviderFromPiAi,
 	resetOAuthProviders as resetOAuthProvidersFromPiAi,
 	unregisterOAuthProvider as unregisterOAuthProviderFromPiAi,
@@ -25,6 +26,8 @@ const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 const OPENAI_CODEX_PROVIDER_LABEL = "OpenAI Codex";
 const OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_OAUTH_ORIGINATOR = "codex_chatgpt_desktop";
+const OPENAI_CODEX_REFRESH_SCOPE = "openid profile email";
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
 const OAUTH_REFRESH_TIMEOUT_ERROR_CODE = "request_timeout";
 
@@ -102,11 +105,12 @@ async function fetchCodexRefreshResponse(
 	try {
 		return await fetch(OPENAI_CODEX_TOKEN_URL, {
 			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
-			body: new URLSearchParams({
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
 				grant_type: "refresh_token",
-				refresh_token: refreshToken,
 				client_id: OPENAI_CODEX_CLIENT_ID,
+				refresh_token: refreshToken,
+				scope: OPENAI_CODEX_REFRESH_SCOPE,
 			}),
 			signal: controller.signal,
 		});
@@ -158,6 +162,41 @@ function createCodexRefreshFailureMessage(
 	});
 }
 
+function withCodexRefreshMetadata(
+	credentials: OAuthCredentials,
+	idToken?: string,
+	now: number = Date.now(),
+): OAuthCredentials {
+	return {
+		...credentials,
+		...(idToken ? { idToken, id_token: idToken } : {}),
+		lastRefreshAt: now,
+		last_refresh: new Date(now).toISOString(),
+	};
+}
+
+const openAICodexOAuthProvider: OAuthProviderInterface = {
+	id: OPENAI_CODEX_PROVIDER_ID,
+	name: "ChatGPT Plus/Pro (Codex Subscription)",
+	usesCallbackServer: true,
+	async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+		const credentials = await loginOpenAICodex({
+			onAuth: callbacks.onAuth,
+			onPrompt: callbacks.onPrompt,
+			onProgress: callbacks.onProgress,
+			onManualCodeInput: callbacks.onManualCodeInput,
+			originator: OPENAI_CODEX_OAUTH_ORIGINATOR,
+		});
+		return withCodexRefreshMetadata(credentials);
+	},
+	async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+		return refreshOpenAICodexCredential(credentials, DEFAULT_OAUTH_REFRESH_TIMEOUT_MS);
+	},
+	getApiKey(credentials: OAuthCredentials): string {
+		return credentials.access;
+	},
+};
+
 async function refreshOpenAICodexCredential(
 	credentials: OAuthCredentials,
 	requestTimeoutMs: number,
@@ -207,12 +246,13 @@ async function refreshOpenAICodexCredential(
 
 	const accessToken = asNonEmptyString(parsedBody?.access_token);
 	const nextRefreshToken = asNonEmptyString(parsedBody?.refresh_token);
+	const idToken = asNonEmptyString(parsedBody?.id_token);
 	const expiresIn =
 		typeof parsedBody?.expires_in === "number" && Number.isFinite(parsedBody.expires_in)
 			? parsedBody.expires_in
 			: undefined;
 
-	if (!accessToken || !nextRefreshToken || expiresIn === undefined) {
+	if (!accessToken || !nextRefreshToken || !idToken || expiresIn === undefined) {
 		throw new OAuthRefreshFailureError(
 			formatOAuthRefreshFailureSummary({
 				providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
@@ -232,6 +272,7 @@ async function refreshOpenAICodexCredential(
 	const identity = extractCodexCredentialIdentity({
 		access: accessToken,
 		accountId: credentials.accountId,
+		idToken,
 	});
 	if (!identity.accountId) {
 		throw new OAuthRefreshFailureError(
@@ -251,13 +292,16 @@ async function refreshOpenAICodexCredential(
 	}
 
 	const expiration = determineTokenExpiration(accessToken, undefined, expiresIn);
-	return {
-		...credentials,
-		access: accessToken,
-		refresh: nextRefreshToken,
-		expires: expiration.expiresAt,
-		accountId: identity.accountId,
-	};
+	return withCodexRefreshMetadata(
+		{
+			...credentials,
+			access: accessToken,
+			refresh: nextRefreshToken,
+			expires: expiration.expiresAt,
+			accountId: identity.accountId,
+		},
+		idToken,
+	);
 }
 
 /**
@@ -273,13 +317,18 @@ export function getOAuthProvider(
 	if (isRemovedLegacyGoogleProvider(id)) {
 		return undefined;
 	}
+	if (id === OPENAI_CODEX_PROVIDER_ID) {
+		return openAICodexOAuthProvider;
+	}
 	return getOAuthProviderFromPiAi(id);
 }
 
 export function getOAuthProviders(): OAuthProviderInterface[] {
-	return getOAuthProvidersFromPiAi().filter(
-		(provider) => !isRemovedLegacyGoogleProvider(provider.id),
-	);
+	return getOAuthProvidersFromPiAi()
+		.filter((provider) => !isRemovedLegacyGoogleProvider(provider.id))
+		.map((provider) => provider.id === OPENAI_CODEX_PROVIDER_ID
+			? openAICodexOAuthProvider
+			: provider);
 }
 
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {

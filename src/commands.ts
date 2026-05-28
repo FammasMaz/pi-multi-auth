@@ -17,7 +17,7 @@ import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
-import { formatResetCountdown } from "./formatters/bar.js";
+import { formatCreditAmount, formatCreditFraction, formatResetCountdown } from "./formatters/bar.js";
 import { resolveBorderGlyphs } from "./formatters/charset.js";
 import {
 	clampRenderedRows,
@@ -51,6 +51,10 @@ import {
 	type ProviderStatus,
 	type SupportedProviderId,
 } from "./types.js";
+import {
+	summarizeCodexAggregateCredits,
+	type CodexAggregateCreditUsage,
+} from "./usage/codex.js";
 import type { UsageSnapshot } from "./usage/types.js";
 
 interface ThemeLike {
@@ -599,6 +603,49 @@ export function resolveUsageWindowLabel(
 	}
 
 	return durationLabel;
+}
+
+function formatAggregateCreditLine(
+	label: string,
+	aggregate: CodexAggregateCreditUsage | null,
+): string | null {
+	if (!aggregate) {
+		return null;
+	}
+	const remainingPercent = aggregate.capacity > 0
+		? Math.max(0, Math.round((aggregate.remaining / aggregate.capacity) * 100))
+		: 0;
+	return `${label}: ${formatCreditFraction(aggregate.remaining, aggregate.capacity)} (${remainingPercent}% left, ${aggregate.accountCount} acct${aggregate.accountCount === 1 ? "" : "s"})`;
+}
+
+export function buildCodexGlobalCreditLines(
+	credentials: readonly CredentialStatus[],
+): string[] {
+	const snapshots = credentials
+		.map((credential) => credential.usageSnapshot)
+		.filter((snapshot): snapshot is UsageSnapshot => snapshot?.provider === "openai-codex");
+	const missingCount = credentials.length - snapshots.length;
+	if (snapshots.length === 0) {
+		return missingCount > 0 ? [`Global credits: waiting on ${missingCount} account${missingCount === 1 ? "" : "s"}.`] : [];
+	}
+
+	const summary = summarizeCodexAggregateCredits(snapshots);
+	const lines = [
+		formatAggregateCreditLine("5h pool", summary.primary),
+		formatAggregateCreditLine("7d pool", summary.secondary),
+	].filter((line): line is string => line !== null);
+
+	if (summary.balance !== null) {
+		lines.push(`Upstream balance: ${formatCreditAmount(summary.balance)} credit${Math.round(summary.balance) === 1 ? "" : "s"}`);
+	}
+	if (summary.unlimitedBalanceCount > 0) {
+		lines.push(`Unlimited credit balance: ${summary.unlimitedBalanceCount} account${summary.unlimitedBalanceCount === 1 ? "" : "s"}`);
+	}
+	if (missingCount > 0) {
+		lines.push(`Missing usage: ${missingCount} account${missingCount === 1 ? "" : "s"}`);
+	}
+
+	return lines.length > 0 ? lines : ["Global credits unavailable for visible accounts."];
 }
 
 async function loginProviderFromModal(
@@ -1378,6 +1425,15 @@ class MultiAuthManagerModal {
 			if (!this.showDisabledAccounts && disabledCount > 0) {
 				lines.push(`Hidden disabled accounts: ${disabledCount}. Press [x] to show them.`);
 			}
+			if (status.provider === "openai-codex" && visibleCredentials.length > 0) {
+				lines.push(
+					"",
+					`${BORDER_GLYPHS.horizontal.repeat(2)} Global Credits ${BORDER_GLYPHS.horizontal.repeat(2)}`,
+					...buildCodexGlobalCreditLines(visibleCredentials).flatMap((line) =>
+						wrapDetailMessageLines(line, safeDetailWidth),
+					),
+				);
+			}
 			lines.push("", "Press [Enter] or [a] to add a backup credential.", "Press [←]/[→] to switch pane focus.");
 			return lines;
 		}
@@ -1412,6 +1468,16 @@ class MultiAuthManagerModal {
 				`${BORDER_GLYPHS.horizontal.repeat(2)} Usage & Quota ${BORDER_GLYPHS.horizontal.repeat(2)}`,
 				...this.buildUsageDetailLines(selectedCredential, safeDetailWidth),
 			);
+		}
+		if (status.provider === "openai-codex") {
+			const globalCreditLines = buildCodexGlobalCreditLines(this.getVisibleCredentials(status));
+			if (globalCreditLines.length > 0) {
+				detailLines.push(
+					"",
+					`${BORDER_GLYPHS.horizontal.repeat(2)} Global Credits ${BORDER_GLYPHS.horizontal.repeat(2)}`,
+					...globalCreditLines.flatMap((line) => wrapDetailMessageLines(line, safeDetailWidth)),
+				);
+			}
 		}
 		if (batchSelectionCount > 0) {
 			detailLines.push("");

@@ -34,6 +34,55 @@ const PLAN_TYPE_MAP: Record<string, string> = {
 	enterprise: "ChatGPT Enterprise",
 };
 
+const CODEX_PRIMARY_CAPACITY_CREDITS: Record<string, number> = {
+	free: 0,
+	plus: 225,
+	business: 225,
+	team: 225,
+	edu: 225,
+	pro: 1500,
+	prolite: 1125,
+	enterprise: 1500,
+};
+
+const CODEX_SECONDARY_CAPACITY_CREDITS: Record<string, number> = {
+	free: 1134,
+	plus: 7560,
+	business: 7560,
+	team: 7560,
+	edu: 7560,
+	pro: 50400,
+	prolite: 37800,
+	enterprise: 50400,
+};
+
+const CODEX_DEFAULT_PRIMARY_WINDOW_MINUTES = 300;
+const CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES = 10_080;
+
+export interface CodexWindowCreditUsage {
+	capacity: number;
+	used: number;
+	remaining: number;
+	usedPercent: number;
+	windowMinutes: number | null;
+	resetsAt: number | null;
+}
+
+export interface CodexAggregateCreditUsage {
+	capacity: number;
+	used: number;
+	remaining: number;
+	usedPercent: number | null;
+	accountCount: number;
+}
+
+export interface CodexAggregateCreditSummary {
+	primary: CodexAggregateCreditUsage | null;
+	secondary: CodexAggregateCreditUsage | null;
+	balance: number | null;
+	unlimitedBalanceCount: number;
+}
+
 const cachedCodexAccountIdsByToken = new Map<string, string | null>();
 
 
@@ -114,6 +163,157 @@ function resolveCodexAccountId(auth: UsageAuth): string | null {
 
 function normalizeUsedPercent(value: number): number {
 	return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function normalizeCodexCapacityPlan(planType: string | null | undefined): string | null {
+	if (typeof planType !== "string") {
+		return null;
+	}
+	const collapsed = planType
+		.trim()
+		.toLowerCase()
+		.replace(/^chatgpt(?:[\s_-]+)?/, "")
+		.replace(/[\s_-]+/g, "-");
+	if (!collapsed) {
+		return null;
+	}
+	const aliases: Record<string, string> = {
+		"free-workspace": "free",
+		go: "free",
+		guest: "free",
+		education: "edu",
+		k12: "edu",
+		"pro-lite": "prolite",
+		pro_lite: "prolite",
+		quorum: "free",
+		unknown: "free",
+	};
+	return aliases[collapsed] ?? collapsed;
+}
+
+function isCodexWeeklyWindow(window: RateLimitWindow | null | undefined): boolean {
+	return window?.windowMinutes === CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES;
+}
+
+function resolveCodexCreditWindow(
+	snapshot: UsageSnapshot,
+	slot: "primary" | "secondary",
+): RateLimitWindow | null {
+	if (slot === "primary") {
+		return isCodexWeeklyWindow(snapshot.primary) ? null : snapshot.primary;
+	}
+	return snapshot.secondary ?? (isCodexWeeklyWindow(snapshot.primary) ? snapshot.primary : null);
+}
+
+function getCodexCapacityCredits(
+	planType: string | null | undefined,
+	slot: "primary" | "secondary",
+): number | null {
+	const normalizedPlan = normalizeCodexCapacityPlan(planType);
+	if (!normalizedPlan) {
+		return null;
+	}
+	const capacities = slot === "primary"
+		? CODEX_PRIMARY_CAPACITY_CREDITS
+		: CODEX_SECONDARY_CAPACITY_CREDITS;
+	return capacities[normalizedPlan] ?? null;
+}
+
+function parseCreditBalance(balance: string | null | undefined): number | null {
+	if (typeof balance !== "string") {
+		return null;
+	}
+	const parsed = Number(balance.replace(/,/g, "").trim());
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function getCodexWindowCredits(
+	snapshot: UsageSnapshot,
+	slot: "primary" | "secondary",
+): CodexWindowCreditUsage | null {
+	if (snapshot.provider !== "openai-codex") {
+		return null;
+	}
+	const window = resolveCodexCreditWindow(snapshot, slot);
+	if (!window) {
+		return null;
+	}
+	const capacity = getCodexCapacityCredits(snapshot.planType, slot);
+	if (capacity === null || capacity <= 0) {
+		return null;
+	}
+	const usedPercent = Math.max(0, Math.min(100, window.usedPercent));
+	const used = (capacity * usedPercent) / 100;
+	return {
+		capacity,
+		used,
+		remaining: Math.max(0, capacity - used),
+		usedPercent,
+		windowMinutes: window.windowMinutes ?? (slot === "primary"
+			? CODEX_DEFAULT_PRIMARY_WINDOW_MINUTES
+			: CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES),
+		resetsAt: window.resetsAt,
+	};
+}
+
+function emptyAggregate(): CodexAggregateCreditUsage {
+	return {
+		capacity: 0,
+		used: 0,
+		remaining: 0,
+		usedPercent: null,
+		accountCount: 0,
+	};
+}
+
+function finalizeAggregate(aggregate: CodexAggregateCreditUsage): CodexAggregateCreditUsage | null {
+	if (aggregate.capacity <= 0 || aggregate.accountCount === 0) {
+		return null;
+	}
+	return {
+		...aggregate,
+		remaining: Math.max(0, aggregate.capacity - aggregate.used),
+		usedPercent: (aggregate.used / aggregate.capacity) * 100,
+	};
+}
+
+export function summarizeCodexAggregateCredits(
+	snapshots: readonly UsageSnapshot[],
+): CodexAggregateCreditSummary {
+	const primary = emptyAggregate();
+	const secondary = emptyAggregate();
+	let balance: number | null = null;
+	let unlimitedBalanceCount = 0;
+
+	for (const snapshot of snapshots) {
+		const primaryUsage = getCodexWindowCredits(snapshot, "primary");
+		if (primaryUsage) {
+			primary.capacity += primaryUsage.capacity;
+			primary.used += primaryUsage.used;
+			primary.accountCount += 1;
+		}
+		const secondaryUsage = getCodexWindowCredits(snapshot, "secondary");
+		if (secondaryUsage) {
+			secondary.capacity += secondaryUsage.capacity;
+			secondary.used += secondaryUsage.used;
+			secondary.accountCount += 1;
+		}
+		if (snapshot.credits?.unlimited) {
+			unlimitedBalanceCount += 1;
+		} else if (snapshot.credits?.hasCredits) {
+			const parsedBalance = parseCreditBalance(snapshot.credits.balance);
+			if (parsedBalance !== null) {
+				balance = (balance ?? 0) + parsedBalance;
+			}
+		}
+	}
+
+	return {
+		primary: finalizeAggregate(primary),
+		secondary: finalizeAggregate(secondary),
+		balance,
+		unlimitedBalanceCount,
+	};
 }
 
 function parseRateLimitWindow(value: unknown): RateLimitWindow | null {

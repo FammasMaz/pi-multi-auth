@@ -20,6 +20,15 @@ export function formatUsageBar(usedPercent: number): string {
 	return `${formatBar(clamped)} ${roundedUsed}% used (${roundedLeft}% left)`;
 }
 
+export function formatCreditAmount(value: number): string {
+	const rounded = Math.round(value);
+	return new Intl.NumberFormat("en-US").format(rounded);
+}
+
+export function formatCreditFraction(remaining: number, capacity: number): string {
+	return `${formatCreditAmount(remaining)}/${formatCreditAmount(capacity)} remaining`;
+}
+
 /**
  * Formats one Copilot quota bucket with bar + used/total data.
  */
