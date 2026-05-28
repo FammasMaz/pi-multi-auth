@@ -3128,7 +3128,7 @@ test("account manager preserves active Codex access tokens after refresh-token r
 	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
 });
 
-test("account manager clears stale Codex refresh-failure disables after reimport", async (t) => {
+test("account manager clears stale Codex authentication disables after reimport", async (t) => {
 	const providerId = "openai-codex";
 	const expiresAt = Date.now() + 10 * 60_000;
 	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
@@ -3148,7 +3148,7 @@ test("account manager clears stale Codex refresh-failure disables after reimport
 	const providerState = getProviderState(state, providerId);
 	providerState.credentialIds = [providerId];
 	providerState.disabledCredentials[providerId] = {
-		error: "Failed to refresh OAuth token for openai-codex: OpenAI Codex refresh rejected permanently (HTTP 401, code=refresh_token_reused)",
+		error: "Multi-auth rotation failed\nProvider: openai-codex\nReason: Your authentication token has been invalidated. Please try signing in again.",
 		disabledAt: Date.now() - 1_000,
 	};
 	await writeFile(storagePath, JSON.stringify(state, null, 2), "utf-8");

@@ -1335,6 +1335,18 @@ function isLegacyCodexOAuthRefreshFailureMessage(message: string | undefined): b
 	);
 }
 
+function isRecoverableCodexAuthenticationDisableMessage(message: string | undefined): boolean {
+	const normalizedMessage = message?.trim();
+	if (!normalizedMessage) {
+		return false;
+	}
+
+	return isLegacyCodexOAuthRefreshFailureMessage(normalizedMessage) ||
+		/authentication token (?:has been )?invalidated/i.test(normalizedMessage) ||
+		/token[_-]?revoked|invalid[_-]?api[_-]?key/i.test(normalizedMessage) ||
+		/(session has ended|log in again|sign in again|re-authenticate)/i.test(normalizedMessage);
+}
+
 function clearRecoveredCodexRefreshFailureState(
 	state: ProviderRotationState,
 	credentialId: string,
@@ -1345,7 +1357,7 @@ function clearRecoveredCodexRefreshFailureState(
 	const disabledEntry = state.disabledCredentials?.[credentialId];
 	if (
 		disabledEntry &&
-		isLegacyCodexOAuthRefreshFailureMessage(disabledEntry.error) &&
+		isRecoverableCodexAuthenticationDisableMessage(disabledEntry.error) &&
 		hasPreservableOAuthTokenLifetime(credential, now)
 	) {
 		delete state.disabledCredentials[credentialId];
