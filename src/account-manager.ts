@@ -128,16 +128,22 @@ import type { QuotaClassification, QuotaClassificationResult, QuotaStateForCrede
 
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
 const PRESERVED_OAUTH_REFRESH_MIN_REMAINING_MS = 30_000;
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 const PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER = new Map<string, ReadonlySet<string>>([
 	["cline", new Set(["failed_to_refresh_token"])],
+	[OPENAI_CODEX_PROVIDER_ID, new Set([
+		"invalid_grant",
+		"refresh_token_expired",
+		"refresh_token_invalidated",
+		"refresh_token_reused",
+		"token_expired",
+	])],
 ]);
 
 const MIN_QUOTA_RETRY_WINDOW_MS = 60_000;
 const SELECTION_USAGE_MAX_AGE_MS = 15_000;
 const BLOCKED_RECONCILE_USAGE_MAX_AGE_MS = 10_000;
 const MODEL_INCOMPATIBILITY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-const OPENAI_CODEX_REFRESH_INTERVAL_MS = 8 * 24 * 60 * 60 * 1000;
 const USAGE_PROVIDER_IDS = new Set(usageProviders.map((provider) => provider.id));
 
 interface AutoActivateOptions {
@@ -331,35 +337,6 @@ function isStoredOAuthCredentialForRefresh(value: unknown): value is StoredOAuth
 		typeof value.refresh === "string" &&
 		typeof value.expires === "number" &&
 		Number.isFinite(value.expires);
-}
-
-function parseCodexRefreshTimestamp(value: unknown): number | null {
-	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-		return value > 1_000_000_000_000 ? value : value * 1000;
-	}
-	if (typeof value !== "string") {
-		return null;
-	}
-	const trimmed = value.trim();
-	if (!trimmed) {
-		return null;
-	}
-	const numeric = Number(trimmed);
-	if (Number.isFinite(numeric) && numeric > 0) {
-		return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
-	}
-	const parsed = Date.parse(trimmed);
-	return Number.isFinite(parsed) ? parsed : null;
-}
-
-function getCodexLastRefreshAt(credential: OAuthCredentials): number | null {
-	return parseCodexRefreshTimestamp(credential.lastRefreshAt) ??
-		parseCodexRefreshTimestamp(credential.last_refresh);
-}
-
-function getCodexRefreshDueAt(credential: OAuthCredentials): number | null {
-	const lastRefreshAt = getCodexLastRefreshAt(credential);
-	return lastRefreshAt === null ? null : lastRefreshAt + OPENAI_CODEX_REFRESH_INTERVAL_MS;
 }
 
 function hasRotatedOAuthCredential(
@@ -1361,8 +1338,20 @@ function isLegacyCodexOAuthRefreshFailureMessage(message: string | undefined): b
 function clearRecoveredCodexRefreshFailureState(
 	state: ProviderRotationState,
 	credentialId: string,
+	credential: StoredOAuthCredential,
+	now: number = Date.now(),
 ): boolean {
 	let changed = false;
+	const disabledEntry = state.disabledCredentials?.[credentialId];
+	if (
+		disabledEntry &&
+		isLegacyCodexOAuthRefreshFailureMessage(disabledEntry.error) &&
+		hasPreservableOAuthTokenLifetime(credential, now)
+	) {
+		delete state.disabledCredentials[credentialId];
+		changed = true;
+	}
+
 	const lastQuotaError = state.lastQuotaError[credentialId];
 	if (isLegacyCodexOAuthRefreshFailureMessage(lastQuotaError)) {
 		delete state.quotaExhaustedUntil[credentialId];
@@ -1514,7 +1503,7 @@ function clearRecoveredOAuthRefreshFailureStateForCredential(
 	now: number = Date.now(),
 ): boolean {
 	if (provider === "openai-codex") {
-		return clearRecoveredCodexRefreshFailureState(state, credentialId);
+		return clearRecoveredCodexRefreshFailureState(state, credentialId, credential, now);
 	}
 	if (provider === "cline") {
 		return clearRecoveredClineRefreshFailureState(state, credentialId, credential, now);
@@ -3019,6 +3008,22 @@ export class AccountManager {
 			);
 		}
 		this.assertOAuthRefreshManagedForProvider(provider);
+
+		if (provider === OPENAI_CODEX_PROVIDER_ID) {
+			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, credential);
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			await this.storage.withLock((stored) => {
+				const providerState = getProviderState(stored, provider);
+				providerState.lastUsedAt[credentialId] = Date.now();
+				return { result: undefined, next: stored };
+			});
+			this.usageService.clearOperationalCredential(provider, credentialId);
+			return {
+				credential,
+				disposition: "preserved_active_token",
+			};
+		}
 
 		let effectiveCredential: StoredOAuthCredential;
 		let disposition: CredentialRefreshDisposition = "refreshed";
@@ -4803,18 +4808,15 @@ export class AccountManager {
 			return credential;
 		}
 
-		const now = Date.now();
+		if (provider === OPENAI_CODEX_PROVIDER_ID) {
+			return credential;
+		}
+
 		const safetyWindowMs = getOAuthRefreshLeadTimeMs(
 			provider,
 			this.extensionConfig.oauthRefresh.safetyWindowMs,
 		);
-		if (provider === OPENAI_CODEX_PROVIDER_ID) {
-			const codexRefreshDueAt = getCodexRefreshDueAt(credential);
-			const refreshDueAt = codexRefreshDueAt ?? credential.expires - safetyWindowMs;
-			if (now < refreshDueAt) {
-				return credential;
-			}
-		} else if (now < credential.expires - safetyWindowMs) {
+		if (Date.now() < credential.expires - safetyWindowMs) {
 			return credential;
 		}
 
@@ -5266,15 +5268,8 @@ export class AccountManager {
 		}
 
 		if (provider === OPENAI_CODEX_PROVIDER_ID) {
-			const refreshDueAt = getCodexRefreshDueAt(credential);
-			if (refreshDueAt !== null) {
-				this.oauthRefreshScheduler.scheduleRefresh(
-					credentialId,
-					provider,
-					refreshDueAt + this.extensionConfig.oauthRefresh.safetyWindowMs,
-				);
-				return;
-			}
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			return;
 		}
 
 		const expiration = determineTokenExpiration(credential.access, credential.expires);

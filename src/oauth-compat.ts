@@ -80,7 +80,13 @@ function isPermanentCodexRefreshFailure(
 		.filter((value): value is string => typeof value === "string" && value.length > 0)
 		.join(" ");
 
-	if (errorCode === "invalid_grant" || errorCode === "refresh_token_reused") {
+	if (
+		errorCode === "invalid_grant" ||
+		errorCode === "refresh_token_reused" ||
+		errorCode === "refresh_token_invalidated" ||
+		errorCode === "refresh_token_expired" ||
+		errorCode === "token_expired"
+	) {
 		return true;
 	}
 
