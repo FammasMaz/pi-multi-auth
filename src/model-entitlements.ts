@@ -27,7 +27,6 @@ export interface CredentialModelEligibility {
 const OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS = new Set([
 	"gpt-5-mini",
 	"gpt-5.3-codex",
-	"gpt-5.5",
 ]);
 const OPENAI_CODEX_FREE_BLOCKED_MODEL_PATTERNS: readonly RegExp[] = [
 	/^gpt-(?:[6-9]|\d{2,})(?:[.-][a-z0-9]+)*$/,
