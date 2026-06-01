@@ -5,6 +5,7 @@ import {
 	OAuthDialogCallbackBridge,
 	formatOAuthLoginSuccessMessage,
 } from "../src/oauth-login-flow.js";
+import type { OAuthDeviceCodeInfo } from "../src/oauth-compat.js";
 
 class StubOAuthDialog {
 	readonly signal = new AbortController().signal;
@@ -132,4 +133,97 @@ test("OAuth success messages report the storage slot and credential totals", () 
 		}),
 		"OAuth login successful for openai-codex. Stored as primary credential openai-codex. Total credentials: 1",
 	);
+});
+
+// ---------------------------------------------------------------------------
+// onDeviceCode callback
+// ---------------------------------------------------------------------------
+
+test("OAuth dialog bridge onDeviceCode shows verification URI and user code", () => {
+	const dialog = new StubOAuthDialog();
+	const callbacks = new OAuthDialogCallbackBridge(dialog).createCallbacks();
+
+	const deviceCodeInfo: OAuthDeviceCodeInfo = {
+		userCode: "ABCD-1234",
+		verificationUri: "https://example.com/device",
+		intervalSeconds: 5,
+		expiresInSeconds: 600,
+	};
+	callbacks.onDeviceCode(deviceCodeInfo);
+
+	assert.equal(dialog.authCalls.length, 1);
+	assert.equal(dialog.authCalls[0].url, "https://example.com/device");
+	assert.match(dialog.authCalls[0].instructions ?? "", /Enter code: ABCD-1234/);
+});
+
+test("OAuth dialog bridge onDeviceCode resets waiting state", () => {
+	const dialog = new StubOAuthDialog();
+	const callbacks = new OAuthDialogCallbackBridge(dialog).createCallbacks();
+
+	// Show waiting first
+	callbacks.onProgress?.("Waiting for device confirmation...");
+	assert.equal(dialog.waitingMessages.length, 1);
+
+	// Device code arrives → waiting state should reset to progress
+	callbacks.onDeviceCode({
+		userCode: "CODE",
+		verificationUri: "https://example.com/device",
+		intervalSeconds: 5,
+		expiresInSeconds: 600,
+	});
+
+	// After onDeviceCode reset, next progress should be a new waiting message
+	callbacks.onProgress?.("Polling for approval...");
+	assert.equal(dialog.waitingMessages.length, 2); // first waiting + new waiting after reset
+	assert.equal(dialog.progressMessages.length, 0);
+});
+
+test("OAuth dialog bridge onDeviceCode handles minimal device code info", () => {
+	const dialog = new StubOAuthDialog();
+	const callbacks = new OAuthDialogCallbackBridge(dialog).createCallbacks();
+
+	// Minimal info without verificationUriComplete
+	callbacks.onDeviceCode({
+		userCode: "MINI",
+		verificationUri: "https://example.com/device",
+	});
+
+	assert.equal(dialog.authCalls.length, 1);
+	assert.equal(dialog.authCalls[0].url, "https://example.com/device");
+});
+
+test("OAuth dialog bridge onDeviceCode shows auth directly without prior waiting state", () => {
+	const dialog = new StubOAuthDialog();
+	const callbacks = new OAuthDialogCallbackBridge(dialog).createCallbacks();
+
+	callbacks.onDeviceCode({
+		userCode: "FIRST",
+		verificationUri: "https://example.com/device",
+	});
+
+	assert.equal(dialog.authCalls.length, 1);
+	// No waiting message was shown before device code
+	assert.equal(dialog.waitingMessages.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// formatOAuthLoginSuccessMessage edge cases
+// ---------------------------------------------------------------------------
+
+test("formatOAuthLoginSuccessMessage handles single credential", () => {
+	const msg = formatOAuthLoginSuccessMessage("test-provider", {
+		credentialId: "test-provider",
+		isBackupCredential: false,
+		credentialIds: ["test-provider"],
+	});
+	assert.equal(msg, "OAuth login successful for test-provider. Stored as primary credential test-provider. Total credentials: 1");
+});
+
+test("formatOAuthLoginSuccessMessage handles empty credentialIds", () => {
+	const msg = formatOAuthLoginSuccessMessage("empty", {
+		credentialId: "empty",
+		isBackupCredential: false,
+		credentialIds: [],
+	});
+	assert.equal(msg, "OAuth login successful for empty. Stored as primary credential empty. Total credentials: 0");
 });

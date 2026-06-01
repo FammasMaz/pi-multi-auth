@@ -975,9 +975,15 @@ async function addOpenAICodexImportsFromModal(
 
 	for (const [index, credential] of parsedInput.credentials.entries()) {
 		try {
+			const missingRefreshToken = credential.refresh.trim().length === 0;
 			const added = await accountManager.addOAuthCredential(
 				OPENAI_CODEX_IMPORT_PROVIDER_ID,
 				credential,
+				{
+					backgroundExclusionReason: missingRefreshToken
+						? "missing_refresh_token_on_import"
+						: undefined,
+				},
 			);
 			latestCredentialIds = added.credentialIds;
 			lastTouchedCredentialId = added.credentialId;
@@ -1143,7 +1149,7 @@ export function resolveMultiAuthOverlayOptions(
 	});
 }
 
-export function resolveMultiAuthRuntimeOverlayOptions(): OverlayOptions {
+function resolveMultiAuthRuntimeOverlayOptions(): OverlayOptions {
 	return resolveResponsiveOverlayRuntimeOptions({
 		minimumWidth: 48,
 		widthRatio: 0.98,
@@ -1717,7 +1723,7 @@ class MultiAuthManagerModal {
 			const supportsImport = providerSupportsCredentialImport(status.provider);
 			const addHint = capabilities.supportsOAuth
 				? supportsImport
-					? "Add backup via API key, OAuth login, or CPA/Sub2API JSON/CSV/ZIP import."
+					? "Add backup via API key, OAuth login, or OmniOnboard/CPA/Sub2API JSON/CSV/ZIP import."
 					: "Add backup via API key or OAuth login."
 				: "Add backup via API key (batch mode opens a multiline editor; one key per line).";
 			const lines = [
@@ -1772,7 +1778,7 @@ class MultiAuthManagerModal {
 			`Selection: ${selectionMode}`,
 			`Marked:    ${this.isCredentialBatchSelected(status.provider, selectedCredential.credentialId) ? "Batch delete queue" : "No"}`,
 			`Rotation:  ${formatRotationModeLabel(status.rotationMode)}`,
-			`Usage:     ${selectedCredential.usageCount} requests`,
+			`Usage:     ${selectedCredential.usageCount} usage units`,
 			...(duplicateDetailLine ? [duplicateDetailLine] : []),
 		];
 		if (hasUsageApi) {
@@ -2242,7 +2248,7 @@ class MultiAuthManagerModal {
 			methods.push({ label: "OAuth login", value: "oauth" });
 		}
 		if (providerSupportsCredentialImport(provider)) {
-			methods.push({ label: "Import CPA/Sub2API JSON/CSV/ZIP", value: "import" });
+			methods.push({ label: "Import OmniOnboard/CPA/Sub2API JSON/CSV/ZIP", value: "import" });
 		}
 		if (methods.length === 1) {
 			return methods[0]?.value ?? null;
@@ -2256,7 +2262,7 @@ class MultiAuthManagerModal {
 		const selectedMethod = await this.selectAddMethod("Add provider", [
 			{ label: "Use API key", value: "api_key" },
 			{ label: "Use OAuth login", value: "oauth" },
-			{ label: "Import CPA/Sub2API JSON/CSV/ZIP", value: "import" },
+			{ label: "Import OmniOnboard/CPA/Sub2API JSON/CSV/ZIP", value: "import" },
 		]);
 		if (!selectedMethod) {
 			return null;
@@ -2442,7 +2448,7 @@ class MultiAuthManagerModal {
 			throw new Error("Credential import is only supported for openai-codex.");
 		}
 		const importInput = await this.ctx.ui.editor(
-			"Paste OpenAI Codex CPA/Sub2API JSON/CSV, or a path to a CPA/Sub2API .zip export.",
+			"Paste OpenAI Codex OmniOnboard/CPA/Sub2API JSON/CSV, or a path to a .zip export.",
 		);
 		if (!importInput) {
 			return null;
@@ -2664,17 +2670,24 @@ class MultiAuthManagerModal {
 							: `Credential checked for ${displayName}.`;
 						return `${checkedMessage} Usage warning: ${usage.error}.`;
 					}
-					return refreshResult?.disposition === "preserved_active_token"
-						? `Refresh endpoint failed for ${displayName}, but the current token is still active. Usage warning: ${usage.error}.`
-						: `Token refreshed for ${displayName}. Usage warning: ${usage.error}.`;
+					if (refreshResult?.disposition === "preserved_active_token") {
+						return `Refresh endpoint failed for ${displayName}, but the current token is still active. Usage warning: ${usage.error}.`;
+					}
+					if (refreshResult?.disposition === "skipped_missing_refresh_token") {
+						return `Token refresh skipped for ${displayName} because it was imported without a refresh token. Usage warning: ${usage.error}.`;
+					}
+					return `Token refreshed for ${displayName}. Usage warning: ${usage.error}.`;
 				}
 				if (isApiKeyCredential) {
 					return cloudflareIdentityRefresh
 						? formatCloudflareIdentityRefreshMessage(cloudflareIdentityRefresh, displayName)
 						: `Credential checked for ${displayName}.`;
 				}
-				return refreshResult?.disposition === "preserved_active_token"
-					? `Refresh endpoint failed for ${displayName}, but the current token is still active and will continue to be used.`
+				if (refreshResult?.disposition === "preserved_active_token") {
+					return `Refresh endpoint failed for ${displayName}, but the current token is still active and will continue to be used.`;
+				}
+				return refreshResult?.disposition === "skipped_missing_refresh_token"
+					? `Token refresh skipped for ${displayName} because it was imported without a refresh token; current access token will continue to be used.`
 					: `Token refreshed for ${displayName}.`;
 			},
 		);
@@ -3054,7 +3067,7 @@ class MultiAuthManagerModal {
 
 }
 
-async function openMultiAuthModal(
+export async function openMultiAuthModal(
 	ctx: ExtensionCommandContext,
 	accountManager: AccountManager,
 ): Promise<void> {

@@ -233,6 +233,7 @@ async function refreshOpenAICodexCredential(
 	const identity = extractCodexCredentialIdentity({
 		access: accessToken,
 		accountId: credentials.accountId,
+		idToken: credentials.idToken,
 	});
 	if (!identity.accountId) {
 		throw new OAuthRefreshFailureError(
