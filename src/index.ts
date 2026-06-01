@@ -1,13 +1,16 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { AccountManager } from "./account-manager.js";
 import {
 	registerGlobalKeyDistributor,
 	unregisterGlobalKeyDistributor,
 } from "./balancer/index.js";
-import { registerMultiAuthCommands } from "./commands.js";
 import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import { loadMultiAuthConfig } from "./config.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
+import {
+	registerDelegatedAuthBroker,
+	unregisterDelegatedAuthBroker,
+} from "./delegated-auth-broker.js";
 import {
 	registerMultiAuthProviders,
 	registerRuntimeProviderOverride,
@@ -63,6 +66,33 @@ function registerEnabledOAuthProviders(hiddenProviders: ReadonlySet<string>): vo
 			registerProvider();
 		}
 	}
+}
+
+function registerLazyMultiAuthCommands(
+	pi: ExtensionAPI,
+	accountManager: AccountManager,
+): void {
+	pi.registerCommand("multi-auth", {
+		description: "Open unified multi-auth account manager modal",
+		handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+			if (args.trim()) {
+				ctx.ui.notify("Usage: /multi-auth", "warning");
+				return;
+			}
+
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/multi-auth requires interactive TUI mode.", "warning");
+				return;
+			}
+
+			try {
+				const { openMultiAuthModal } = await import("./commands.js");
+				await openMultiAuthModal(ctx, accountManager);
+			} catch (error) {
+				ctx.ui.notify(`/multi-auth failed: ${getErrorMessage(error)}`, "error");
+			}
+		},
+	});
 }
 
 /**
@@ -122,6 +152,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 
 	const keyDistributor = accountManager.getKeyDistributor();
 	registerGlobalKeyDistributor(keyDistributor);
+	const delegatedAuthBroker = registerDelegatedAuthBroker(accountManager);
 	const excludedProviders = new Set(hiddenProvidersAtStartup);
 	const isRuntimeProviderAllowed = (provider: string): boolean => {
 		if (excludedProviders.has(provider)) {
@@ -232,6 +263,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		nextWarmup = (async () => {
 			await accountManager.ensureInitialized();
 			await accountManager.autoActivatePreferredCredentials({ avoidUsageApi: true });
+			await accountManager.warmupOperationalUsageCaches();
 		})()
 			.then(() => {
 				if (!isStartupWorkCurrent(generation)) {
@@ -310,6 +342,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 				onWarning?.(message);
 			} finally {
 				unregisterGlobalKeyDistributor(keyDistributor);
+				unregisterDelegatedAuthBroker(delegatedAuthBroker);
 				await multiAuthDebugLogger.dispose();
 			}
 		})();
@@ -333,7 +366,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 	});
 
 	if (!isSubagentRuntime) {
-		registerMultiAuthCommands(pi, accountManager);
+		registerLazyMultiAuthCommands(pi, accountManager);
 	}
 
 	try {
@@ -361,6 +394,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		const startupGeneration = beginStartupWorkGeneration();
 		clearStartupTimers();
 		registerGlobalKeyDistributor(keyDistributor);
+		registerDelegatedAuthBroker(accountManager);
 		flushStartupWarnings((message) => {
 			ctx.ui.notify(`multi-auth startup warning: ${message}`, "warning");
 		});

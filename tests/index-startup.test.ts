@@ -11,9 +11,9 @@ import { DEFAULT_MULTI_AUTH_CONFIG, loadMultiAuthConfig } from "../src/config.js
 import { MultiAuthDebugLogger } from "../src/debug-logger.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
 import {
-	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
-	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
-	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_DELEGATED_AUTH_API_KEY_ENV,
+	PI_DELEGATED_AUTH_LEASE_ID_ENV,
+	PI_DELEGATED_AUTH_PROVIDER_ID_ENV,
 	PI_AGENT_ROUTER_SUBAGENT_ENV,
 	resolveDelegatedCredentialOverride,
 } from "../src/runtime-context.js";
@@ -57,6 +57,7 @@ const { default: extension } = await import(
 
 let ensureCalls = 0;
 const autoActivateCallOptions = [];
+let operationalWarmupCalls = 0;
 let resolveEnsureStarted;
 let releaseEnsure;
 const ensureStarted = new Promise((resolve) => {
@@ -66,6 +67,8 @@ const ensureStarted = new Promise((resolve) => {
 const originalEnsureInitialized = AccountManager.prototype.ensureInitialized;
 const originalAutoActivatePreferredCredentials =
 	AccountManager.prototype.autoActivatePreferredCredentials;
+const originalWarmupOperationalUsageCaches =
+	AccountManager.prototype.warmupOperationalUsageCaches;
 const originalDiscoverProviderIds = ProviderRegistry.prototype.discoverProviderIds;
 
 ProviderRegistry.prototype.discoverProviderIds = async function discoverProviderIdsStub() {
@@ -81,6 +84,10 @@ AccountManager.prototype.ensureInitialized = async function ensureInitializedStu
 AccountManager.prototype.autoActivatePreferredCredentials =
 	async function autoActivatePreferredCredentialsStub(options) {
 		autoActivateCallOptions.push(options ?? null);
+	};
+AccountManager.prototype.warmupOperationalUsageCaches =
+	async function warmupOperationalUsageCachesStub() {
+		operationalWarmupCalls += 1;
 	};
 
 try {
@@ -117,6 +124,7 @@ try {
 
 	const ensureCallsAfterSessionStart = ensureCalls;
 	const autoActivateCallsBeforeRelease = autoActivateCallOptions.length;
+	const operationalWarmupCallsBeforeRelease = operationalWarmupCalls;
 
 	releaseEnsure?.();
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -127,13 +135,17 @@ try {
 			ensureCallsBeforeSessionStart,
 			ensureCallsAfterSessionStart,
 			autoActivateCallsBeforeRelease,
+			operationalWarmupCallsBeforeRelease,
 			autoActivateCallOptions,
+			operationalWarmupCalls,
 		}),
 	);
 } finally {
 	AccountManager.prototype.ensureInitialized = originalEnsureInitialized;
 	AccountManager.prototype.autoActivatePreferredCredentials =
 		originalAutoActivatePreferredCredentials;
+	AccountManager.prototype.warmupOperationalUsageCaches =
+		originalWarmupOperationalUsageCaches;
 	ProviderRegistry.prototype.discoverProviderIds = originalDiscoverProviderIds;
 }
 `;
@@ -154,15 +166,17 @@ test("pi-multi-auth starts startup warmup only after session_start", () => {
 	assert.equal(result.ensureCallsBeforeSessionStart, 0);
 	assert.equal(result.ensureCallsAfterSessionStart, 1);
 	assert.equal(result.autoActivateCallsBeforeRelease, 0);
+	assert.equal(result.operationalWarmupCallsBeforeRelease, 0);
 	assert.deepEqual(result.autoActivateCallOptions, [{ avoidUsageApi: true }]);
+	assert.equal(result.operationalWarmupCalls, 1);
 });
 
 test("delegated subagent runtime resolves the router-provided credential override", () => {
 	const override = resolveDelegatedCredentialOverride("openai-codex", {
 		[PI_AGENT_ROUTER_SUBAGENT_ENV]: "1",
-		[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: "openai-codex",
-		[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: "openai-codex-4",
-		[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: "delegated-secret",
+		[PI_DELEGATED_AUTH_PROVIDER_ID_ENV]: "openai-codex",
+		[PI_DELEGATED_AUTH_LEASE_ID_ENV]: "openai-codex-4",
+		[PI_DELEGATED_AUTH_API_KEY_ENV]: "delegated-secret",
 	});
 
 	assert.deepEqual(override, {
@@ -173,9 +187,9 @@ test("delegated subagent runtime resolves the router-provided credential overrid
 	assert.equal(
 		resolveDelegatedCredentialOverride("github-copilot", {
 			[PI_AGENT_ROUTER_SUBAGENT_ENV]: "1",
-			[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: "openai-codex",
-			[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: "openai-codex-4",
-			[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: "delegated-secret",
+			[PI_DELEGATED_AUTH_PROVIDER_ID_ENV]: "openai-codex",
+			[PI_DELEGATED_AUTH_LEASE_ID_ENV]: "openai-codex-4",
+			[PI_DELEGATED_AUTH_API_KEY_ENV]: "delegated-secret",
 		}),
 		undefined,
 	);

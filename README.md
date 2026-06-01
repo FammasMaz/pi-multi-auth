@@ -143,7 +143,8 @@ The extension reads optional environment variables to override OAuth client sett
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_MULTI_AUTH_RUNTIME_DIR` | Pi agent runtime directory | Override the directory for usage cache and `multi-auth.json` |
+| `PI_DELEGATED_AUTH_RUNTIME_DIR` | Pi agent runtime directory | Override the directory for usage cache and `multi-auth.json` |
+| `PI_MULTI_AUTH_RUNTIME_DIR` | Pi agent runtime directory | Legacy alias for `PI_DELEGATED_AUTH_RUNTIME_DIR`; used only when the delegated variable is unset |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Override the Pi agent directory (affects `models.json` and runtime path resolution) |
 
 ### Display overrides
