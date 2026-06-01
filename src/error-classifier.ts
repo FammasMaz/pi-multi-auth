@@ -112,7 +112,9 @@ const QUOTA_PATTERNS: RegExp[] = [
 	/usage limit/i,
 	/credit balance/i,
 	/out of credits?/i,
-	/monthly (?:spend|usage) limit/i,
+	/monthly (?:spend|usage|quota|credit) limit/i,
+	/monthly\s+(?:quota|credits?)/i,
+	/30[\s-]?day\s+(?:usage\s+)?(?:quota|limit|window)/i,
 	/daily\s+free\s+allocation/i,
 	/used\s+up\s+your\s+daily/i,
 	/neurons?\s+per\s+day/i,
@@ -394,7 +396,9 @@ export function classifyCredentialError(
 
 	const isRateLimited = matchesAny(message, RATE_LIMIT_PATTERNS);
 	const isQuotaError = matchesAny(message, QUOTA_PATTERNS);
-	const isWeeklyQuota = matchesAny(message, WEEKLY_QUOTA_PATTERNS);
+	const inferredQuotaClassification = quotaClassifier.classifyFromMessage(message).classification;
+	const isWeeklyQuota =
+		matchesAny(message, WEEKLY_QUOTA_PATTERNS) && inferredQuotaClassification !== "monthly";
 
 	// Weekly quota errors get special handling with exponential backoff
 	if (isWeeklyQuota) {

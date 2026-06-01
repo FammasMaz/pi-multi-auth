@@ -57,7 +57,8 @@ const CODEX_SECONDARY_CAPACITY_CREDITS: Record<string, number> = {
 };
 
 const CODEX_DEFAULT_PRIMARY_WINDOW_MINUTES = 300;
-const CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES = 10_080;
+const CODEX_PAID_SECONDARY_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_FREE_SECONDARY_WINDOW_MINUTES = 30 * 24 * 60;
 
 export interface CodexWindowCreditUsage {
 	capacity: number;
@@ -74,6 +75,7 @@ export interface CodexAggregateCreditUsage {
 	remaining: number;
 	usedPercent: number | null;
 	accountCount: number;
+	windowMinutes: number | null;
 }
 
 export interface CodexAggregateCreditSummary {
@@ -191,8 +193,49 @@ function normalizeCodexCapacityPlan(planType: string | null | undefined): string
 	return aliases[collapsed] ?? collapsed;
 }
 
-function isCodexWeeklyWindow(window: RateLimitWindow | null | undefined): boolean {
-	return window?.windowMinutes === CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES;
+function isCodexFreeLikePlan(planType: string | null | undefined): boolean {
+	return getCodexCapacityCredits(planType, "primary") === 0 &&
+		getCodexCapacityCredits(planType, "secondary") !== null;
+}
+
+function getCodexDefaultWindowMinutes(
+	planType: string | null | undefined,
+	slot: "primary" | "secondary",
+): number {
+	if (slot === "primary") {
+		return CODEX_DEFAULT_PRIMARY_WINDOW_MINUTES;
+	}
+	return isCodexFreeLikePlan(planType)
+		? CODEX_FREE_SECONDARY_WINDOW_MINUTES
+		: CODEX_PAID_SECONDARY_WINDOW_MINUTES;
+}
+
+function isCodexSecondaryQuotaWindow(
+	window: RateLimitWindow | null | undefined,
+	planType: string | null | undefined,
+): boolean {
+	const windowMinutes = window?.windowMinutes;
+	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes)) {
+		return false;
+	}
+	if (windowMinutes === CODEX_PAID_SECONDARY_WINDOW_MINUTES) {
+		return true;
+	}
+	if (windowMinutes === CODEX_FREE_SECONDARY_WINDOW_MINUTES) {
+		return planType === null || planType === undefined || isCodexFreeLikePlan(planType);
+	}
+	return false;
+}
+
+function normalizeCodexUsageWindows(
+	planType: string | null,
+	primary: RateLimitWindow | null,
+	secondary: RateLimitWindow | null,
+): { primary: RateLimitWindow | null; secondary: RateLimitWindow | null } {
+	if (primary && isCodexSecondaryQuotaWindow(primary, planType)) {
+		return { primary: null, secondary: secondary ?? primary };
+	}
+	return { primary, secondary };
 }
 
 function resolveCodexCreditWindow(
@@ -200,9 +243,10 @@ function resolveCodexCreditWindow(
 	slot: "primary" | "secondary",
 ): RateLimitWindow | null {
 	if (slot === "primary") {
-		return isCodexWeeklyWindow(snapshot.primary) ? null : snapshot.primary;
+		return isCodexSecondaryQuotaWindow(snapshot.primary, snapshot.planType) ? null : snapshot.primary;
 	}
-	return snapshot.secondary ?? (isCodexWeeklyWindow(snapshot.primary) ? snapshot.primary : null);
+	return snapshot.secondary ??
+		(isCodexSecondaryQuotaWindow(snapshot.primary, snapshot.planType) ? snapshot.primary : null);
 }
 
 function getCodexCapacityCredits(
@@ -249,9 +293,7 @@ export function getCodexWindowCredits(
 		used,
 		remaining: Math.max(0, capacity - used),
 		usedPercent,
-		windowMinutes: window.windowMinutes ?? (slot === "primary"
-			? CODEX_DEFAULT_PRIMARY_WINDOW_MINUTES
-			: CODEX_DEFAULT_SECONDARY_WINDOW_MINUTES),
+		windowMinutes: window.windowMinutes ?? getCodexDefaultWindowMinutes(snapshot.planType, slot),
 		resetsAt: window.resetsAt,
 	};
 }
@@ -263,7 +305,36 @@ function emptyAggregate(): CodexAggregateCreditUsage {
 		remaining: 0,
 		usedPercent: null,
 		accountCount: 0,
+		windowMinutes: null,
 	};
+}
+
+function trackAggregateWindowMinutes(
+	aggregate: CodexAggregateCreditUsage,
+	windowMinutes: number | null,
+): void {
+	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+		return;
+	}
+	if (aggregate.windowMinutes === null) {
+		if (aggregate.accountCount === 0) {
+			aggregate.windowMinutes = windowMinutes;
+		}
+		return;
+	}
+	if (aggregate.windowMinutes !== windowMinutes) {
+		aggregate.windowMinutes = null;
+	}
+}
+
+function addAggregateUsage(
+	aggregate: CodexAggregateCreditUsage,
+	usage: CodexWindowCreditUsage,
+): void {
+	aggregate.capacity += usage.capacity;
+	aggregate.used += usage.used;
+	trackAggregateWindowMinutes(aggregate, usage.windowMinutes);
+	aggregate.accountCount += 1;
 }
 
 function finalizeAggregate(aggregate: CodexAggregateCreditUsage): CodexAggregateCreditUsage | null {
@@ -288,15 +359,11 @@ export function summarizeCodexAggregateCredits(
 	for (const snapshot of snapshots) {
 		const primaryUsage = getCodexWindowCredits(snapshot, "primary");
 		if (primaryUsage) {
-			primary.capacity += primaryUsage.capacity;
-			primary.used += primaryUsage.used;
-			primary.accountCount += 1;
+			addAggregateUsage(primary, primaryUsage);
 		}
 		const secondaryUsage = getCodexWindowCredits(snapshot, "secondary");
 		if (secondaryUsage) {
-			secondary.capacity += secondaryUsage.capacity;
-			secondary.used += secondaryUsage.used;
-			secondary.accountCount += 1;
+			addAggregateUsage(secondary, secondaryUsage);
 		}
 		if (snapshot.credits?.unlimited) {
 			unlimitedBalanceCount += 1;
@@ -546,18 +613,24 @@ export const codexUsageProvider: UsageProvider<UsageAuth> = {
 			response.responseHeaders,
 			"openai-codex",
 		);
-		const quotaClassification = quotaClassifier.classifyFromUsage(
+		const planType = formatPlanType(parsed.plan_type);
+		const normalizedWindows = normalizeCodexUsageWindows(
+			planType,
 			parsed.rate_limit.primary_window,
 			parsed.rate_limit.secondary_window,
+		);
+		const quotaClassification = quotaClassifier.classifyFromUsage(
+			normalizedWindows.primary,
+			normalizedWindows.secondary,
 			rateLimitHeaders,
 		).classification;
 		const now = Date.now();
 		return {
 			timestamp: now,
 			provider: "openai-codex",
-			planType: formatPlanType(parsed.plan_type),
-			primary: parsed.rate_limit.primary_window,
-			secondary: parsed.rate_limit.secondary_window,
+			planType,
+			primary: normalizedWindows.primary,
+			secondary: normalizedWindows.secondary,
 			credits: parsed.credits,
 			copilotQuota: null,
 			updatedAt: now,

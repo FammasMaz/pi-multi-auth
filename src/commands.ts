@@ -582,6 +582,20 @@ function formatWindowDurationLabel(windowMinutes: number | null): string | null 
 	return `${windowMinutes}-minute window`;
 }
 
+function formatWindowDurationShortLabel(windowMinutes: number | null): string | null {
+	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+		return null;
+	}
+
+	if (windowMinutes % (24 * 60) === 0) {
+		return `${windowMinutes / (24 * 60)}d`;
+	}
+	if (windowMinutes % 60 === 0) {
+		return `${windowMinutes / 60}h`;
+	}
+	return `${windowMinutes}m`;
+}
+
 export function resolveUsageWindowLabel(
 	snapshot: UsageSnapshot,
 	slot: "primary" | "secondary",
@@ -606,12 +620,14 @@ export function resolveUsageWindowLabel(
 }
 
 function formatAggregateCreditLine(
-	label: string,
+	fallbackLabel: string,
 	aggregate: CodexAggregateCreditUsage | null,
 ): string | null {
 	if (!aggregate) {
 		return null;
 	}
+	const durationLabel = formatWindowDurationShortLabel(aggregate.windowMinutes);
+	const label = durationLabel ? `${durationLabel} pool` : fallbackLabel;
 	const remainingPercent = aggregate.capacity > 0
 		? Math.max(0, Math.round((aggregate.remaining / aggregate.capacity) * 100))
 		: 0;
@@ -631,8 +647,8 @@ export function buildCodexGlobalCreditLines(
 
 	const summary = summarizeCodexAggregateCredits(snapshots);
 	const lines = [
-		formatAggregateCreditLine("5h pool", summary.primary),
-		formatAggregateCreditLine("7d pool", summary.secondary),
+		formatAggregateCreditLine("Primary pool", summary.primary),
+		formatAggregateCreditLine("Secondary pool", summary.secondary),
 	].filter((line): line is string => line !== null);
 
 	if (summary.balance !== null) {

@@ -68,7 +68,7 @@ export const QUOTA_COOLDOWN_MS: Record<QuotaClassification, number> = {
 	hourly: 60 * 60 * 1000,
 	daily: 24 * 60 * 60 * 1000,
 	weekly: 72 * 60 * 60 * 1000,
-	monthly: 7 * 24 * 60 * 60 * 1000,
+	monthly: 30 * 24 * 60 * 60 * 1000,
 	balance: Number.POSITIVE_INFINITY,
 	organization: Number.POSITIVE_INFINITY,
 	unknown: 60 * 60 * 1000,

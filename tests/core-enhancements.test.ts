@@ -2640,6 +2640,14 @@ test("account manager resolves deterministic failover chains with mapped models"
 	assert.equal(stored.providers[sourceProvider]?.activeChain, undefined);
 });
 
+test("OpenAI 30-day free quota errors classify as monthly quota exhaustion", () => {
+	const classification = classifyCredentialError("You have reached your 30-day limit. Upgrade for higher limits.");
+
+	assert.equal(classification.kind, "quota");
+	assert.equal(classification.quotaClassification, "monthly");
+	assert.ok((classification.recommendedCooldownMs ?? 0) >= 29 * 24 * 60 * 60_000);
+});
+
 test("richer quota classification drives cooldown duration and persisted quota state", async (t) => {
 	const providerId = "quota-provider";
 	const { accountManager, storagePath } = await createAccountManagerHarness(t, {

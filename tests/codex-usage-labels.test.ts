@@ -54,7 +54,7 @@ test("Codex global credit lines aggregate visible account capacity", () => {
 	]);
 });
 
-test("Codex credit helper treats weekly-only primary rows as weekly capacity", () => {
+test("Codex credit helper treats weekly-only primary rows as secondary capacity", () => {
 	const snapshot = createSnapshot({
 		planType: "free",
 		primary: { usedPercent: 50, windowMinutes: 10_080, resetsAt: null },
@@ -70,4 +70,29 @@ test("Codex credit helper treats weekly-only primary rows as weekly capacity", (
 		windowMinutes: 10_080,
 		resetsAt: null,
 	});
+});
+
+test("Codex free 30-day primary rows are shown as secondary 30d capacity", () => {
+	const snapshot = createSnapshot({
+		planType: "free",
+		primary: { usedPercent: 50, windowMinutes: 43_200, resetsAt: null },
+		secondary: null,
+	});
+	const credential = {
+		credentialId: "openai-codex-free",
+		usageSnapshot: snapshot,
+	} as CredentialStatus;
+
+	assert.equal(getCodexWindowCredits(snapshot, "primary"), null);
+	assert.deepEqual(getCodexWindowCredits(snapshot, "secondary"), {
+		capacity: 1134,
+		used: 567,
+		remaining: 567,
+		usedPercent: 50,
+		windowMinutes: 43_200,
+		resetsAt: null,
+	});
+	assert.deepEqual(buildCodexGlobalCreditLines([credential]), [
+		"30d pool: 567/1,134 remaining (50% left, 1 acct)",
+	]);
 });
