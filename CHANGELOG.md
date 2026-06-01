@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.10.0 - 2026-06-01
+
+### Added
+- Added delegated auth broker support with `PI_DELEGATED_AUTH_*` runtime environment variables and legacy fallback handling.
+- Added retry-budget and half-open probe controls for credential balancing, token-weighted usage accounting, and background exclusion handling for credentials missing refresh tokens.
+- Added backup recovery, atomic writes, and Windows ACL hardening for credential and state file persistence.
+- Added persistent usage cache and usage coordinator robustness improvements, import handling updates, and longer Codex usage request timeouts.
+
+### Changed
+- Improved provider retry behavior with jittered exponential backoff, abortable sleeps, retry-budget integration, and token-estimate-aware success recording.
+- Updated OAuth command flows for missing refresh token messaging and OmniOnboard naming.
+- Widened Pi peer dependency compatibility to include Pi 0.77.x and 0.78.x and updated development tooling.
+
+### Fixed
+- Decayed stale quota errors over time with success-streak recovery so recovered credentials can return to rotation.
+- Improved auth writer and storage recovery from partial or corrupted snapshots.
+
+### Removed
+- Removed unused carousel and quota bar formatter code.
+
 ## 0.9.0 - 2026-05-26
 
 ### Added
