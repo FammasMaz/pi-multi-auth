@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { getErrorMessage, isRecord } from "../auth-error-utils.js";
 import { multiAuthDebugLogger } from "../debug-logger.js";
@@ -8,14 +8,16 @@ import {
 	readTextSnapshotWithRetries,
 	writeTextSnapshotWithRetries,
 } from "../file-retry.js";
+import { writeTextFileAtomically } from "../file-utils.js";
 import { resolveAgentRuntimePath } from "../runtime-paths.js";
 import type { ParsedRateLimitHeaders, QuotaClassification } from "../types-quota.js";
 import type { UsageFetchResult, UsageSnapshot } from "./types.js";
 
-export const USAGE_CACHE_SCHEMA_VERSION = 2;
+export const USAGE_CACHE_SCHEMA_VERSION = 3;
 export const DEFAULT_USAGE_CACHE_MAX_ENTRIES = 5_000;
 export const DEFAULT_USAGE_DISPLAY_CACHE_RETENTION_MS = 30 * 24 * 60 * 60_000;
 
+const USAGE_CACHE_V2_SCHEMA_VERSION = 2;
 const USAGE_CACHE_LEGACY_SCHEMA_VERSION = 1;
 
 const QUOTA_CLASSIFICATIONS = new Set<QuotaClassification>([
@@ -78,7 +80,7 @@ interface PersistedUsageCacheFile {
 	maxDisplayEntries: number;
 	displayRetentionMs: number;
 	entries: PersistedUsageCacheEntry[];
-	displayEntries: PersistedUsageDisplayCacheEntry[];
+	displayEntries: SerializedUsageDisplayCacheEntry[];
 }
 
 interface ParsedPersistedUsageCacheFile {
@@ -102,6 +104,10 @@ interface PersistedUsageCacheEntry extends CredentialScopedUsageCacheEntry {
 
 interface PersistedUsageDisplayCacheEntry extends CredentialScopedUsageCacheEntry {
 	displayUntil: number;
+}
+
+interface SerializedUsageDisplayCacheEntry extends Omit<PersistedUsageDisplayCacheEntry, "snapshot"> {
+	snapshot?: UsageSnapshot;
 }
 
 type PersistedCopilotQuotaBucket = NonNullable<UsageSnapshot["copilotQuota"]>["chat"];
@@ -334,7 +340,10 @@ function parsePersistedEntry(value: unknown): PersistedUsageCacheEntry | null {
 	return parseCredentialScopedEntry(value, value.credentialCacheKey);
 }
 
-function parsePersistedDisplayEntry(value: unknown): PersistedUsageDisplayCacheEntry | null {
+function parsePersistedDisplayEntry(
+	value: unknown,
+	resolveSnapshot?: (provider: string, credentialId: string, credentialCacheKey: string) => UsageSnapshot | null,
+): PersistedUsageDisplayCacheEntry | null {
 	if (!isRecord(value) || !isNonEmptyString(value.credentialCacheKey)) {
 		return null;
 	}
@@ -346,7 +355,10 @@ function parsePersistedDisplayEntry(value: unknown): PersistedUsageDisplayCacheE
 	) {
 		return null;
 	}
-	const snapshot = parseUsageSnapshot(value.snapshot);
+	const snapshot = parseUsageSnapshot(value.snapshot) ??
+		(value.snapshot === undefined
+			? resolveSnapshot?.(value.provider, value.credentialId, value.credentialCacheKey) ?? null
+			: null);
 	if (!snapshot || snapshot.provider !== value.provider) {
 		return null;
 	}
@@ -677,14 +689,15 @@ export class UsageSnapshotCacheStore {
 			return { entries: [], displayEntries: [], shouldRewrite: false };
 		}
 		const isCurrentSchema = parsed.schemaVersion === USAGE_CACHE_SCHEMA_VERSION;
+		const isV2Schema = parsed.schemaVersion === USAGE_CACHE_V2_SCHEMA_VERSION;
 		const isLegacySchema = parsed.schemaVersion === USAGE_CACHE_LEGACY_SCHEMA_VERSION;
-		if (!isCurrentSchema && !isLegacySchema) {
+		if (!isCurrentSchema && !isV2Schema && !isLegacySchema) {
 			multiAuthDebugLogger.log("usage_cache_invalid_schema", { cachePath: this.filePath });
 			return { entries: [], displayEntries: [], shouldRewrite: false };
 		}
 		if (!Array.isArray(parsed.entries)) {
 			multiAuthDebugLogger.log("usage_cache_invalid_entries", { cachePath: this.filePath });
-			return { entries: [], displayEntries: [], shouldRewrite: isLegacySchema };
+			return { entries: [], displayEntries: [], shouldRewrite: isLegacySchema || isV2Schema };
 		}
 		const entries: PersistedUsageCacheEntry[] = [];
 		let discardedEntry = false;
@@ -699,11 +712,19 @@ export class UsageSnapshotCacheStore {
 			}
 		}
 
+		const entrySnapshots = new Map<string, UsageSnapshot>();
+		for (const entry of entries) {
+			entrySnapshots.set(createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey), entry.snapshot);
+		}
 		const displayEntries: PersistedUsageDisplayCacheEntry[] = [];
-		if (isCurrentSchema && parsed.displayEntries !== undefined) {
+		if ((isCurrentSchema || isV2Schema) && parsed.displayEntries !== undefined) {
 			if (Array.isArray(parsed.displayEntries)) {
 				for (const rawEntry of parsed.displayEntries) {
-					const entry = parsePersistedDisplayEntry(rawEntry);
+					const entry = parsePersistedDisplayEntry(
+						rawEntry,
+						(provider, credentialId, credentialCacheKey) =>
+							entrySnapshots.get(createRecordKey(provider, credentialId, credentialCacheKey)) ?? null,
+					);
 					if (entry) {
 						displayEntries.push(entry);
 					} else {
@@ -718,7 +739,7 @@ export class UsageSnapshotCacheStore {
 		return {
 			entries,
 			displayEntries,
-			shouldRewrite: isLegacySchema || discardedEntry,
+			shouldRewrite: isLegacySchema || isV2Schema || discardedEntry,
 		};
 	}
 
@@ -781,14 +802,39 @@ export class UsageSnapshotCacheStore {
 		displayEntries: readonly PersistedUsageDisplayCacheEntry[],
 		generatedAt: number,
 	): string {
+		const sortedEntries = [...entries].sort(compareEntriesForRetention);
+		const entrySnapshots = new Map<string, string>();
+		for (const entry of sortedEntries) {
+			entrySnapshots.set(
+				createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey),
+				JSON.stringify(entry.snapshot),
+			);
+		}
+		const serializedDisplayEntries: SerializedUsageDisplayCacheEntry[] = [...displayEntries]
+			.sort(compareEntriesForRetention)
+			.map((entry) => {
+				const baseEntry = {
+					provider: entry.provider,
+					credentialId: entry.credentialId,
+					credentialCacheKey: entry.credentialCacheKey,
+					fetchedAt: entry.fetchedAt,
+					displayUntil: entry.displayUntil,
+				};
+				const matchingSnapshot = entrySnapshots.get(
+					createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey),
+				);
+				return matchingSnapshot === JSON.stringify(entry.snapshot)
+					? baseEntry
+					: { ...baseEntry, snapshot: entry.snapshot };
+			});
 		const payload: PersistedUsageCacheFile = {
 			schemaVersion: USAGE_CACHE_SCHEMA_VERSION,
 			generatedAt,
 			maxEntries: this.maxEntries,
 			maxDisplayEntries: this.displayMaxEntries,
 			displayRetentionMs: this.displayRetentionMs,
-			entries: [...entries].sort(compareEntriesForRetention),
-			displayEntries: [...displayEntries].sort(compareEntriesForRetention),
+			entries: sortedEntries,
+			displayEntries: serializedDisplayEntries,
 		};
 		return `${JSON.stringify(payload, null, 2)}\n`;
 	}
@@ -805,8 +851,7 @@ export class UsageSnapshotCacheStore {
 				filePath: this.filePath,
 				failureMessage: `Failed to persist usage cache snapshot to '${this.filePath}'.`,
 				write: async () => {
-					await writeFile(this.filePath, serialized, "utf-8");
-					await chmod(this.filePath, 0o600);
+					await writeTextFileAtomically(this.filePath, serialized);
 				},
 				isRetryableError: isRetryableFileAccessError,
 				onRetry: ({ attempt, maxAttempts, reason, delayMs }) => {

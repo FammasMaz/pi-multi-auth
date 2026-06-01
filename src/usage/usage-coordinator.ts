@@ -50,7 +50,7 @@ export interface UsageRequestDescriptor {
 	operation: UsageCoordinationOperation;
 }
 
-export type UsageRequestDeferralReason = "credential_cooldown" | "auth_cooldown";
+export type UsageRequestDeferralReason = "credential_cooldown" | "auth_cooldown" | "provider_circuit_open";
 
 interface UsageRequestDeferral {
 	reason: UsageRequestDeferralReason;
@@ -96,9 +96,12 @@ interface ProviderPolicyState {
 	inFlight: number;
 }
 
-const PROGRESSIVE_WINDOW_OPERATIONS = new Set<UsageCoordinationOperation>([
-	"modal-refresh",
-]);
+interface ProviderCircuitState {
+	failureCount: number;
+	openUntil: number;
+	halfOpenProbeInFlight: boolean;
+}
+
 const ROTATING_WINDOW_OPERATIONS = new Set<UsageCoordinationOperation>([
 	"selection",
 	"blocked-reconciliation",
@@ -179,6 +182,7 @@ export class UsageCoordinator {
 	private readonly providerState = new Map<string, ProviderPolicyState>();
 	private readonly accountCooldownUntil = new Map<string, number>();
 	private readonly authCooldownUntil = new Map<string, number>();
+	private readonly providerCircuits = new Map<string, ProviderCircuitState>();
 	private readonly queue: QueueEntry[] = [];
 	private readonly progressiveWindowCursors = new Map<string, number>();
 
@@ -279,7 +283,7 @@ export class UsageCoordinator {
 			return [...candidates];
 		}
 
-		if (!PROGRESSIVE_WINDOW_OPERATIONS.has(operation)) {
+		if (!ROTATING_WINDOW_OPERATIONS.has(operation)) {
 			return candidates.slice(0, windowSize);
 		}
 
@@ -375,6 +379,7 @@ export class UsageCoordinator {
 				inFlight: state.inFlight,
 			})),
 			credentialCooldowns: this.getRedactedCredentialCooldowns(Date.now()),
+			providerCircuits: this.getRedactedProviderCircuits(Date.now()),
 		};
 	}
 
@@ -449,7 +454,37 @@ export class UsageCoordinator {
 				message: `Fresh usage request deferred for ${descriptor.provider}: auth cooldown is active until ${new Date(authCooldown).toISOString()}.`,
 			};
 		}
+		return this.resolveProviderCircuitDeferral(descriptor.provider, now);
+	}
+
+	private resolveProviderCircuitDeferral(provider: string, now: number): UsageRequestDeferral | null {
+		const circuit = this.providerCircuits.get(provider);
+		if (!circuit) {
+			return null;
+		}
+		if (circuit.openUntil > now) {
+			return {
+				reason: "provider_circuit_open",
+				retryAt: circuit.openUntil,
+				message: `Fresh usage request deferred for ${provider}: provider usage circuit is open until ${new Date(circuit.openUntil).toISOString()}.`,
+			};
+		}
+		if (circuit.halfOpenProbeInFlight) {
+			return {
+				reason: "provider_circuit_open",
+				retryAt: now + Math.max(1, this.config.circuitBreakerCooldownMs),
+				message: `Fresh usage request deferred for ${provider}: provider usage circuit is waiting for a recovery probe.`,
+			};
+		}
 		return null;
+	}
+
+	private reserveProviderCircuitProbe(provider: string, now: number): void {
+		const circuit = this.providerCircuits.get(provider);
+		if (!circuit || circuit.openUntil > now || circuit.openUntil === 0) {
+			return;
+		}
+		circuit.halfOpenProbeInFlight = true;
 	}
 
 	private drainQueue(): void {
@@ -481,6 +516,7 @@ export class UsageCoordinator {
 	private dispatchPolicyAllows(entry: QueueEntry): boolean {
 		try {
 			this.assertRequestPolicyAllows(entry.descriptor);
+			this.reserveProviderCircuitProbe(entry.descriptor.provider, Date.now());
 			return true;
 		} catch (error: unknown) {
 			entry.reject(error);
@@ -526,20 +562,22 @@ export class UsageCoordinator {
 			});
 	}
 
-	private recordSuccess(_provider: string): void {
-		// Usage lookups are advisory; successful metadata refreshes do not need provider-level recovery state.
+	private recordSuccess(provider: string): void {
+		this.providerCircuits.delete(provider);
 	}
 
 	private recordFailure(descriptor: UsageRequestDescriptor, error: unknown): void {
 		const now = Date.now();
 		const key = this.accountKey(descriptor.provider, descriptor.credentialId);
 		if (this.isAuthLikeError(error)) {
+			this.providerCircuits.delete(descriptor.provider);
 			const authCooldownMs = Math.max(0, this.config.authCooldownMs + this.resolveJitterMs(descriptor.provider, descriptor.credentialId));
 			if (authCooldownMs > 0) {
 				this.authCooldownUntil.set(key, now + authCooldownMs);
 			}
 			return;
 		}
+		this.recordProviderCircuitFailure(descriptor.provider, now);
 		const jitter = this.resolveJitterMs(descriptor.provider, descriptor.credentialId);
 		const accountCooldownMs = this.config.accountCooldownMs + jitter;
 		if (accountCooldownMs <= 0) {
@@ -547,6 +585,32 @@ export class UsageCoordinator {
 			return;
 		}
 		this.accountCooldownUntil.set(key, now + accountCooldownMs);
+	}
+
+	private recordProviderCircuitFailure(provider: string, now: number): void {
+		const existing = this.providerCircuits.get(provider) ?? {
+			failureCount: 0,
+			openUntil: 0,
+			halfOpenProbeInFlight: false,
+		};
+		const failureCount = existing.openUntil > 0 && existing.openUntil <= now
+			? this.config.circuitBreakerFailureThreshold
+			: existing.failureCount + 1;
+		const shouldOpen = this.config.circuitBreakerCooldownMs > 0 &&
+			failureCount >= this.config.circuitBreakerFailureThreshold;
+		if (!shouldOpen) {
+			this.providerCircuits.set(provider, {
+				failureCount,
+				openUntil: 0,
+				halfOpenProbeInFlight: false,
+			});
+			return;
+		}
+		this.providerCircuits.set(provider, {
+			failureCount,
+			openUntil: now + this.config.circuitBreakerCooldownMs,
+			halfOpenProbeInFlight: false,
+		});
 	}
 
 	private isAuthLikeError(error: unknown): boolean {
@@ -605,6 +669,24 @@ export class UsageCoordinator {
 			});
 		}
 		return cooldowns;
+	}
+
+	private getRedactedProviderCircuits(now: number): Array<{
+		provider: string;
+		failureCount: number;
+		openUntil: number;
+		halfOpenProbeInFlight: boolean;
+	}> {
+		return [...this.providerCircuits.entries()]
+			.filter(([_provider, circuit]) =>
+				circuit.failureCount > 0 || circuit.openUntil > now || circuit.halfOpenProbeInFlight,
+			)
+			.map(([provider, circuit]) => ({
+				provider,
+				failureCount: circuit.failureCount,
+				openUntil: circuit.openUntil,
+				halfOpenProbeInFlight: circuit.halfOpenProbeInFlight,
+			}));
 	}
 
 	private resolveJitterMs(provider: string, credentialId: string): number {
