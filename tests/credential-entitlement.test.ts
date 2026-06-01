@@ -438,7 +438,13 @@ test("codex usage-based selection returns immediately and queues background refr
 	);
 	let fetchCount = 0;
 	let blockRefresh = false;
+	let refreshGateReleased = false;
 	const refreshGate = createDeferred();
+	const backgroundRefreshStarted = createDeferred();
+	const releaseRefreshGate = (): void => {
+		refreshGateReleased = true;
+		refreshGate.resolve();
+	};
 
 	await writeFile(
 		authPath,
@@ -465,6 +471,7 @@ test("codex usage-based selection returns immediately and queues background refr
 		fetchUsage: async (auth: UsageAuth) => {
 			fetchCount += 1;
 			if (blockRefresh) {
+				backgroundRefreshStarted.resolve();
 				await refreshGate.promise;
 			}
 			return createUsageSnapshot(planTypeBySecret.get(auth.accessToken) ?? { planType: null });
@@ -473,7 +480,7 @@ test("codex usage-based selection returns immediately and queues background refr
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [CODEX_PROVIDER_ID]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 	t.after(async () => {
-		refreshGate.resolve();
+		releaseRefreshGate();
 		await accountManager.shutdown();
 		await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
@@ -483,17 +490,25 @@ test("codex usage-based selection returns immediately and queues background refr
 	fetchCount = 0;
 	blockRefresh = true;
 
+	const selectionPromise = accountManager.acquireCredential(CODEX_PROVIDER_ID);
+	await Promise.race([
+		backgroundRefreshStarted.promise,
+		sleep(2_000).then(() => {
+			throw new Error("cache-first selection did not queue a background usage refresh");
+		}),
+	]);
+
 	const selected = await Promise.race([
-		accountManager.acquireCredential(CODEX_PROVIDER_ID),
-		sleep(200).then(() => {
+		selectionPromise,
+		sleep(5_000).then(() => {
 			throw new Error("cache-first selection waited for a fresh usage refresh");
 		}),
 	]);
 
+	assert.equal(refreshGateReleased, false);
 	assert.equal(selected.credentialId, "openai-codex-1");
-	await sleep(50);
 	assert.equal(fetchCount > 0, true);
-	refreshGate.resolve();
+	releaseRefreshGate();
 });
 
 
@@ -553,8 +568,10 @@ test("codex stale usage selection keeps local rotation fair while queueing backg
 	const first = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
 	const second = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
 
+	// Usage-based selection stays sticky on the credential with the lowest
+	// actual usage instead of rotating every request.
 	assert.equal(first.credentialId, "openai-codex");
-	assert.equal(second.credentialId, "openai-codex-1");
+	assert.equal(second.credentialId, "openai-codex");
 	assert.equal(fetchCount > 0, true);
 });
 

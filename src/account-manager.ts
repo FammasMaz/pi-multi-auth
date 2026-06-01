@@ -34,7 +34,13 @@ import { PoolManager } from "./pool-manager.js";
 import { cloneProviderState } from "./provider-state-utils.js";
 import { resolveDefaultRotationMode } from "./rotation-modes.js";
 import { quotaClassifier } from "./quota-classifier.js";
-import { getRoundRobinCandidateIndex, getUsageBasedCandidateIndex } from "./rotation-selection.js";
+import {
+	getEffectiveQuotaErrorCount,
+	getRoundRobinCandidateIndex,
+	getUsageBasedCandidateIndex,
+	QUOTA_ERROR_DECAY_WINDOW_MS,
+	QUOTA_ERROR_PROBE_SUCCESS_STREAK_REQUIRED,
+} from "./rotation-selection.js";
 import {
 	AuthWriter,
 	type ApiKeyProviderNormalizationResult,
@@ -47,6 +53,8 @@ import {
 } from "./storage.js";
 import {
 	type BackupAndStoreResult,
+	type CredentialBackgroundExclusionReason,
+	type CredentialBackgroundExclusionState,
 	type CredentialRequestOverrides,
 	type CredentialStatus,
 	type MultiAuthState,
@@ -154,12 +162,20 @@ const PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER = new Map<string, Readonly
 
 const MIN_QUOTA_RETRY_WINDOW_MS = 60_000;
 const SELECTION_USAGE_MAX_AGE_MS = 15_000;
+const CODEX_SELECTION_USAGE_MAX_AGE_MS = 7_000;
 const CODEX_STALE_SELECTION_REFRESH_THRESHOLD_PERCENT = 50;
 const CODEX_SELECTION_EXHAUSTED_USED_PERCENT = 99;
+const TOKEN_USAGE_UNIT_SIZE = 1_000;
+const CODEX_USAGE_CACHE_INVALIDATION_TOKEN_THRESHOLD = 16_000;
 const BLOCKED_RECONCILE_USAGE_MAX_AGE_MS = 10_000;
 const MODEL_INCOMPATIBILITY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-const CODEX_PROCESS_CREDENTIAL_LEASE_TTL_MS = 30 * 60 * 1000;
+const MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON = "missing_refresh_token_on_import" as const;
+const MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_MESSAGE =
+	"Credential was imported without a refresh token; skipping automatic OAuth refresh while allowing access-token usage probes.";
+const OPERATIONAL_USAGE_WARMUP_WINDOW_MULTIPLIER = 4;
+const OPERATIONAL_USAGE_WARMUP_FOLLOW_UP_DELAY_MS = 30_000;
+export const CODEX_PROCESS_CREDENTIAL_LEASE_TTL_MS = 30 * 60 * 1000;
 const USAGE_PROVIDER_IDS = new Set(usageProviders.map((provider) => provider.id));
 const INTERNAL_CASCADE_CONFIG = { ...DEFAULT_CASCADE_CONFIG };
 const INTERNAL_HEALTH_CONFIG = {
@@ -180,6 +196,10 @@ interface AddApiKeyCredentialOptions {
 	request?: CredentialRequestOverrides;
 }
 
+interface AddOAuthCredentialOptions {
+	backgroundExclusionReason?: CredentialBackgroundExclusionReason;
+}
+
 interface AccountManagerRuntimeOptions {
 	startOAuthRefreshScheduler?: boolean;
 	configPath?: string;
@@ -189,7 +209,11 @@ function createProcessLeaseOwnerId(): string {
 	return `pid:${process.pid}:started:${Date.now().toString(36)}`;
 }
 
-export type CredentialRefreshDisposition = "refreshed" | "preserved_active_token" | "reused_current_token";
+export type CredentialRefreshDisposition =
+	| "refreshed"
+	| "preserved_active_token"
+	| "reused_current_token"
+	| "skipped_missing_refresh_token";
 
 export interface CredentialRefreshResult {
 	credential: StoredOAuthCredential;
@@ -240,6 +264,22 @@ interface CachedUsageSelectionRead {
 	usage: CredentialUsageSnapshotResult | null;
 	needsRefresh: boolean;
 	hasDurableEvidence: boolean;
+}
+
+interface BackgroundUsageRefreshOptions {
+	maxAgeMs?: number;
+	forceRefresh?: boolean;
+}
+
+interface OperationalUsageWarmupCandidate {
+	credentialId: string;
+	index: number;
+	usageCount: number;
+	quotaErrorCount: number;
+	lastUsedAt: number;
+	isActive: boolean;
+	hasUsageSnapshot: boolean;
+	needsRefresh: boolean;
 }
 
 export interface CredentialSelectionCache {
@@ -420,6 +460,56 @@ function buildCodexIdentityKey(credential: OAuthCredentials): string | undefined
 		return `user:${identity.accountUserId}`;
 	}
 	return identity.email ? `email:${identity.email.toLowerCase()}` : undefined;
+}
+
+function hasOAuthRefreshToken(credential: unknown): boolean {
+	return isRecord(credential) && typeof credential.refresh === "string" && credential.refresh.trim().length > 0;
+}
+
+function resolveStoredOAuthCredentialForImport(
+	existingCredential: StoredOAuthCredential | undefined,
+	incomingCredentials: OAuthCredentials,
+	options: AddOAuthCredentialOptions,
+): OAuthCredentials {
+	if (
+		options.backgroundExclusionReason === MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON &&
+		!hasOAuthRefreshToken(incomingCredentials) &&
+		existingCredential &&
+		hasOAuthRefreshToken(existingCredential)
+	) {
+		return {
+			...incomingCredentials,
+			refresh: existingCredential.refresh,
+		};
+	}
+
+	return incomingCredentials;
+}
+
+function formatCredentialBackgroundExclusionMessage(
+	exclusion: CredentialBackgroundExclusionState | undefined,
+): string {
+	if (exclusion?.reason === MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON) {
+		return MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_MESSAGE;
+	}
+	return "Credential is excluded from automatic background refresh and usage probes.";
+}
+
+function getCredentialBackgroundExclusionIds(state: ProviderRotationState): Set<string> {
+	return new Set(Object.keys(state.backgroundCredentialExclusions ?? {}));
+}
+
+function clearCredentialBackgroundExclusion(
+	state: ProviderRotationState,
+	credentialId: string,
+): void {
+	delete state.backgroundCredentialExclusions?.[credentialId];
+	if (
+		state.backgroundCredentialExclusions &&
+		Object.keys(state.backgroundCredentialExclusions).length === 0
+	) {
+		state.backgroundCredentialExclusions = undefined;
+	}
 }
 
 function buildCloudflareApiKeyIdentityKey(credential: StoredAuthCredential): string | undefined {
@@ -722,6 +812,43 @@ function compareNullableNumberAscending(left: number | null, right: number | nul
 	return left - right;
 }
 
+function getSelectionUsageMaxAgeMs(provider: SupportedProviderId): number {
+	return provider === OPENAI_CODEX_PROVIDER_ID
+		? CODEX_SELECTION_USAGE_MAX_AGE_MS
+		: SELECTION_USAGE_MAX_AGE_MS;
+}
+
+function getUsageSnapshotWindowUsedPercent(
+	snapshot: UsageSnapshot | null,
+	window: "primary" | "secondary",
+): number | null {
+	const usedPercent = snapshot?.[window]?.usedPercent;
+	return typeof usedPercent === "number" && Number.isFinite(usedPercent)
+		? Math.max(0, usedPercent)
+		: null;
+}
+
+function normalizeCredentialUsageUnits(tokenEstimate: number | undefined): number {
+	if (typeof tokenEstimate !== "number" || !Number.isFinite(tokenEstimate) || tokenEstimate <= 0) {
+		return 1;
+	}
+	return Math.max(1, Math.ceil(tokenEstimate / TOKEN_USAGE_UNIT_SIZE));
+}
+
+function shouldInvalidateCodexUsageCacheAfterSuccess(tokenEstimate: number | undefined): boolean {
+	return typeof tokenEstimate === "number" &&
+		Number.isFinite(tokenEstimate) &&
+		tokenEstimate >= CODEX_USAGE_CACHE_INVALIDATION_TOKEN_THRESHOLD;
+}
+
+function hasQuotaErrorPenaltyExpired(
+	state: ProviderRotationState,
+	credentialId: string,
+	now: number,
+): boolean {
+	return getEffectiveQuotaErrorCount(state, credentialId, now) <= 0;
+}
+
 function haveEquivalentProviderState(
 	left: ProviderRotationState,
 	right: ProviderRotationState,
@@ -799,6 +926,32 @@ function remapStringRecord(
 	return remapped;
 }
 
+function remapBackgroundCredentialExclusions(
+	exclusions: ProviderRotationState["backgroundCredentialExclusions"],
+	credentialIdMap: Readonly<Record<string, string>>,
+	validIds: ReadonlySet<string>,
+): ProviderRotationState["backgroundCredentialExclusions"] {
+	if (!exclusions) {
+		return undefined;
+	}
+
+	const remapped: NonNullable<ProviderRotationState["backgroundCredentialExclusions"]> = {};
+	for (const [credentialId, exclusion] of Object.entries(exclusions)) {
+		const nextCredentialId = resolveMappedCredentialId(credentialId, credentialIdMap, validIds);
+		if (!nextCredentialId || exclusion.reason !== MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON) {
+			continue;
+		}
+		remapped[nextCredentialId] = {
+			reason: MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON,
+			excludedAt: typeof exclusion.excludedAt === "number" && Number.isFinite(exclusion.excludedAt)
+				? exclusion.excludedAt
+				: Date.now(),
+		};
+	}
+
+	return Object.keys(remapped).length > 0 ? remapped : undefined;
+}
+
 function remapQuotaStates(
 	quotaStates: ProviderRotationState["quotaStates"],
 	credentialIdMap: Readonly<Record<string, string>>,
@@ -871,6 +1024,16 @@ function applyCredentialNormalization(
 		result.credentialIdMap,
 		validIds,
 	);
+	state.quotaErrorLastSeenAt = remapNumericRecord(
+		state.quotaErrorLastSeenAt ?? {},
+		result.credentialIdMap,
+		validIds,
+	);
+	state.quotaRecoverySuccessCount = remapNumericRecord(
+		state.quotaRecoverySuccessCount ?? {},
+		result.credentialIdMap,
+		validIds,
+	);
 	state.quotaExhaustedUntil = remapNumericRecord(
 		state.quotaExhaustedUntil,
 		result.credentialIdMap,
@@ -894,6 +1057,11 @@ function applyCredentialNormalization(
 	state.friendlyNames = remapStringRecord(state.friendlyNames, result.credentialIdMap, validIds);
 	state.pools = remapPools(state.pools, result.credentialIdMap, validIds);
 	state.quotaStates = remapQuotaStates(state.quotaStates, result.credentialIdMap, validIds);
+	state.backgroundCredentialExclusions = remapBackgroundCredentialExclusions(
+		state.backgroundCredentialExclusions,
+		result.credentialIdMap,
+		validIds,
+	);
 	state.manualActiveCredentialId = resolveMappedCredentialId(
 		state.manualActiveCredentialId,
 		result.credentialIdMap,
@@ -948,6 +1116,7 @@ function normalizeProviderState(
 	provider?: SupportedProviderId,
 ): void {
 	const validIds = new Set(state.credentialIds);
+	const now = Date.now();
 
 	const keepOnlyValidNumericKeys = (record: Record<string, number>): void => {
 		for (const key of Object.keys(record)) {
@@ -960,6 +1129,10 @@ function normalizeProviderState(
 	keepOnlyValidNumericKeys(state.lastUsedAt);
 	keepOnlyValidNumericKeys(state.usageCount);
 	keepOnlyValidNumericKeys(state.quotaErrorCount);
+	state.quotaErrorLastSeenAt = state.quotaErrorLastSeenAt ?? {};
+	state.quotaRecoverySuccessCount = state.quotaRecoverySuccessCount ?? {};
+	keepOnlyValidNumericKeys(state.quotaErrorLastSeenAt);
+	keepOnlyValidNumericKeys(state.quotaRecoverySuccessCount);
 	keepOnlyValidNumericKeys(state.quotaExhaustedUntil);
 	keepOnlyValidNumericKeys(state.transientErrorCount);
 
@@ -1005,13 +1178,33 @@ function normalizeProviderState(
 			disabledAt:
 				typeof entry.disabledAt === "number" && Number.isFinite(entry.disabledAt)
 					? entry.disabledAt
-					: Date.now(),
+					: now,
 			...(normalizedPlanType ? { planType: normalizedPlanType } : {}),
 		};
 	}
 
+	if (state.backgroundCredentialExclusions) {
+		for (const key of Object.keys(state.backgroundCredentialExclusions)) {
+			const entry = state.backgroundCredentialExclusions[key];
+			if (!validIds.has(key) || entry?.reason !== MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON) {
+				delete state.backgroundCredentialExclusions[key];
+				continue;
+			}
+			state.backgroundCredentialExclusions[key] = {
+				reason: MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON,
+				excludedAt:
+					typeof entry.excludedAt === "number" && Number.isFinite(entry.excludedAt)
+						? entry.excludedAt
+						: now,
+			};
+		}
+		if (Object.keys(state.backgroundCredentialExclusions).length === 0) {
+			state.backgroundCredentialExclusions = undefined;
+		}
+	}
+
 	keepOnlyValidNumericKeys(state.oauthRefreshScheduled ?? {});
-	reconcileActiveQuotaCooldownsFromPersistedErrors(state, validIds);
+	reconcileActiveQuotaCooldownsFromPersistedErrors(state, validIds, now);
 
 	if (state.cascadeState) {
 		for (const providerId of Object.keys(state.cascadeState)) {
@@ -1166,6 +1359,11 @@ function normalizeProviderState(
 		}
 		if (state.quotaErrorCount[credentialId] === undefined) {
 			state.quotaErrorCount[credentialId] = 0;
+		} else if (hasQuotaErrorPenaltyExpired(state, credentialId, now)) {
+			delete state.quotaErrorCount[credentialId];
+			delete state.quotaErrorLastSeenAt?.[credentialId];
+			delete state.quotaRecoverySuccessCount?.[credentialId];
+			state.quotaErrorCount[credentialId] = 0;
 		}
 		if (state.transientErrorCount[credentialId] === undefined) {
 			state.transientErrorCount[credentialId] = 0;
@@ -1201,7 +1399,22 @@ function normalizeProviderState(
 	}
 }
 
-function pruneProviderCredentialLeases(
+function reconcileBackgroundCredentialExclusionsForProvider(
+	provider: SupportedProviderId,
+	state: ProviderRotationState,
+	credentialEntries: readonly AuthCredentialEntry[],
+): boolean {
+	void provider;
+	void credentialEntries;
+	if (!state.backgroundCredentialExclusions) {
+		return false;
+	}
+
+	state.backgroundCredentialExclusions = undefined;
+	return true;
+}
+
+export function pruneProviderCredentialLeases(
 	state: ProviderRotationState,
 	now: number,
 	ownerIdToRemove?: string,
@@ -1212,12 +1425,13 @@ function pruneProviderCredentialLeases(
 	}
 
 	const validIds = new Set(state.credentialIds);
+	const normalizedOwnerIdToRemove = ownerIdToRemove?.trim();
 	let didChange = false;
 	for (const [ownerId, lease] of Object.entries(leases)) {
 		const normalizedOwnerId = lease.ownerId?.trim() || ownerId.trim();
 		const credentialId = lease.credentialId?.trim();
 		const shouldRemove =
-			(ownerIdToRemove !== undefined && ownerId === ownerIdToRemove) ||
+			(normalizedOwnerIdToRemove !== undefined && (ownerId === normalizedOwnerIdToRemove || normalizedOwnerId === normalizedOwnerIdToRemove)) ||
 			!normalizedOwnerId ||
 			!credentialId ||
 			!validIds.has(credentialId) ||
@@ -1237,6 +1451,14 @@ function pruneProviderCredentialLeases(
 				credentialId,
 			};
 			didChange = true;
+			continue;
+		}
+		if (credentialId !== lease.credentialId) {
+			leases[ownerId] = {
+				...lease,
+				credentialId,
+			};
+			didChange = true;
 		}
 	}
 
@@ -1247,7 +1469,7 @@ function pruneProviderCredentialLeases(
 	return didChange;
 }
 
-function getOwnedCredentialLease(
+export function getOwnedCredentialLease(
 	state: ProviderRotationState,
 	ownerId: string,
 	now: number,
@@ -1259,7 +1481,7 @@ function getOwnedCredentialLease(
 	return lease;
 }
 
-function getCredentialIdsLeasedByOtherOwners(
+export function getCredentialIdsLeasedByOtherOwners(
 	state: ProviderRotationState,
 	ownerId: string,
 	now: number,
@@ -1276,7 +1498,7 @@ function getCredentialIdsLeasedByOtherOwners(
 	return credentialIds;
 }
 
-function buildCredentialLease(
+export function buildCredentialLease(
 	ownerId: string,
 	credentialId: string,
 	now: number,
@@ -1742,6 +1964,9 @@ export class AccountManager {
 		Promise<CloudflareCredentialIdentity | null>
 	>();
 	private readonly backgroundUsageRefreshes = new Set<Promise<void>>();
+	private readonly operationalUsageWarmupCursors = new Map<SupportedProviderId, number>();
+	private readonly operationalUsageWarmupTimers = new Map<SupportedProviderId, ReturnType<typeof setTimeout>>();
+	private readonly backgroundCredentialExclusionIdsByProvider = new Map<SupportedProviderId, ReadonlySet<string>>();
 	private rotationModeMigrationPromise: Promise<void> | null = null;
 	private initializationPromise: Promise<void> | null = null;
 	private shutdownPromise: Promise<void> | null = null;
@@ -1831,12 +2056,51 @@ export class AccountManager {
 		throw new Error(`OAuth token refresh is internally disabled for provider ${provider}.`);
 	}
 
+	private updateBackgroundCredentialExclusionCache(
+		provider: SupportedProviderId,
+		state: ProviderRotationState,
+	): void {
+		const excludedCredentialIds = getCredentialBackgroundExclusionIds(state);
+		if (excludedCredentialIds.size === 0) {
+			this.backgroundCredentialExclusionIdsByProvider.delete(provider);
+			return;
+		}
+		this.backgroundCredentialExclusionIdsByProvider.set(provider, excludedCredentialIds);
+	}
+
+	private isCredentialCachedBackgroundExcluded(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): boolean {
+		return this.backgroundCredentialExclusionIdsByProvider.get(provider)?.has(credentialId) ?? false;
+	}
+
+	private async getCredentialBackgroundExclusion(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): Promise<CredentialBackgroundExclusionState | undefined> {
+		if (!this.isCredentialCachedBackgroundExcluded(provider, credentialId)) {
+			return undefined;
+		}
+		const state = await this.storage.readProviderState(provider);
+		this.updateBackgroundCredentialExclusionCache(provider, state);
+		return state.backgroundCredentialExclusions?.[credentialId];
+	}
+
+	private shouldSkipOAuthRefreshForMissingRefreshToken(
+		provider: SupportedProviderId,
+		credential: StoredOAuthCredential,
+	): boolean {
+		return provider === OPENAI_CODEX_PROVIDER_ID && !hasOAuthRefreshToken(credential);
+	}
+
 	async shutdown(): Promise<void> {
 		if (this.shutdownPromise) {
 			return this.shutdownPromise;
 		}
 
 		this.isShuttingDown = true;
+		this.clearOperationalUsageWarmupTimers();
 		this.oauthRefreshScheduler.stop();
 		this.lightweightRotationState.shutdown();
 		this.shutdownPromise = (async () => {
@@ -2188,6 +2452,9 @@ export class AccountManager {
 		provider: SupportedProviderId,
 		providerState?: ProviderRotationState,
 	): Promise<void> {
+		this.clearOperationalUsageWarmupTimer(provider);
+		this.operationalUsageWarmupCursors.delete(provider);
+		this.backgroundCredentialExclusionIdsByProvider.delete(provider);
 		const state = providerState ?? await this.storage.readProviderState(provider);
 		for (const credentialId of state.credentialIds) {
 			this.oauthRefreshScheduler.cancelRefresh(credentialId);
@@ -2323,7 +2590,7 @@ export class AccountManager {
 		credentialId: string,
 	): CachedUsageSelectionRead {
 		const freshUsage = this.getCachedCredentialUsageSnapshot(provider, credentialId, {
-			maxAgeMs: SELECTION_USAGE_MAX_AGE_MS,
+			maxAgeMs: getSelectionUsageMaxAgeMs(provider),
 		});
 		if (freshUsage) {
 			return {
@@ -2358,11 +2625,26 @@ export class AccountManager {
 		}
 	}
 
+	private clearOperationalUsageWarmupTimer(provider: SupportedProviderId): void {
+		const timer = this.operationalUsageWarmupTimers.get(provider);
+		if (timer) {
+			clearTimeout(timer);
+			this.operationalUsageWarmupTimers.delete(provider);
+		}
+	}
+
+	private clearOperationalUsageWarmupTimers(): void {
+		for (const timer of this.operationalUsageWarmupTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.operationalUsageWarmupTimers.clear();
+	}
+
 	private enqueueCredentialUsageRefresh(
 		provider: SupportedProviderId,
 		credentialIds: readonly string[],
 		operation: UsageCoordinationOperation,
-		maxAgeMs: number = SELECTION_USAGE_MAX_AGE_MS,
+		options: BackgroundUsageRefreshOptions = {},
 	): number {
 		if (this.isShuttingDown) {
 			return 0;
@@ -2374,14 +2656,14 @@ export class AccountManager {
 		}
 
 		const selectedCredentialIds = this.usageCoordinator.selectCredentialIds(uniqueCredentialIds, operation);
-		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, maxAgeMs);
+		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, options);
 	}
 
 	private enqueueAllCredentialUsageRefresh(
 		provider: SupportedProviderId,
 		credentialIds: readonly string[],
 		operation: UsageCoordinationOperation,
-		maxAgeMs: number = SELECTION_USAGE_MAX_AGE_MS,
+		options: BackgroundUsageRefreshOptions = {},
 	): number {
 		if (this.isShuttingDown) {
 			return 0;
@@ -2395,21 +2677,30 @@ export class AccountManager {
 		const selectedCredentialIds = this.usageCoordinator
 			.selectCredentialIdWindows(uniqueCredentialIds, operation)
 			.flat();
-		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, maxAgeMs);
+		return this.queueCredentialUsageRefresh(provider, selectedCredentialIds, operation, options);
 	}
 
 	private queueCredentialUsageRefresh(
 		provider: SupportedProviderId,
 		credentialIds: readonly string[],
 		operation: UsageCoordinationOperation,
-		maxAgeMs: number,
+		options: BackgroundUsageRefreshOptions,
 	): number {
-		for (const credentialId of credentialIds) {
+		const eligibleCredentialIds = credentialIds.filter(
+			(credentialId) => !this.isCredentialCachedBackgroundExcluded(provider, credentialId),
+		);
+		if (eligibleCredentialIds.length === 0) {
+			return 0;
+		}
+
+		const maxAgeMs = options.maxAgeMs ?? getSelectionUsageMaxAgeMs(provider);
+		const forceRefresh = options.forceRefresh ?? true;
+		for (const credentialId of eligibleCredentialIds) {
 			const backgroundRequest = this.getCredentialUsageSnapshotWithContext(
 				provider,
 				credentialId,
 				{
-					forceRefresh: true,
+					forceRefresh,
 					maxAgeMs,
 					coordinationOperation: operation,
 				},
@@ -2432,7 +2723,7 @@ export class AccountManager {
 			});
 			this.trackBackgroundUsageRefresh(backgroundRequest);
 		}
-		return credentialIds.length;
+		return eligibleCredentialIds.length;
 	}
 
 	selectUsageRefreshCandidates<TRequest extends { provider: SupportedProviderId; credentialId: string }>(
@@ -2571,6 +2862,16 @@ export class AccountManager {
 			};
 		}
 
+		const backgroundExclusion = await this.getCredentialBackgroundExclusion(provider, credentialId);
+		if (backgroundExclusion) {
+			return {
+				snapshot: null,
+				error: formatCredentialBackgroundExclusionMessage(backgroundExclusion),
+				fromCache: false,
+				displayOnly: true,
+			};
+		}
+
 		const credential = await raceWithSignal(
 			this.resolveCredentialForUsage(credentialId, context),
 			context?.signal,
@@ -2584,7 +2885,6 @@ export class AccountManager {
 				fromCache: false,
 			};
 		}
-
 		let freshCredential: StoredAuthCredential = credential;
 		if (credential.type === "oauth") {
 			try {
@@ -2775,13 +3075,44 @@ export class AccountManager {
 		};
 	}
 
+	private async addCredentialUsageUnits(
+		provider: SupportedProviderId,
+		credentialId: string,
+		usageUnits: number,
+	): Promise<void> {
+		if (!Number.isFinite(usageUnits) || usageUnits <= 0) {
+			return;
+		}
+		await this.storage.withLock((state) => {
+			const providerState = getProviderState(state, provider);
+			if (!providerState.credentialIds.includes(credentialId)) {
+				return { result: undefined };
+			}
+			providerState.usageCount[credentialId] =
+				(providerState.usageCount[credentialId] ?? 0) + usageUnits;
+			return { result: undefined, next: state };
+		});
+	}
+
 	async recordCredentialSuccess(
 		provider: SupportedProviderId,
 		credentialId: string,
 		latencyMs: number,
 		modelId?: string,
+		tokenEstimate?: number,
 	): Promise<void> {
 		await this.ensureInitialized();
+		const usageUnits = normalizeCredentialUsageUnits(tokenEstimate);
+		const supplementalUsageUnits = usageUnits - 1;
+		if (supplementalUsageUnits > 0) {
+			await this.addCredentialUsageUnits(provider, credentialId, supplementalUsageUnits);
+		}
+		if (
+			provider === OPENAI_CODEX_PROVIDER_ID &&
+			shouldInvalidateCodexUsageCacheAfterSuccess(tokenEstimate)
+		) {
+			this.usageService.clearOperationalCredential(provider, credentialId);
+		}
 		this.healthScorer.recordSuccess(credentialId, latencyMs);
 		this.healthScorer.endCooldown(credentialId);
 		this.healthScorer.calculateScore(credentialId);
@@ -2866,6 +3197,7 @@ export class AccountManager {
 	async addOAuthCredential(
 		provider: SupportedProviderId,
 		credentials: OAuthCredentials,
+		options: AddOAuthCredentialOptions = {},
 	): Promise<BackupAndStoreResult> {
 		if (isRemovedLegacyGoogleProvider(provider)) {
 			throw new Error("Legacy Google OAuth providers are no longer supported.");
@@ -2876,27 +3208,34 @@ export class AccountManager {
 			throw new Error(`OAuth provider is not available: ${provider}`);
 		}
 
-		return this.storeOAuthCredential(provider, credentials);
+		return this.storeOAuthCredential(provider, credentials, options);
 	}
 
 	private async storeOAuthCredential(
 		provider: SupportedProviderId,
 		credentials: OAuthCredentials,
+		options: AddOAuthCredentialOptions = {},
 	): Promise<BackupAndStoreResult> {
 		const duplicateCredentialId = await this.findExistingOAuthCredentialIdByIdentity(
 			provider,
 			credentials,
 		);
 		if (duplicateCredentialId) {
-			await this.authWriter.setOAuthCredential(duplicateCredentialId, credentials);
+			const existingCredential = await this.authWriter.getOAuthCredential(duplicateCredentialId);
+			const credentialsToStore = resolveStoredOAuthCredentialForImport(
+				existingCredential,
+				credentials,
+				options,
+			);
+			await this.authWriter.setOAuthCredential(duplicateCredentialId, credentialsToStore);
 			const credentialIds = await this.authWriter.listProviderCredentialIds(provider);
 			const storedCredential: StoredOAuthCredential = {
 				type: "oauth",
-				...credentials,
+				...credentialsToStore,
 			};
 			await this.persistCredentialList(provider, credentialIds, duplicateCredentialId, storedCredential);
 			this.usageService.clearProvider(provider);
-			if (provider === OPENAI_CODEX_PROVIDER_ID) {
+			if (provider === OPENAI_CODEX_PROVIDER_ID && hasOAuthRefreshToken(storedCredential)) {
 				await this.restoreCodexCredentialAfterOAuthLogin(duplicateCredentialId);
 			}
 			return {
@@ -2912,10 +3251,11 @@ export class AccountManager {
 		}
 
 		const backupResult = await this.authWriter.setOAuthCredentialAsBackup(provider, credentials);
-		await this.persistCredentialList(provider, backupResult.credentialIds, backupResult.credentialId, {
+		const storedCredential: StoredOAuthCredential = {
 			type: "oauth",
 			...credentials,
-		});
+		};
+		await this.persistCredentialList(provider, backupResult.credentialIds, backupResult.credentialId, storedCredential);
 		this.usageService.clearProvider(provider);
 
 		return {
@@ -2939,12 +3279,19 @@ export class AccountManager {
 			delete providerState.quotaStates?.[credentialId];
 			delete providerState.lastTransientError?.[credentialId];
 			delete providerState.transientErrorCount?.[credentialId];
+			delete providerState.backgroundCredentialExclusions?.[credentialId];
 			delete providerState.modelIncompatibilities?.[credentialId];
 			if (providerState.modelIncompatibilities && Object.keys(providerState.modelIncompatibilities).length === 0) {
 				providerState.modelIncompatibilities = undefined;
 			}
 			if (providerState.quotaStates && Object.keys(providerState.quotaStates).length === 0) {
 				providerState.quotaStates = undefined;
+			}
+			if (
+				providerState.backgroundCredentialExclusions &&
+				Object.keys(providerState.backgroundCredentialExclusions).length === 0
+			) {
+				providerState.backgroundCredentialExclusions = undefined;
 			}
 			normalizeProviderState(providerState, OPENAI_CODEX_PROVIDER_ID);
 			return { result: true, next: state };
@@ -3169,7 +3516,7 @@ export class AccountManager {
 		persistedCredential?: StoredAuthCredential,
 	): Promise<void> {
 		await this.flushLightweightRotationStateIfNeeded(provider);
-		await this.storage.withLock((state) => {
+		const providerStateAfterPersist = await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);
 			providerState.credentialIds = [...credentialIds];
 			normalizeProviderState(providerState, provider);
@@ -3182,8 +3529,13 @@ export class AccountManager {
 			}
 
 			providerState.lastUsedAt[lastAddedCredentialId] = Date.now();
-			return { result: undefined, next: state };
+			if (persistedCredential) {
+				clearCredentialBackgroundExclusion(providerState, lastAddedCredentialId);
+			}
+			normalizeProviderState(providerState, provider);
+			return { result: cloneProviderState(providerState), next: state };
 		});
+		this.updateBackgroundCredentialExclusionCache(provider, providerStateAfterPersist);
 
 		const credential = persistedCredential ?? (await this.authWriter.getCredential(lastAddedCredentialId));
 		if (credential?.type === "oauth") {
@@ -3340,6 +3692,8 @@ export class AccountManager {
 		}
 
 		await this.recordCredentialFailure(provider, credentialId, 0, errorKind, errorMessage);
+		this.cascadeStateManager.removeCredential(provider, credentialId);
+		await this.persistProviderTelemetry(provider);
 		this.oauthRefreshScheduler.cancelRefresh(credentialId);
 		await this.persistOAuthRefreshSchedule(provider);
 		this.usageService.clearOperationalCredential(provider, credentialId);
@@ -3557,6 +3911,31 @@ export class AccountManager {
 		await this.disableCredential(provider, credentialId, rawErrorMessage, errorKind);
 	}
 
+	private async clearDisabledCredentialForReenable(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): Promise<ProviderRotationState | null> {
+		return this.storage.withLock((stored) => {
+			const providerState = getProviderState(stored, provider);
+			if (!providerState.credentialIds.includes(credentialId)) {
+				return { result: null };
+			}
+			if (!providerState.disabledCredentials?.[credentialId]) {
+				return { result: null };
+			}
+
+			delete providerState.disabledCredentials[credentialId];
+			if (Object.keys(providerState.disabledCredentials).length === 0) {
+				providerState.disabledCredentials = {};
+			}
+
+			clearCredentialBackgroundExclusion(providerState, credentialId);
+
+			normalizeProviderState(providerState, provider);
+			return { result: cloneProviderState(providerState), next: stored };
+		});
+	}
+
 	/**
 	 * Re-enables a previously disabled credential, allowing it to participate in rotation again.
 	 * Clears the disabled state from multi-auth.json and reschedules OAuth refresh if applicable.
@@ -3566,35 +3945,41 @@ export class AccountManager {
 		credentialId: string,
 	): Promise<void> {
 		await this.ensureInitialized();
-
-		const didReenable = await this.storage.withLock((stored) => {
-			const providerState = getProviderState(stored, provider);
-			if (!providerState.credentialIds.includes(credentialId)) {
-				return { result: false };
-			}
-
-			if (!providerState.disabledCredentials?.[credentialId]) {
-				return { result: false };
-			}
-
-			delete providerState.disabledCredentials[credentialId];
-
-			if (Object.keys(providerState.disabledCredentials).length === 0) {
-				providerState.disabledCredentials = {};
-			}
-
-			return { result: true, next: stored };
-		});
-
-		if (!didReenable) {
+		const state = await this.syncProviderState(provider);
+		if (!state.credentialIds.includes(credentialId) || !state.disabledCredentials?.[credentialId]) {
 			throw new Error(
 				`Credential ${credentialId} is not available or not disabled for provider ${provider}`,
 			);
 		}
 
-		const credentialsById = await this.authWriter.getCredentials([credentialId]);
-		const credential = credentialsById.get(credentialId);
-		if (credential?.type === "oauth") {
+		const credential = await this.authWriter.getCredential(credentialId);
+		if (!credential) {
+			throw new Error(`Credential ${credentialId} was not found in auth.json`);
+		}
+
+		if (credential.type === "oauth" && this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
+			const providerState = await this.clearDisabledCredentialForReenable(
+				provider,
+				credentialId,
+			);
+			if (!providerState) {
+				throw new Error(
+					`Credential ${credentialId} is not available or not disabled for provider ${provider}`,
+				);
+			}
+			this.updateBackgroundCredentialExclusionCache(provider, providerState);
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			this.usageService.clearOperationalCredential(provider, credentialId);
+			multiAuthDebugLogger.log("credential_reenabled_without_refresh_token", {
+				provider,
+				credentialRef: redactUsageCredentialIdentifier(credentialId),
+				reason: MISSING_REFRESH_TOKEN_BACKGROUND_EXCLUSION_REASON,
+			});
+			return;
+		}
+
+		if (credential.type === "oauth") {
 			const refreshResult = await this.refreshCredential(provider, credentialId);
 			if (refreshResult.disposition === "refreshed") {
 				this.scheduleOAuthRefresh(provider, credentialId, refreshResult.credential);
@@ -3602,6 +3987,16 @@ export class AccountManager {
 			}
 		}
 
+		const providerState = await this.clearDisabledCredentialForReenable(
+			provider,
+			credentialId,
+		);
+		if (!providerState) {
+			throw new Error(
+				`Credential ${credentialId} is not available or not disabled for provider ${provider}`,
+			);
+		}
+		this.updateBackgroundCredentialExclusionCache(provider, providerState);
 		this.usageService.clearOperationalCredential(provider, credentialId);
 	}
 
@@ -3647,6 +4042,11 @@ export class AccountManager {
 				disposition: "reused_current_token",
 			};
 		}
+		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, currentCredential)) {
+			throw new Error(
+				`OAuth refresh skipped for ${credentialId} because it was imported without a refresh token.`,
+			);
+		}
 
 		return this.refreshCredential(provider, credentialId);
 	}
@@ -3676,6 +4076,15 @@ export class AccountManager {
 			);
 		}
 		this.assertOAuthRefreshManagedForProvider(provider);
+		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			this.registerCurrentUsageCredentialCacheKey(provider, credentialId, credential);
+			return {
+				credential,
+				disposition: "skipped_missing_refresh_token",
+			};
+		}
 
 		let effectiveCredential: StoredOAuthCredential;
 		let disposition: CredentialRefreshDisposition = "refreshed";
@@ -3805,7 +4214,10 @@ export class AccountManager {
 			if (credential.type === "oauth") {
 				try {
 					const refreshResult = await this.refreshCredential(provider, credentialId);
-					if (refreshResult.disposition === "preserved_active_token") {
+					if (
+						refreshResult.disposition === "preserved_active_token" ||
+						refreshResult.disposition === "skipped_missing_refresh_token"
+					) {
 						preservedCredentialIds.push(credentialId);
 					} else {
 						refreshedCredentialIds.push(credentialId);
@@ -4032,6 +4444,7 @@ export class AccountManager {
 							(credentialId) => !poolAvailable.has(credentialId),
 						),
 						requestingSessionId: `orchestrator:${provider}:pool:${selection.pool.poolId}`,
+						rotationMode: selection.pool.poolMode,
 					},
 					{ signal },
 				);
@@ -4441,6 +4854,7 @@ export class AccountManager {
 							providerId: provider,
 							excludedIds: [...selectionExcludedCredentialIds],
 							requestingSessionId: `orchestrator:${provider}`,
+							rotationMode: state.rotationMode,
 						},
 						{ signal: options?.signal },
 					);
@@ -4546,7 +4960,7 @@ export class AccountManager {
 			state.credentialIds.length > 0 ? (selectedIndex + 1) % state.credentialIds.length : selectedIndex;
 		const nextActiveIndex = state.manualActiveCredentialId
 			? selectedIndex
-			: effectiveRotationMode === "round-robin"
+			: effectiveRotationMode === "round-robin" || effectiveRotationMode === "usage-based"
 				? hasSelectionExclusions
 					? selectedIndex
 					: nextRoundRobinIndex
@@ -4673,6 +5087,10 @@ export class AccountManager {
 			};
 			providerState.quotaErrorCount[credentialId] =
 				(providerState.quotaErrorCount[credentialId] ?? 0) + 1;
+			providerState.quotaErrorLastSeenAt = providerState.quotaErrorLastSeenAt ?? {};
+			providerState.quotaErrorLastSeenAt[credentialId] = now;
+			providerState.quotaRecoverySuccessCount = providerState.quotaRecoverySuccessCount ?? {};
+			delete providerState.quotaRecoverySuccessCount[credentialId];
 
 			return {
 				result: providerState.rotationMode === "balancer",
@@ -4806,6 +5224,7 @@ export class AccountManager {
 			throw new Error(`Cannot mark model incompatibility for ${provider}: model ID is empty.`);
 		}
 
+		await this.ensureInitialized();
 		const message = errorMessage.trim().slice(0, 500) ||
 			`Credential is not compatible with ${formatModelReference(provider, normalizedModelId)}.`;
 		const safeCooldownMs = typeof cooldownMs === "number" && Number.isFinite(cooldownMs) && cooldownMs > 0
@@ -4913,6 +5332,7 @@ export class AccountManager {
 				return { result: undefined };
 			}
 
+			const now = Date.now();
 			let didChange = false;
 			if (providerState.quotaExhaustedUntil[credentialId] !== undefined) {
 				delete providerState.quotaExhaustedUntil[credentialId];
@@ -4928,6 +5348,23 @@ export class AccountManager {
 			}
 			if (providerState.quotaStates?.[credentialId] !== undefined) {
 				delete providerState.quotaStates[credentialId];
+				didChange = true;
+			}
+			const quotaErrorCount = providerState.quotaErrorCount[credentialId] ?? 0;
+			if (quotaErrorCount > 0) {
+				providerState.quotaRecoverySuccessCount = providerState.quotaRecoverySuccessCount ?? {};
+				const successCount = (providerState.quotaRecoverySuccessCount[credentialId] ?? 0) + 1;
+				if (
+					successCount >= QUOTA_ERROR_PROBE_SUCCESS_STREAK_REQUIRED ||
+					now - (providerState.quotaErrorLastSeenAt?.[credentialId] ?? 0) >= QUOTA_ERROR_DECAY_WINDOW_MS
+				) {
+					delete providerState.quotaErrorCount[credentialId];
+					delete providerState.quotaErrorLastSeenAt?.[credentialId];
+					delete providerState.quotaRecoverySuccessCount[credentialId];
+					providerState.quotaErrorCount[credentialId] = 0;
+				} else {
+					providerState.quotaRecoverySuccessCount[credentialId] = successCount;
+				}
 				didChange = true;
 			}
 
@@ -5056,6 +5493,175 @@ export class AccountManager {
 				return { result: undefined, next: stored };
 			});
 		}
+	}
+
+	/**
+	 * Warms operational usage caches from the session lifecycle. The refresh is
+	 * cache-aware and bounded so large credential pools improve progressively
+	 * without making provider registration or startup perform a bulk usage crawl.
+	 */
+	async warmupOperationalUsageCaches(providers?: readonly SupportedProviderId[]): Promise<void> {
+		await this.ensureInitialized();
+		const providerIds = providers ?? await this.providerRegistry.discoverProviderIds();
+		const uniqueProviderIds = [...new Set(providerIds.map((provider) => provider.trim()).filter(Boolean))];
+		for (const provider of uniqueProviderIds) {
+			if (this.isShuttingDown) {
+				return;
+			}
+			await this.warmupOperationalUsageCache(provider);
+		}
+	}
+
+	private compareOperationalUsageWarmupCandidates(
+		left: OperationalUsageWarmupCandidate,
+		right: OperationalUsageWarmupCandidate,
+	): number {
+		const getPriority = (candidate: OperationalUsageWarmupCandidate): number => {
+			if (candidate.isActive) {
+				return 0;
+			}
+			if (!candidate.hasUsageSnapshot) {
+				return 1;
+			}
+			return candidate.needsRefresh ? 2 : 3;
+		};
+		const priorityComparison = getPriority(left) - getPriority(right);
+		if (priorityComparison !== 0) {
+			return priorityComparison;
+		}
+		if (left.quotaErrorCount !== right.quotaErrorCount) {
+			return left.quotaErrorCount - right.quotaErrorCount;
+		}
+		if (left.usageCount !== right.usageCount) {
+			return left.usageCount - right.usageCount;
+		}
+		if (left.lastUsedAt !== right.lastUsedAt) {
+			return left.lastUsedAt - right.lastUsedAt;
+		}
+		return left.index - right.index;
+	}
+
+	private selectOperationalUsageWarmupCredentialIds(
+		provider: SupportedProviderId,
+		state: ProviderRotationState,
+	): { credentialIds: string[]; shouldScheduleFollowUp: boolean } {
+		const activeCredentialId = state.credentialIds[state.activeIndex];
+		const now = Date.now();
+		const excludedCredentialIds = getCredentialBackgroundExclusionIds(state);
+		const candidates = state.credentialIds
+			.map((credentialId, index): OperationalUsageWarmupCandidate | null => {
+				if (excludedCredentialIds.has(credentialId)) {
+					return null;
+				}
+				const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
+				const snapshot = cachedUsage.usage?.snapshot ?? null;
+				return {
+					credentialId,
+					index,
+					usageCount: state.usageCount[credentialId] ?? 0,
+					quotaErrorCount: getEffectiveQuotaErrorCount(state, credentialId, now),
+					lastUsedAt: state.lastUsedAt[credentialId] ?? 0,
+					isActive: credentialId === activeCredentialId,
+					hasUsageSnapshot: snapshot !== null,
+					needsRefresh: cachedUsage.needsRefresh,
+				};
+			})
+			.filter((candidate): candidate is OperationalUsageWarmupCandidate => candidate !== null)
+			.filter((candidate) => candidate.needsRefresh || !candidate.hasUsageSnapshot)
+			.sort((left, right) => this.compareOperationalUsageWarmupCandidates(left, right));
+
+		if (candidates.length === 0) {
+			this.operationalUsageWarmupCursors.delete(provider);
+			return { credentialIds: [], shouldScheduleFollowUp: false };
+		}
+
+		const shouldScheduleFollowUp = candidates.some((candidate) => !candidate.hasUsageSnapshot);
+		const windowSize = this.usageCoordinator.getOperationWindowSize("startup-refinement");
+		const batchSize = Math.min(
+			candidates.length,
+			Math.max(windowSize, windowSize * OPERATIONAL_USAGE_WARMUP_WINDOW_MULTIPLIER),
+		);
+		const pinnedCandidates = candidates.filter((candidate) => candidate.isActive);
+		const rotatingCandidates = candidates.filter((candidate) => !candidate.isActive);
+		const cursor = rotatingCandidates.length > 0
+			? (this.operationalUsageWarmupCursors.get(provider) ?? 0) % rotatingCandidates.length
+			: 0;
+		const rotatedCandidates = rotatingCandidates.length > 0
+			? [...rotatingCandidates.slice(cursor), ...rotatingCandidates.slice(0, cursor)]
+			: [];
+		const selectedCandidates = [...pinnedCandidates, ...rotatedCandidates].slice(0, batchSize);
+		if (rotatingCandidates.length > 0 && selectedCandidates.length < candidates.length) {
+			const consumedRotatingCount = selectedCandidates.filter((candidate) => !candidate.isActive).length;
+			this.operationalUsageWarmupCursors.set(
+				provider,
+				(cursor + consumedRotatingCount) % rotatingCandidates.length,
+			);
+		} else {
+			this.operationalUsageWarmupCursors.delete(provider);
+		}
+		return {
+			credentialIds: selectedCandidates.map((candidate) => candidate.credentialId),
+			shouldScheduleFollowUp,
+		};
+	}
+
+	private scheduleOperationalUsageWarmupFollowUp(provider: SupportedProviderId): void {
+		if (this.isShuttingDown || this.operationalUsageWarmupTimers.has(provider)) {
+			return;
+		}
+		const timer = setTimeout(() => {
+			this.operationalUsageWarmupTimers.delete(provider);
+			if (this.isShuttingDown) {
+				return;
+			}
+			void this.warmupOperationalUsageCache(provider).catch((error: unknown) => {
+				multiAuthDebugLogger.log("provider_operational_usage_warmup_follow_up_failed", {
+					provider,
+					message: getErrorMessage(error),
+				});
+			});
+		}, OPERATIONAL_USAGE_WARMUP_FOLLOW_UP_DELAY_MS);
+		this.operationalUsageWarmupTimers.set(provider, timer);
+	}
+
+	async warmupOperationalUsageCache(provider: SupportedProviderId): Promise<number> {
+		await this.ensureInitialized();
+		if (this.isShuttingDown || await this.isProviderHidden(provider)) {
+			this.clearOperationalUsageWarmupTimer(provider);
+			return 0;
+		}
+		if (!this.usageService.hasProvider(provider)) {
+			this.clearOperationalUsageWarmupTimer(provider);
+			return 0;
+		}
+		const state = await this.syncProviderState(provider);
+		if (state.credentialIds.length === 0) {
+			this.clearOperationalUsageWarmupTimer(provider);
+			this.operationalUsageWarmupCursors.delete(provider);
+			return 0;
+		}
+		const selection = this.selectOperationalUsageWarmupCredentialIds(provider, state);
+		if (selection.credentialIds.length === 0) {
+			return 0;
+		}
+		const count = this.enqueueAllCredentialUsageRefresh(
+			provider,
+			selection.credentialIds,
+			"startup-refinement",
+			{ maxAgeMs: getSelectionUsageMaxAgeMs(provider), forceRefresh: false },
+		);
+		if (selection.shouldScheduleFollowUp) {
+			this.scheduleOperationalUsageWarmupFollowUp(provider);
+		}
+		multiAuthDebugLogger.log("provider_operational_usage_warmup_dispatched", {
+			provider,
+			credentialCount: state.credentialIds.length,
+			candidateCount: selection.credentialIds.length,
+			refreshQueuedCount: count,
+			cacheAware: true,
+			followUpScheduled: selection.shouldScheduleFollowUp,
+		});
+		return count;
 	}
 
 	/**
@@ -5393,12 +5999,13 @@ export class AccountManager {
 			`Usage-based credential selection aborted for ${provider}.`,
 		);
 		const fallbackIndex = getUsageBasedCandidateIndex(state, available);
+		const backgroundExcludedCredentialIds = getCredentialBackgroundExclusionIds(state);
 		const candidates = state.credentialIds
 			.map((credentialId, index) => ({
 				credentialId,
 				index,
 				usageCount: state.usageCount[credentialId] ?? 0,
-				quotaErrorCount: state.quotaErrorCount[credentialId] ?? 0,
+				quotaErrorCount: getEffectiveQuotaErrorCount(state, credentialId, selectionStartedAt),
 				lastUsedAt: state.lastUsedAt[credentialId] ?? 0,
 			}))
 			.filter((candidate) => available.has(candidate.credentialId));
@@ -5410,6 +6017,7 @@ export class AccountManager {
 		if (provider === OPENAI_CODEX_PROVIDER_ID && operation === "selection") {
 			return this.getCacheFirstUsageBasedCandidateIndex(
 				provider,
+				state,
 				candidates,
 				fallbackIndex,
 				selectionStartedAt,
@@ -5426,15 +6034,22 @@ export class AccountManager {
 		for (const candidateWindow of candidateWindows) {
 			const usageResults = await Promise.allSettled(
 				candidateWindow.map((candidate) =>
-					this.getCredentialUsageSnapshotWithContext(
-						provider,
-						candidate.credentialId,
-						{
-							maxAgeMs: SELECTION_USAGE_MAX_AGE_MS,
-							coordinationOperation: operation,
-						},
-						usageContext,
-					),
+					backgroundExcludedCredentialIds.has(candidate.credentialId)
+						? Promise.resolve({
+								snapshot: null,
+								error: null,
+								fromCache: false,
+								displayOnly: true,
+							} satisfies CredentialUsageSnapshotResult)
+						: this.getCredentialUsageSnapshotWithContext(
+							provider,
+							candidate.credentialId,
+							{
+								maxAgeMs: getSelectionUsageMaxAgeMs(provider),
+								coordinationOperation: operation,
+							},
+							usageContext,
+						),
 				),
 			);
 
@@ -5452,6 +6067,8 @@ export class AccountManager {
 							hasUsageSnapshot: false,
 							isUntouched: false,
 							usedPercent: null,
+							primaryUsedPercent: null,
+							secondaryUsedPercent: null,
 							resetAt: null,
 							quotaState: { state: "unknown" } as UsageQuotaState,
 						};
@@ -5463,6 +6080,8 @@ export class AccountManager {
 						hasUsageSnapshot: snapshot !== null,
 						isUntouched: isUsageSnapshotUntouched(snapshot),
 						usedPercent: getUsageSnapshotUsedPercent(snapshot),
+						primaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "primary"),
+						secondaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "secondary"),
 						resetAt: getUsageSnapshotResetAt(snapshot),
 						quotaState: inferOperationalQuotaStateFromUsage(provider, snapshot),
 					};
@@ -5486,6 +6105,20 @@ export class AccountManager {
 				if (left.isUntouched !== right.isUntouched) {
 					return left.isUntouched ? -1 : 1;
 				}
+				const secondaryUsageComparison = compareNullableNumberAscending(
+					left.secondaryUsedPercent,
+					right.secondaryUsedPercent,
+				);
+				if (secondaryUsageComparison !== 0) {
+					return secondaryUsageComparison;
+				}
+				const primaryUsageComparison = compareNullableNumberAscending(
+					left.primaryUsedPercent,
+					right.primaryUsedPercent,
+				);
+				if (primaryUsageComparison !== 0) {
+					return primaryUsageComparison;
+				}
 				const usageComparison = compareNullableNumberAscending(
 					left.usedPercent,
 					right.usedPercent,
@@ -5504,7 +6137,7 @@ export class AccountManager {
 					return left.usageCount - right.usageCount;
 				}
 				if (left.lastUsedAt !== right.lastUsedAt) {
-					return left.lastUsedAt - right.lastUsedAt;
+					return right.lastUsedAt - left.lastUsedAt;
 				}
 				return left.index - right.index;
 			});
@@ -5535,6 +6168,9 @@ export class AccountManager {
 		}
 
 		throwIfAborted(signal, `Delegated credential usage validation aborted for ${provider}/${credentialId}.`);
+		if (this.isCredentialCachedBackgroundExcluded(provider, credentialId)) {
+			return { available: true };
+		}
 		const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
 		const snapshot = cachedUsage.usage?.snapshot ?? null;
 		const cachedUsedPercent = getUsageSnapshotUsedPercent(snapshot);
@@ -5570,7 +6206,7 @@ export class AccountManager {
 				credentialId,
 				{
 					forceRefresh: true,
-					maxAgeMs: SELECTION_USAGE_MAX_AGE_MS,
+					maxAgeMs: getSelectionUsageMaxAgeMs(provider),
 					coordinationOperation: "selection",
 					signal,
 				},
@@ -5603,6 +6239,9 @@ export class AccountManager {
 		const snapshots: Record<string, BalancerUsageSnapshot | undefined> = {};
 		const refreshCredentialIds: string[] = [];
 		for (const credentialId of credentialIds) {
+			if (this.isCredentialCachedBackgroundExcluded(provider, credentialId)) {
+				continue;
+			}
 			const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
 			const usage = cachedUsage.usage;
 			const snapshot = usage?.snapshot ?? null;
@@ -5627,6 +6266,7 @@ export class AccountManager {
 
 	private async getCacheFirstUsageBasedCandidateIndex(
 		provider: SupportedProviderId,
+		state: ProviderRotationState,
 		candidates: ReadonlyArray<{
 			credentialId: string;
 			index: number;
@@ -5638,19 +6278,27 @@ export class AccountManager {
 		selectionStartedAt: number,
 		usageContext?: CredentialUsageContext,
 	): Promise<number | undefined> {
-		let staleCredentialCount = 0;
-		const syncValidationCount = 0;
-		let staleExhaustedSkipCount = 0;
-		const ranked = candidates.map((candidate) => {
-			const cachedUsage = this.readCachedOperationalUsageForSelection(
-				provider,
-				candidate.credentialId,
-			);
-			if (cachedUsage.needsRefresh) {
-				staleCredentialCount += 1;
-			}
+		type RankedCandidate = (typeof candidates)[number] & {
+			hasUsageSnapshot: boolean;
+			isStaleUsage: boolean;
+			isCachedExhausted: boolean;
+			isUntouched: boolean;
+			usedPercent: number | null;
+			primaryUsedPercent: number | null;
+			secondaryUsedPercent: number | null;
+			resetAt: number | null;
+		};
 
-			const snapshot = cachedUsage.usage?.snapshot ?? null;
+		let staleCredentialCount = 0;
+		let syncValidationCount = 0;
+		let staleExhaustedSkipCount = 0;
+		const backgroundExcludedCredentialIds = getCredentialBackgroundExclusionIds(state);
+		const hydrateCandidateUsage = (
+			candidate: (typeof candidates)[number],
+			usage: CredentialUsageSnapshotResult | null,
+			isStaleUsage: boolean,
+		): RankedCandidate => {
+			const snapshot = usage?.snapshot ?? null;
 			const usedPercent = getUsageSnapshotUsedPercent(snapshot);
 			const quotaState = inferOperationalQuotaStateFromUsage(provider, snapshot);
 			const isCachedExhausted = snapshot !== null && (quotaState.state === "exhausted" ||
@@ -5658,46 +6306,124 @@ export class AccountManager {
 			return {
 				...candidate,
 				hasUsageSnapshot: snapshot !== null,
-				isStaleUsage: cachedUsage.needsRefresh,
+				isStaleUsage,
 				isCachedExhausted,
 				isUntouched: isUsageSnapshotUntouched(snapshot),
 				usedPercent,
+				primaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "primary"),
+				secondaryUsedPercent: getUsageSnapshotWindowUsedPercent(snapshot, "secondary"),
 				resetAt: getUsageSnapshotResetAt(snapshot),
 			};
+		};
+
+		const ranked = candidates.map((candidate) => {
+			if (backgroundExcludedCredentialIds.has(candidate.credentialId)) {
+				return hydrateCandidateUsage(candidate, null, false);
+			}
+			const cachedUsage = this.readCachedOperationalUsageForSelection(
+				provider,
+				candidate.credentialId,
+			);
+			if (cachedUsage.needsRefresh) {
+				staleCredentialCount += 1;
+			}
+			return hydrateCandidateUsage(candidate, cachedUsage.usage, cachedUsage.needsRefresh);
 		});
 
-		const backgroundRefreshCredentialIds = ranked
-			.filter((candidate) => candidate.isStaleUsage || !candidate.hasUsageSnapshot)
-			.map((candidate) => candidate.credentialId);
-		const selectableRanked = ranked.filter((candidate) => {
+		const backgroundRefreshCredentialIds = new Set(
+			ranked
+				.filter(
+					(candidate) =>
+						!backgroundExcludedCredentialIds.has(candidate.credentialId) &&
+						(candidate.isStaleUsage || !candidate.hasUsageSnapshot),
+				)
+				.map((candidate) => candidate.credentialId),
+		);
+		let selectableRanked = ranked.filter((candidate) => {
 			if (!candidate.isCachedExhausted) {
 				return true;
 			}
 			staleExhaustedSkipCount += 1;
 			return false;
 		});
-		const hasUsageSignals = selectableRanked.some((candidate) => candidate.hasUsageSnapshot);
+		let hasUsageSignals = selectableRanked.some((candidate) => candidate.hasUsageSnapshot);
+
+		if (selectableRanked.length > 1 && !hasUsageSignals) {
+			const syncCandidates = this.usageCoordinator.selectCredentialRequests(
+				selectableRanked
+					.filter((candidate) => !backgroundExcludedCredentialIds.has(candidate.credentialId))
+					.map((candidate) => ({ ...candidate, provider })),
+				"selection",
+			);
+			syncValidationCount = syncCandidates.length;
+			const usageResults = await Promise.allSettled(
+				syncCandidates.map((candidate) =>
+					this.getCredentialUsageSnapshotWithContext(
+						provider,
+						candidate.credentialId,
+						{
+							forceRefresh: true,
+							maxAgeMs: getSelectionUsageMaxAgeMs(provider),
+							coordinationOperation: "selection",
+						},
+						usageContext,
+					),
+				),
+			);
+			throwIfAborted(
+				usageContext?.signal,
+				`Usage-based credential selection aborted for ${provider}.`,
+			);
+
+			const refreshedByCredentialId = new Map<string, RankedCandidate>();
+			for (let index = 0; index < syncCandidates.length; index += 1) {
+				const candidate = syncCandidates[index];
+				const usageResult = usageResults[index];
+				if (!candidate || usageResult?.status !== "fulfilled") {
+					continue;
+				}
+				backgroundRefreshCredentialIds.delete(candidate.credentialId);
+				refreshedByCredentialId.set(
+					candidate.credentialId,
+					hydrateCandidateUsage(candidate, usageResult.value, false),
+				);
+			}
+
+			selectableRanked = selectableRanked
+				.map((candidate) => refreshedByCredentialId.get(candidate.credentialId) ?? candidate)
+				.filter((candidate) => {
+					if (!candidate.isCachedExhausted) {
+						return true;
+					}
+					staleExhaustedSkipCount += 1;
+					return false;
+				});
+			hasUsageSignals = selectableRanked.some((candidate) => candidate.hasUsageSnapshot);
+		}
+
 		let selectedIndex: number | undefined;
 		if (selectableRanked.length === 0) {
 			selectedIndex = undefined;
 		} else if (!hasUsageSignals) {
 			selectedIndex = fallbackIndex ?? selectableRanked[0]?.index;
 		} else {
-			const compareLocalRotation = (left: typeof selectableRanked[number], right: typeof selectableRanked[number]): number => {
-				if (left.quotaErrorCount !== right.quotaErrorCount) {
-					return left.quotaErrorCount - right.quotaErrorCount;
-				}
-				if (left.usageCount !== right.usageCount) {
-					return left.usageCount - right.usageCount;
-				}
-				if (left.lastUsedAt !== right.lastUsedAt) {
-					return left.lastUsedAt - right.lastUsedAt;
-				}
-				return 0;
-			};
-			const compareUsageSignals = (left: typeof selectableRanked[number], right: typeof selectableRanked[number]): number => {
+			const compareUsageSignals = (left: RankedCandidate, right: RankedCandidate): number => {
 				if (left.isUntouched !== right.isUntouched) {
 					return left.isUntouched ? -1 : 1;
+				}
+				const secondaryUsageComparison = compareNullableNumberAscending(
+					left.secondaryUsedPercent,
+					right.secondaryUsedPercent,
+				);
+				if (secondaryUsageComparison !== 0) {
+					return secondaryUsageComparison;
+				}
+				const primaryUsageComparison = compareNullableNumberAscending(
+					left.primaryUsedPercent,
+					right.primaryUsedPercent,
+				);
+				if (primaryUsageComparison !== 0) {
+					return primaryUsageComparison;
 				}
 				const usageComparison = compareNullableNumberAscending(
 					left.usedPercent,
@@ -5713,24 +6439,32 @@ export class AccountManager {
 				if (left.hasUsageSnapshot !== right.hasUsageSnapshot) {
 					return left.hasUsageSnapshot ? -1 : 1;
 				}
-				if (!left.isStaleUsage && !right.isStaleUsage) {
-					const usageSignalComparison = compareUsageSignals(left, right);
-					if (usageSignalComparison !== 0) {
-						return usageSignalComparison;
-					}
-					const localComparison = compareLocalRotation(left, right);
-					return localComparison !== 0 ? localComparison : left.index - right.index;
+
+				// Actual API usage signals are the primary sort key regardless
+				// of cache freshness — they reflect real provider quota state.
+				const usageSignalComparison = compareUsageSignals(left, right);
+				if (usageSignalComparison !== 0) {
+					return usageSignalComparison;
 				}
 
-				const localComparison = compareLocalRotation(left, right);
-				if (localComparison !== 0) {
-					return localComparison;
+				// Prefer credentials with fewer recent quota errors. The value is
+				// already time-decayed and reduced by successful recovery probes.
+				if (left.quotaErrorCount !== right.quotaErrorCount) {
+					return left.quotaErrorCount - right.quotaErrorCount;
 				}
-				if (left.isStaleUsage !== right.isStaleUsage) {
-					return left.isStaleUsage ? 1 : -1;
+
+				// STICKY: when actual usage is identical, keep using the same
+				// credential instead of rotating based on the local request counter.
+				if (left.lastUsedAt !== right.lastUsedAt) {
+					return right.lastUsedAt - left.lastUsedAt;
 				}
-				const usageSignalComparison = compareUsageSignals(left, right);
-				return usageSignalComparison !== 0 ? usageSignalComparison : left.index - right.index;
+
+				// Local request counter is token-aware and only a final tiebreaker.
+				if (left.usageCount !== right.usageCount) {
+					return left.usageCount - right.usageCount;
+				}
+
+				return left.index - right.index;
 			});
 
 			selectedIndex = selectableRanked[0]?.index;
@@ -5738,7 +6472,7 @@ export class AccountManager {
 
 		const refreshQueuedCount = this.enqueueCredentialUsageRefresh(
 			provider,
-			backgroundRefreshCredentialIds,
+			[...backgroundRefreshCredentialIds],
 			"selection",
 		);
 		multiAuthDebugLogger.log("credential_usage_selection_timing", {
@@ -5768,8 +6502,9 @@ export class AccountManager {
 		);
 		const now = Date.now();
 		const cascadeBlockedCredentialIds = this.cascadeStateManager.getBlockedCredentialIds(provider, now);
+		const backgroundExcludedCredentialIds = getCredentialBackgroundExclusionIds(state);
 		const blockedCredentialIds = state.credentialIds.filter((credentialId) => {
-			if (excludedCredentialIds?.has(credentialId)) {
+			if (excludedCredentialIds?.has(credentialId) || backgroundExcludedCredentialIds.has(credentialId)) {
 				return false;
 			}
 			const exhaustedUntil = state.quotaExhaustedUntil[credentialId];
@@ -5876,6 +6611,11 @@ export class AccountManager {
 		if (!this.isOAuthRefreshManagedForProvider(provider) || await this.isProviderHidden(provider)) {
 			return credential;
 		}
+		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			return credential;
+		}
 
 		const safetyWindowMs = getOAuthRefreshLeadTimeMs(
 			provider,
@@ -5916,6 +6656,11 @@ export class AccountManager {
 			throw new Error(`OAuth refresh skipped because provider ${provider} is hidden.`);
 		}
 		this.assertOAuthRefreshManagedForProvider(provider);
+		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			return credential;
+		}
 		const refreshKey = `${provider}:${credentialId}`;
 		const inFlightRefresh = this.oauthRefreshInFlight.get(refreshKey);
 		if (inFlightRefresh) {
@@ -6052,6 +6797,11 @@ export class AccountManager {
 		normalizedProviderState.credentialIds = [...normalizedCredentialIds];
 		normalizedProviderState.rotationMode = resolveDefaultRotationMode(provider);
 		normalizeProviderState(normalizedProviderState, provider);
+		reconcileBackgroundCredentialExclusionsForProvider(
+			provider,
+			normalizedProviderState,
+			credentialEntries,
+		);
 		clearRecoveredOAuthRefreshFailureStateForProvider(
 			provider,
 			normalizedProviderState,
@@ -6069,6 +6819,7 @@ export class AccountManager {
 					: currentProviderState,
 				legacyRotationMode,
 			);
+			this.updateBackgroundCredentialExclusionCache(provider, effectiveProviderState);
 			if (isHiddenProvider) {
 				await this.cancelProviderOperationalWork(provider, effectiveProviderState);
 				return effectiveProviderState;
@@ -6083,6 +6834,11 @@ export class AccountManager {
 			storedProviderState.credentialIds = [...normalizedCredentialIds];
 			storedProviderState.rotationMode = resolveDefaultRotationMode(provider);
 			normalizeProviderState(storedProviderState, provider);
+			reconcileBackgroundCredentialExclusionsForProvider(
+				provider,
+				storedProviderState,
+				credentialEntries,
+			);
 			clearRecoveredOAuthRefreshFailureStateForProvider(
 				provider,
 				storedProviderState,
@@ -6103,6 +6859,7 @@ export class AccountManager {
 				: providerState,
 			legacyRotationMode,
 		);
+		this.updateBackgroundCredentialExclusionCache(provider, effectiveProviderState);
 		if (isHiddenProvider) {
 			await this.cancelProviderOperationalWork(provider, effectiveProviderState);
 			return effectiveProviderState;
@@ -6204,6 +6961,11 @@ export class AccountManager {
 					providerState.credentialIds = [...(credentialIdsByProvider.get(provider) ?? [])];
 					providerState.rotationMode = resolveDefaultRotationMode(provider);
 					normalizeProviderState(providerState, provider);
+					reconcileBackgroundCredentialExclusionsForProvider(
+						provider,
+						providerState,
+						credentialEntriesByProvider.get(provider) ?? [],
+					);
 					if (provider === "cline" || !this.isOAuthRefreshManagedForProvider(provider)) {
 						clearDisabledOAuthRefreshFailureStateForProvider(provider, providerState);
 					}
@@ -6227,6 +6989,7 @@ export class AccountManager {
 			}
 			for (const [provider, providerState] of Object.entries(persistedProviders)) {
 				const effectiveProviderState = this.applyEffectiveProviderRotationMode(provider, providerState);
+				this.updateBackgroundCredentialExclusionCache(provider, effectiveProviderState);
 				this.loadProviderTelemetry(provider, effectiveProviderState);
 				await this.syncProviderOAuthSchedules(
 					provider,
@@ -6290,7 +7053,10 @@ export class AccountManager {
 		credentialId: string,
 		credential: StoredOAuthCredential,
 	): void {
-		if (!this.isOAuthRefreshManagedForProvider(provider)) {
+		if (
+			!this.isOAuthRefreshManagedForProvider(provider) ||
+			this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)
+		) {
 			this.oauthRefreshScheduler.cancelRefresh(credentialId);
 			return;
 		}
@@ -6377,6 +7143,11 @@ export class AccountManager {
 			await this.persistOAuthRefreshSchedule(provider);
 			return undefined;
 		}
+		if (this.shouldSkipOAuthRefreshForMissingRefreshToken(provider, credential)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			return undefined;
+		}
 
 		try {
 			const refreshed = await this.refreshCredentialToken(provider, credentialId, credential);
@@ -6404,6 +7175,8 @@ export class AccountManager {
 		const resolutionStartedAt = Date.now();
 		const verifiedEligibleCredentialIds: string[] = [];
 		const preferredCredentialIds: string[] = [];
+		const knownFreePlanCredentialIds: string[] = [];
+		const unknownFreePlanCredentialIds: string[] = [];
 		const usageFailureCredentialIds: string[] = [];
 		const unknownPlanCredentialIds: string[] = [];
 		const ineligibleCredentialIds: string[] = [];
@@ -6427,6 +7200,8 @@ export class AccountManager {
 		const removeFromEligibilityLists = (credentialId: string): void => {
 			removeFromList(verifiedEligibleCredentialIds, credentialId);
 			removeFromList(preferredCredentialIds, credentialId);
+			removeFromList(knownFreePlanCredentialIds, credentialId);
+			removeFromList(unknownFreePlanCredentialIds, credentialId);
 			removeFromList(usageFailureCredentialIds, credentialId);
 			removeFromList(unknownPlanCredentialIds, credentialId);
 			removeFromList(ineligibleCredentialIds, credentialId);
@@ -6442,6 +7217,10 @@ export class AccountManager {
 					hasUnknownPlanType = true;
 				} else {
 					pushUnique(verifiedEligibleCredentialIds, credentialId);
+					if (prefersFreePlan) {
+						pushUnique(preferredCredentialIds, credentialId);
+						pushUnique(unknownFreePlanCredentialIds, credentialId);
+					}
 				}
 				return;
 			}
@@ -6458,6 +7237,10 @@ export class AccountManager {
 					}
 				} else {
 					pushUnique(verifiedEligibleCredentialIds, credentialId);
+					if (prefersFreePlan) {
+						pushUnique(preferredCredentialIds, credentialId);
+						pushUnique(unknownFreePlanCredentialIds, credentialId);
+					}
 				}
 				return;
 			}
@@ -6495,12 +7278,18 @@ export class AccountManager {
 			pushUnique(verifiedEligibleCredentialIds, credentialId);
 			if (prefersFreePlan && planType === "free") {
 				pushUnique(preferredCredentialIds, credentialId);
+				pushUnique(knownFreePlanCredentialIds, credentialId);
+			}
+			if (prefersFreePlan && planType === "unknown") {
+				pushUnique(preferredCredentialIds, credentialId);
+				pushUnique(unknownFreePlanCredentialIds, credentialId);
 			}
 		};
 
 		// Quota recovery bypass: check which credentials have stale quota cooldown
 		const providerState = await this.storage.readProviderState(provider);
 		const now = Date.now();
+		const backgroundExcludedCredentialIds = getCredentialBackgroundExclusionIds(providerState);
 		const quotaRecoveryCandidates = new Set<string>();
 		for (const id of credentialIds) {
 			const exhaustedUntil = providerState.quotaExhaustedUntil?.[id] ?? 0;
@@ -6514,6 +7303,10 @@ export class AccountManager {
 		}
 
 		for (const credentialId of credentialIds) {
+			if (backgroundExcludedCredentialIds.has(credentialId)) {
+				processUsage(credentialId, null);
+				continue;
+			}
 			const cachedUsage = this.readCachedOperationalUsageForSelection(provider, credentialId);
 			let usage = cachedUsage.usage;
 			let hasPlanEvidence = cachedUsage.hasDurableEvidence;
@@ -6557,7 +7350,9 @@ export class AccountManager {
 		let synchronousFetchCount = 0;
 		const bootstrapCredentialIds =
 			requiresEntitlement && verifiedEligibleCredentialIds.length === 0
-				? [...bootstrapCandidateCredentialIds]
+				? bootstrapCandidateCredentialIds.filter(
+					(credentialId) => !backgroundExcludedCredentialIds.has(credentialId),
+				)
 				: [];
 
 		if (bootstrapCredentialIds.length > 0) {
@@ -6608,9 +7403,10 @@ export class AccountManager {
 		const backgroundRefreshCandidateCredentialIds = bootstrapPerformed
 			? []
 			: credentialIds.filter((credentialId) =>
-				bootstrapCandidateCredentialIds.includes(credentialId) ||
-				unknownPlanCredentialIds.includes(credentialId) ||
-				usageFailureCredentialIds.includes(credentialId),
+				!backgroundExcludedCredentialIds.has(credentialId) &&
+				(bootstrapCandidateCredentialIds.includes(credentialId) ||
+					unknownPlanCredentialIds.includes(credentialId) ||
+					usageFailureCredentialIds.includes(credentialId)),
 			);
 		const backgroundRefreshQueuedCount = this.enqueueCredentialUsageRefresh(
 			provider,
@@ -6657,6 +7453,10 @@ export class AccountManager {
 			}
 		}
 
+		const preferredCredentialTiers = prefersFreePlan
+			? [knownFreePlanCredentialIds, unknownFreePlanCredentialIds].filter((tier) => tier.length > 0)
+			: undefined;
+
 		multiAuthDebugLogger.log("codex_entitlement_selection_timing", {
 			provider,
 			modelId: normalizedModelId ?? "unknown",
@@ -6677,6 +7477,9 @@ export class AccountManager {
 			eligibleCredentialIds,
 			ineligibleCredentialIds,
 			preferredCredentialIds,
+			preferredCredentialTiers: preferredCredentialTiers && preferredCredentialTiers.length > 0
+				? preferredCredentialTiers
+				: undefined,
 			failureMessage,
 		};
 	}

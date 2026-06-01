@@ -44,9 +44,9 @@ import {
     parseEnrichedProviderResponse,
 } from "../src/provider-error-details.js";
 import {
-	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
-	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
-	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_DELEGATED_AUTH_API_KEY_ENV,
+	PI_DELEGATED_AUTH_LEASE_ID_ENV,
+	PI_DELEGATED_AUTH_PROVIDER_ID_ENV,
 	PI_AGENT_ROUTER_SUBAGENT_ENV,
 } from "../src/runtime-context.js";
 import { PoolManager } from "../src/pool-manager.js";
@@ -62,9 +62,9 @@ import type { UsageAuth, UsageSnapshot } from "../src/usage/types.js";
 
 const PI_AGENT_ROUTER_ENV_KEYS = [
 	PI_AGENT_ROUTER_SUBAGENT_ENV,
-	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
-	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
-	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+	PI_DELEGATED_AUTH_PROVIDER_ID_ENV,
+	PI_DELEGATED_AUTH_LEASE_ID_ENV,
+	PI_DELEGATED_AUTH_API_KEY_ENV,
 ] as const;
 
 type PiAgentRouterEnvKey = (typeof PI_AGENT_ROUTER_ENV_KEYS)[number];
@@ -1768,9 +1768,9 @@ test("delegated credential overrides pin the delegated credential through accoun
 	const acquiredCredentialSelections: string[][] = [];
 
 	process.env[PI_AGENT_ROUTER_SUBAGENT_ENV] = "1";
-	process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV] = "cline";
-	process.env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV] = delegatedCredentialId;
-	process.env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV] = "workos:stale-token";
+	process.env[PI_DELEGATED_AUTH_PROVIDER_ID_ENV] = "cline";
+	process.env[PI_DELEGATED_AUTH_LEASE_ID_ENV] = delegatedCredentialId;
+	process.env[PI_DELEGATED_AUTH_API_KEY_ENV] = "workos:stale-token";
 
 	const wrapper = createRotatingStreamWrapper(
 		"cline",
