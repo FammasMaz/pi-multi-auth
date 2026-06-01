@@ -41,6 +41,8 @@ const LEASE_TTL_MS = 24 * 60 * 60 * 1000;
 const LIGHTWEIGHT_SESSION_LEASE_TTL_MS = 5 * 60 * 1000;
 const LIGHTWEIGHT_SESSION_LEASE_SCOPE_PREFIX = "lightweight-session";
 const TRANSIENT_COOLDOWN_REASON_PATTERN = /transient/i;
+const CASCADE_HALF_OPEN_PROBE_BLOCK_MS = 100;
+const CASCADE_HALF_OPEN_PROBE_TTL_MS = 30_000;
 
 type KeyDistributorConfig = {
 	waitTimeoutMs: number;
@@ -124,6 +126,7 @@ export class KeyDistributor {
 	private readonly lightweightSubagentSessionIdsByScopeKey = new Map<string, Set<string>>();
 	private readonly lightweightParentSessionIdByScopeKey = new Map<string, string>();
 	private readonly lightweightLeaseScopeKeysByParentSessionId = new Map<string, Set<string>>();
+	private readonly cascadeProbeReservedAtByProvider = new Map<SupportedProviderId, number>();
 	private readonly stickyCredentialBySelectionSession = new Map<string, string>();
 	private readonly waitersByProvider = new Map<SupportedProviderId, Set<Waiter>>();
 	private readonly wakeTimerByProvider = new Map<SupportedProviderId, ReturnType<typeof setTimeout>>();
@@ -444,7 +447,13 @@ export class KeyDistributor {
 	 * Selects a credential for a non-exclusive orchestrator request.
 	 */
 	async acquireKey(context: SelectionContext, options: AcquireWaitOptions = {}): Promise<string> {
-		return this.acquireCredentialId(context, options.signal);
+		return this.acquireCredentialId(
+			{
+				...context,
+				stickyCredential: context.stickyCredential ?? false,
+			},
+			options.signal,
+		);
 	}
 
 	/**
@@ -985,13 +994,15 @@ export class KeyDistributor {
 			}
 			case "balancer":
 			default: {
-				const stickyCredentialId = this.getStickyCredentialForSelectionSession(
-					context,
-					available,
-					snapshot.usageSnapshots,
-				);
-				if (stickyCredentialId) {
-					return stickyCredentialId;
+				if (context.stickyCredential !== false) {
+					const stickyCredentialId = this.getStickyCredentialForSelectionSession(
+						context,
+						available,
+						snapshot.usageSnapshots,
+					);
+					if (stickyCredentialId) {
+						return stickyCredentialId;
+					}
 				}
 
 				const selectedCredentialId = selectBestCredential(context, snapshot, {
@@ -1000,7 +1011,7 @@ export class KeyDistributor {
 					maxConcurrentPerKey: this.config.maxConcurrentPerKey,
 					tolerance: this.config.tolerance,
 				});
-				if (selectedCredentialId) {
+				if (selectedCredentialId && context.stickyCredential !== false) {
 					this.stickyCredentialBySelectionSession.set(
 						this.getSelectionSessionKey(context),
 						selectedCredentialId,
@@ -1143,7 +1154,10 @@ export class KeyDistributor {
 				this.notifyAvailability(providerId);
 			}
 
-			const snapshot = await this.buildSnapshot(context.providerId, now, signal);
+			const snapshot = this.applySelectionContextRotationMode(
+				await this.buildSnapshot(context.providerId, now, signal),
+				context,
+			);
 			throwFixedAbortErrorIfAborted(
 				signal,
 				createCredentialAvailabilityAbortMessage(context.providerId),
@@ -1217,6 +1231,23 @@ export class KeyDistributor {
 		}
 	}
 
+	private applySelectionContextRotationMode<Snapshot extends { providerState: ProviderRotationState }>(
+		snapshot: Snapshot,
+		context: SelectionContext,
+	): Snapshot {
+		if (!context.rotationMode || snapshot.providerState.rotationMode === context.rotationMode) {
+			return snapshot;
+		}
+
+		return {
+			...snapshot,
+			providerState: {
+				...snapshot.providerState,
+				rotationMode: context.rotationMode,
+			},
+		};
+	}
+
 	private async resolveEffectiveSelectionContext(
 		context: SelectionContext,
 		credentialIds: readonly string[],
@@ -1271,10 +1302,22 @@ export class KeyDistributor {
 		const balancerState = this.getOrCreateState(providerId);
 
 		const activeCascade = providerState.cascadeState?.[providerId]?.active;
-		const cascadeBlockedUntil =
-			activeCascade?.isActive === true && activeCascade.nextRetryAt > now
-				? activeCascade.nextRetryAt
-				: null;
+		let cascadeBlockedUntil: number | null = null;
+		if (activeCascade?.isActive === true) {
+			if (activeCascade.nextRetryAt > now) {
+				cascadeBlockedUntil = activeCascade.nextRetryAt;
+				this.cascadeProbeReservedAtByProvider.delete(providerId);
+			} else {
+				const reservedAt = this.cascadeProbeReservedAtByProvider.get(providerId);
+				if (reservedAt !== undefined && now - reservedAt < CASCADE_HALF_OPEN_PROBE_TTL_MS) {
+					cascadeBlockedUntil = now + CASCADE_HALF_OPEN_PROBE_BLOCK_MS;
+				} else {
+					this.cascadeProbeReservedAtByProvider.set(providerId, now);
+				}
+			}
+		} else {
+			this.cascadeProbeReservedAtByProvider.delete(providerId);
+		}
 		const cascadeBlockedCredentialIds = new Set(
 			cascadeBlockedUntil === null
 				? []

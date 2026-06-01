@@ -1,4 +1,4 @@
-import type { SupportedProviderId } from "../types.js";
+import type { RotationMode, SupportedProviderId } from "../types.js";
 import type { UsageSnapshot } from "../usage/types.js";
 
 /**
@@ -67,6 +67,10 @@ export interface SelectionContext {
 	excludedIds: readonly string[];
 	requestingSessionId: string;
 	modelId?: string;
+	/** Effective rotation mode after extension config overrides are applied. */
+	rotationMode?: RotationMode;
+	/** Whether balancer mode may reuse the previous credential for this selection session. */
+	stickyCredential?: boolean;
 }
 
 export interface DelegatedCredentialRequest {

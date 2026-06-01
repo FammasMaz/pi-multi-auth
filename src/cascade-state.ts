@@ -30,6 +30,7 @@ function cloneProviderCascadeState(state: ProviderCascadeState): ProviderCascade
 export class CascadeStateManager {
 	private config: CascadeConfig;
 	private readonly cascadeStates = new Map<string, ProviderCascadeState>();
+	private readonly halfOpenProbeInFlight = new Map<string, boolean>();
 
 	constructor(config: Partial<CascadeConfig> = {}) {
 		this.config = {
@@ -66,6 +67,22 @@ export class CascadeStateManager {
 		return new Set(activeCascade.cascadePath.map((attempt) => attempt.credentialId));
 	}
 
+	tryReserveProbe(providerId: string, now: number = Date.now()): boolean {
+		const activeCascade = this.getCascadeState(providerId);
+		if (!activeCascade || !activeCascade.isActive || activeCascade.nextRetryAt > now) {
+			return false;
+		}
+		if (this.halfOpenProbeInFlight.get(providerId) === true) {
+			return false;
+		}
+		this.halfOpenProbeInFlight.set(providerId, true);
+		return true;
+	}
+
+	releaseProbe(providerId: string): void {
+		this.halfOpenProbeInFlight.delete(providerId);
+	}
+
 	isCredentialInCascadePath(providerId: string, credentialId: string): boolean {
 		const cascade = this.getCascadeState(providerId);
 		if (!cascade) {
@@ -82,6 +99,7 @@ export class CascadeStateManager {
 		errorMessage: string,
 		now: number = Date.now(),
 	): CascadeRetryState {
+		this.releaseProbe(providerId);
 		const attempt = this.createAttempt(providerId, credentialId, errorKind, errorMessage, now);
 		const cascade: CascadeRetryState = {
 			cascadeId: randomUUID(),
@@ -105,6 +123,7 @@ export class CascadeStateManager {
 		errorMessage: string,
 		now: number = Date.now(),
 	): CascadeRetryState {
+		this.releaseProbe(providerId);
 		const existingCascade = this.getCascadeState(providerId);
 		if (!existingCascade) {
 			return this.createCascade(providerId, credentialId, errorKind, errorMessage, now);
@@ -128,6 +147,7 @@ export class CascadeStateManager {
 	}
 
 	clearCascade(providerId: string): void {
+		this.releaseProbe(providerId);
 		const providerState = this.cascadeStates.get(providerId);
 		if (!providerState?.active) {
 			return;
@@ -163,6 +183,7 @@ export class CascadeStateManager {
 	removeCredential(providerId: string, credentialId: string): void {
 		const providerState = this.cascadeStates.get(providerId);
 		if (!providerState) {
+			this.releaseProbe(providerId);
 			return;
 		}
 
@@ -173,6 +194,7 @@ export class CascadeStateManager {
 			providerState.active.attemptCount = providerState.active.cascadePath.length;
 			if (providerState.active.cascadePath.length === 0) {
 				providerState.active = undefined;
+				this.releaseProbe(providerId);
 			}
 		}
 
