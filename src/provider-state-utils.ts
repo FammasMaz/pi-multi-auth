@@ -10,6 +10,8 @@ export function cloneProviderState(state: ProviderRotationState): ProviderRotati
 		lastUsedAt: { ...state.lastUsedAt },
 		usageCount: { ...state.usageCount },
 		quotaErrorCount: { ...state.quotaErrorCount },
+		quotaErrorLastSeenAt: { ...(state.quotaErrorLastSeenAt ?? {}) },
+		quotaRecoverySuccessCount: { ...(state.quotaRecoverySuccessCount ?? {}) },
 		quotaExhaustedUntil: { ...state.quotaExhaustedUntil },
 		lastQuotaError: { ...state.lastQuotaError },
 		lastTransientError: { ...state.lastTransientError },
@@ -31,5 +33,8 @@ export function cloneProviderState(state: ProviderRotationState): ProviderRotati
 			? cloneJson(state.modelIncompatibilities)
 			: undefined,
 		credentialLeases: state.credentialLeases ? cloneJson(state.credentialLeases) : undefined,
+		backgroundCredentialExclusions: state.backgroundCredentialExclusions
+			? cloneJson(state.backgroundCredentialExclusions)
+			: undefined,
 	};
 }

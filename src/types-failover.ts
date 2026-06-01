@@ -44,10 +44,6 @@ export interface ChainResult {
 	isLastProvider: boolean;
 }
 
-export interface FailoverChainConfig {
-	enabled: boolean;
-	chains: FailoverChain[];
-}
 
 export const DEFAULT_FAILOVER_TRIGGERS: CredentialErrorKind[] = [
 	"quota",

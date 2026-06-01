@@ -1,4 +1,4 @@
-type OAuthRefreshFailureSource = "extension" | "provider";
+import type { OAuthRefreshFailureSource } from "./types-oauth.js";
 
 const STRUCTURED_FIELD_SANITIZE_PATTERN = /[^a-z0-9._-]+/gi;
 
@@ -77,7 +77,7 @@ export function isAbortError(error: unknown): boolean {
 	return false;
 }
 
-export function toAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
+function toAbortError(signal: AbortSignal | undefined, fallbackMessage: string): Error {
 	if (signal?.reason instanceof Error) {
 		return signal.reason;
 	}
