@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import {
 	getErrorMessage,
 	isRecord,
@@ -8,14 +8,14 @@ import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import {
 	acquireFileLock,
+	backupBeforeOverwrite,
 	ensureFileExists,
 	ensureParentDir,
 	hardenCredentialFilePermissions,
-	pathExists,
+	readTextSnapshotWithBackupRecovery,
 } from "./file-utils.js";
 import {
 	isRetryableFileAccessError,
-	readTextSnapshotWithRetries,
 	writeTextSnapshotWithRetries,
 } from "./file-retry.js";
 import type {
@@ -75,49 +75,14 @@ function parseAuthData(content: string | undefined): RawAuthFileData {
 	return parsed;
 }
 
-function isRetryableSnapshotReadError(error: Error): boolean {
-	return (
-		error.message.startsWith("Invalid JSON in auth.json:") ||
-		error.message === "Invalid auth.json format: expected a JSON object" ||
-		isRetryableFileAccessError(error)
-	);
-}
-
 async function readAuthDataSnapshot(authPath: string): Promise<RawAuthFileData> {
 	await ensureParentDir(authPath);
 	await ensureFileExists(authPath, "{}");
 
-	return readTextSnapshotWithRetries({
+	return readTextSnapshotWithBackupRecovery({
 		filePath: authPath,
-		failureMessage: `Failed to read auth.json snapshot from '${authPath}'.`,
-		read: async () => ((await pathExists(authPath)) ? readFile(authPath, "utf-8") : undefined),
 		parse: parseAuthData,
-		resolveOnFinalEmpty: () => ({}),
-		isRetryableError: isRetryableSnapshotReadError,
-		onRetry: ({ attempt, maxAttempts, reason, delayMs }) => {
-			multiAuthDebugLogger.log("auth_snapshot_retry", {
-				authPath,
-				attempt,
-				maxAttempts,
-				reason,
-				delayMs,
-			});
-		},
-		onRecovered: ({ attempt, maxAttempts }) => {
-			multiAuthDebugLogger.log("auth_snapshot_recovered", {
-				authPath,
-				attempt,
-				maxAttempts,
-			});
-		},
-		onError: ({ attempt, maxAttempts, error }) => {
-			multiAuthDebugLogger.log("auth_snapshot_error", {
-				authPath,
-				attempt,
-				maxAttempts,
-				error,
-			});
-		},
+		createDefault: () => ({}),
 	});
 }
 
@@ -131,6 +96,7 @@ async function writeAuthDataSnapshot(authPath: string, data: RawAuthFileData): P
 		filePath: authPath,
 		failureMessage: `Failed to persist auth.json to '${authPath}'.`,
 		write: async () => {
+			await backupBeforeOverwrite(authPath);
 			await writeFile(authPath, serialized, "utf-8");
 			await hardenCredentialFilePermissions(authPath);
 		},

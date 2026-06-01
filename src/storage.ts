@@ -1,13 +1,13 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import {
 	acquireFileLock,
 	ensureFileExists,
 	ensureParentDir,
-	hardenCredentialFilePermissions,
-	pathExists,
+	readTextSnapshotWithBackupRecovery,
+	writeTextFileAtomically,
 } from "./file-utils.js";
-import { isRetryableFileAccessError, readTextSnapshotWithRetries, writeTextSnapshotWithRetries } from "./file-retry.js";
+import { isRetryableFileAccessError, writeTextSnapshotWithRetries } from "./file-retry.js";
 import { RollingMetricSeries, type MetricSeriesSnapshot } from "./performance-metrics.js";
 import { cloneProviderState } from "./provider-state-utils.js";
 import { resolveDefaultRotationMode } from "./rotation-modes.js";
@@ -58,6 +58,8 @@ export function createEmptyProviderState(
 		lastUsedAt: {},
 		usageCount: {},
 		quotaErrorCount: {},
+		quotaErrorLastSeenAt: {},
+		quotaRecoverySuccessCount: {},
 		quotaExhaustedUntil: {},
 		lastQuotaError: {},
 		lastTransientError: {},
@@ -77,6 +79,7 @@ export function createEmptyProviderState(
 		quotaDrainStates: undefined,
 		modelIncompatibilities: undefined,
 		credentialLeases: undefined,
+		backgroundCredentialExclusions: undefined,
 	};
 }
 
@@ -142,6 +145,8 @@ function parseProviderState(
 		lastUsedAt: parseNumberMap(value.lastUsedAt),
 		usageCount: parseNumberMap(value.usageCount),
 		quotaErrorCount: parseNumberMap(value.quotaErrorCount),
+		quotaErrorLastSeenAt: parseNumberMap(value.quotaErrorLastSeenAt),
+		quotaRecoverySuccessCount: parseNumberMap(value.quotaRecoverySuccessCount),
 		quotaExhaustedUntil: parseNumberMap(value.quotaExhaustedUntil),
 		lastQuotaError: parseStringMap(value.lastQuotaError),
 		lastTransientError: parseStringMap(value.lastTransientError),
@@ -161,6 +166,7 @@ function parseProviderState(
 		quotaDrainStates: parseQuotaDrainStates(value.quotaDrainStates),
 		modelIncompatibilities: parseModelIncompatibilities(value.modelIncompatibilities),
 		credentialLeases: parseCredentialLeases(value.credentialLeases),
+		backgroundCredentialExclusions: parseBackgroundCredentialExclusions(value.backgroundCredentialExclusions),
 	};
 }
 
@@ -191,6 +197,33 @@ function parseDisabledCredentials(
 		}
 	}
 	return result;
+}
+
+function parseBackgroundCredentialExclusions(
+	value: unknown,
+): ProviderRotationState["backgroundCredentialExclusions"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const result: NonNullable<ProviderRotationState["backgroundCredentialExclusions"]> = {};
+	for (const [credentialId, entry] of Object.entries(value)) {
+		if (!isRecord(entry)) {
+			continue;
+		}
+		if (entry.reason !== "missing_refresh_token_on_import") {
+			continue;
+		}
+		result[credentialId] = {
+			reason: "missing_refresh_token_on_import",
+			excludedAt:
+				typeof entry.excludedAt === "number" && Number.isFinite(entry.excludedAt)
+					? entry.excludedAt
+					: Date.now(),
+		};
+	}
+
+	return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function parseCascadeState(value: unknown): ProviderRotationState["cascadeState"] {
@@ -566,7 +599,7 @@ function parseModelIncompatibilities(
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function parseCredentialLeases(value: unknown): ProviderRotationState["credentialLeases"] {
+export function parseCredentialLeases(value: unknown): ProviderRotationState["credentialLeases"] {
 	if (!isRecord(value)) {
 		return undefined;
 	}
@@ -663,23 +696,94 @@ function parseState(content: string | undefined): MultiAuthState {
 	return state;
 }
 
-function isRetryableStorageSnapshotError(error: Error): boolean {
-	return error.message.startsWith("Invalid JSON in multi-auth.json:") || isRetryableFileAccessError(error);
-}
-
 async function readMultiAuthStateSnapshot(storagePath: string): Promise<MultiAuthState> {
-	return readTextSnapshotWithRetries({
+	return readTextSnapshotWithBackupRecovery({
 		filePath: storagePath,
-		failureMessage: `Failed to read multi-auth.json snapshot from '${storagePath}'.`,
-		read: async () => ((await pathExists(storagePath)) ? readFile(storagePath, "utf-8") : undefined),
 		parse: parseState,
-		resolveOnFinalEmpty: () => createDefaultMultiAuthState(),
-		isRetryableError: isRetryableStorageSnapshotError,
+		createDefault: () => createDefaultMultiAuthState(),
 	});
 }
 
+function hasObjectEntries(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && Object.keys(value).length > 0;
+}
+
+function hasArrayEntries<TValue>(value: readonly TValue[] | undefined): value is readonly TValue[] {
+	return Array.isArray(value) && value.length > 0;
+}
+
+function hasMapEntries(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && Object.keys(value).length > 0;
+}
+
+function sparsifyProviderState(
+	provider: string,
+	state: ProviderRotationState,
+): Record<string, unknown> {
+	const sparse: Record<string, unknown> = {};
+	if (hasArrayEntries(state.credentialIds)) {
+		sparse.credentialIds = [...state.credentialIds];
+	}
+	sparse.activeIndex = state.activeIndex;
+	sparse.rotationMode = state.rotationMode;
+	if (state.manualActiveCredentialId) {
+		sparse.manualActiveCredentialId = state.manualActiveCredentialId;
+	}
+	for (const field of [
+		"lastUsedAt",
+		"usageCount",
+		"quotaErrorCount",
+		"quotaErrorLastSeenAt",
+		"quotaRecoverySuccessCount",
+		"quotaExhaustedUntil",
+		"lastQuotaError",
+		"lastTransientError",
+		"transientErrorCount",
+		"weeklyQuotaAttempts",
+		"friendlyNames",
+		"disabledCredentials",
+		"oauthRefreshScheduled",
+		"quotaStates",
+		"quotaDrainStates",
+		"modelIncompatibilities",
+		"credentialLeases",
+		"backgroundCredentialExclusions",
+	] as const) {
+		const value = state[field];
+		if (hasMapEntries(value)) {
+			sparse[field] = value;
+		}
+	}
+	if (hasObjectEntries(state.cascadeState)) {
+		sparse.cascadeState = state.cascadeState;
+	}
+	if (state.healthState) {
+		sparse.healthState = state.healthState;
+	}
+	if (hasArrayEntries(state.pools)) {
+		sparse.pools = state.pools;
+	}
+	if (state.poolConfig) {
+		sparse.poolConfig = state.poolConfig;
+	}
+	if (state.poolState) {
+		sparse.poolState = state.poolState;
+	}
+	if (hasArrayEntries(state.chains)) {
+		sparse.chains = state.chains;
+	}
+	if (state.activeChain) {
+		sparse.activeChain = state.activeChain;
+	}
+	return sparse;
+}
+
 function serializeState(state: MultiAuthState): string {
-	return JSON.stringify(state, null, 2);
+	const providers: Record<string, Record<string, unknown>> = {};
+	for (const [provider, providerState] of Object.entries(state.providers)) {
+		providers[provider] = sparsifyProviderState(provider, providerState);
+	}
+	return JSON.stringify({ version: 1, providers }, null, 2);
 }
 
 function createStorageFingerprint(fileStats: { mtimeMs: number; size: number }): string {
@@ -694,8 +798,7 @@ async function writeSerializedMultiAuthStateSnapshot(
 		filePath: storagePath,
 		failureMessage: `Failed to persist multi-auth.json to '${storagePath}'.`,
 		write: async () => {
-			await writeFile(storagePath, serializedState, "utf-8");
-			await hardenCredentialFilePermissions(storagePath);
+			await writeTextFileAtomically(storagePath, serializedState);
 		},
 		isRetryableError: isRetryableFileAccessError,
 	});
@@ -870,7 +973,7 @@ export class MultiAuthStorage {
 
 	private async ensureStorageReady(): Promise<void> {
 		await ensureParentDir(this.storagePath);
-		await ensureFileExists(this.storagePath, JSON.stringify(createDefaultMultiAuthState(), null, 2));
+		await ensureFileExists(this.storagePath, serializeState(createDefaultMultiAuthState()));
 	}
 
 	private async readCachedSnapshotReference(): Promise<CachedStorageSnapshot> {
