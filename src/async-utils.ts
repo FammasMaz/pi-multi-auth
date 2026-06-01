@@ -21,6 +21,37 @@ export function sleep(ms: number): Promise<void> {
 	});
 }
 
+export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) {
+		return Promise.reject(createAbortError("Sleep aborted."));
+	}
+	if (ms <= 0) {
+		return Promise.resolve();
+	}
+
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const timeoutId = setTimeout(() => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = (): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timeoutId);
+			signal?.removeEventListener("abort", onAbort);
+			reject(createAbortError("Sleep aborted."));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 export async function runWithTimeoutSignal<T>(
 	operation: (signal: AbortSignal) => Promise<T>,
 	options: RunWithTimeoutSignalOptions,

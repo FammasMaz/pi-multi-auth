@@ -31,7 +31,7 @@ import { buildKiloRequestHeaders } from "./kilo-compat.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { getCredentialRequestSecret } from "./credential-display.js";
-import { sleep } from "./async-utils.js";
+import { abortableSleep } from "./async-utils.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import { modelRequiresEntitlement } from "./model-entitlements.js";
 import {
@@ -41,6 +41,8 @@ import {
 } from "./provider-error-details.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { resolveDelegatedCredentialOverride } from "./runtime-context.js";
+import { computeExponentialBackoffMs } from "./balancer/credential-backoff.js";
+import { RetryBudget } from "./balancer/retry-budget.js";
 import type {
 	ProviderRegistrationMetadata,
 	SelectedCredential,
@@ -58,6 +60,12 @@ const SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS = 30_000;
 const MIN_SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS = 25;
 const BLAZEAPI_PROVIDER_ID = "blazeapi";
 const BLAZEAPI_REQUEST_LIMIT_MESSAGE_PATTERN = /request limit reached for your current plan/i;
+const PROVIDER_RETRY_BUDGET_WINDOW_MS = 60_000;
+const PROVIDER_RETRY_BUDGET_MAX_RETRIES = 100;
+const providerRetryBudget = new RetryBudget({
+	maxRetriesPerWindow: PROVIDER_RETRY_BUDGET_MAX_RETRIES,
+	windowMs: PROVIDER_RETRY_BUDGET_WINDOW_MS,
+});
 
 type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
 
@@ -639,6 +647,22 @@ function getAssistantOutputTokens(message: AssistantMessage): number | null {
 		: null;
 }
 
+function getAssistantTokenEstimate(message: AssistantMessage): number | undefined {
+	const totalTokens = message.usage.totalTokens;
+	if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
+		return totalTokens;
+	}
+
+	const components = [
+		message.usage.input,
+		message.usage.output,
+		message.usage.cacheRead,
+		message.usage.cacheWrite,
+	].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+	const sum = components.reduce((total, value) => total + value, 0);
+	return sum > 0 ? sum : undefined;
+}
+
 function isRetryableEmptyCompletion(
 	event: Extract<AssistantMessageEvent, { type: "done" }>,
 	hasForwardedSubstantiveEvent: boolean,
@@ -864,6 +888,13 @@ function resolveCredentialProviderId(
 	return providerFromModel.length > 0 ? providerFromModel : fallbackProvider;
 }
 
+function getJitteredBackoffMs(baseMs: number): number {
+	if (baseMs <= 0) {
+		return 0;
+	}
+	return Math.max(1, Math.round(baseMs * (0.5 + Math.random() * 0.5)));
+}
+
 function usageWindowHasRemainingCapacity(
 	window: { usedPercent: number } | null | undefined,
 ): boolean | null {
@@ -1071,6 +1102,11 @@ export function createRotatingStreamWrapper(
 
 			await refreshRotationAttemptLimit();
 			for (let attempt = 0; attempt < rotationAttemptLimit; attempt += 1) {
+				if (!providerRetryBudget.tryAcquire(activeProviderId)) {
+					throw new Error(
+						`Retry budget exhausted for ${activeProviderId}: ${PROVIDER_RETRY_BUDGET_MAX_RETRIES} rotation attempt(s) per ${Math.round(PROVIDER_RETRY_BUDGET_WINDOW_MS / 1000)}s window.`,
+					);
+				}
 				const delegatedCredentialOverride = resolveDelegatedCredentialOverride(activeProviderId);
 				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected: SelectedCredential;
@@ -1370,13 +1406,20 @@ export function createRotatingStreamWrapper(
 							// Wait past the recorded cooldown (capped) and re-acquire
 							// the same credential without marking it excluded so that
 							// transient errors auto-retry instead of bubbling up.
-							const waitMs = cooldownMs > 0
+							const backoffBaseMs = cooldownMs > 0
 								? Math.min(cooldownMs, SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS)
 								: MIN_SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS;
+							const backoffMs = computeExponentialBackoffMs(
+								backoffBaseMs,
+								transientAttempt + 1,
+								SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS,
+							);
+							const waitMs = getJitteredBackoffMs(backoffMs);
 							multiAuthDebugLogger.log("transient_retry_without_rotation", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
 								cooldownMs,
+								backoffMs,
 								waitMs,
 								attempt,
 								rotationAttemptLimit,
@@ -1384,11 +1427,12 @@ export function createRotatingStreamWrapper(
 							});
 							if (waitMs > 0) {
 								try {
-									await sleep(waitMs);
+									await abortableSleep(waitMs, options?.signal);
 								} catch (error: unknown) {
 									if (isCallerAbort(options?.signal, error)) {
 										return "fail";
 									}
+									throw error;
 								}
 							}
 							if (options?.signal?.aborted) {
@@ -1660,11 +1704,13 @@ export function createRotatingStreamWrapper(
 								stream.push(event);
 								if (event.type === "done") {
 									sawDoneEvent = true;
+									providerRetryBudget.recordSuccess(activeProviderId);
 									await accountManager.recordCredentialSuccess(
 										activeProviderId,
 										selected.credentialId,
 										Date.now() - requestStartedAt,
 										requestModel.id,
+										getAssistantTokenEstimate(event.message),
 									);
 									stream.end();
 									return;
@@ -1845,7 +1891,9 @@ export async function registerMultiAuthProviders(
 			? new Set(options.includeProviders)
 			: null;
 	const registry = accountManager.getProviderRegistry();
-	const providers = await registry.discoverProviderIds();
+	const providers = includeSet
+		? ([...includeSet] as SupportedProviderId[])
+		: await registry.discoverProviderIds();
 	const metadataToRegister = (
 		await Promise.all(
 			providers.map(async (provider) => {
