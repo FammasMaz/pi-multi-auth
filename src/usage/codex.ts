@@ -12,8 +12,8 @@ import type {
 
 const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_USAGE_USER_AGENT = "pi-multi-auth/0.1.0";
-const CODEX_USAGE_REQUEST_TIMEOUT_MS = 3_000;
-const CODEX_USAGE_RETRY_REQUEST_TIMEOUT_MS = 10_000;
+const CODEX_USAGE_REQUEST_TIMEOUT_MS = 8_000;
+const CODEX_USAGE_RETRY_REQUEST_TIMEOUT_MS = 15_000;
 const OPENAI_AUTH_CLAIM_KEY = "https://api.openai.com/auth";
 const MAX_CODEX_ACCOUNT_ID_CACHE_ENTRIES = 128;
 

@@ -10,9 +10,8 @@ import type { OAuthCredentials } from "./oauth-compat.js";
 
 export const OPENAI_CODEX_IMPORT_PROVIDER_ID = "openai-codex";
 
-const IMPORT_SOURCE_LABEL = "OpenAI Codex CPA/Sub2API JSON";
-const CSV_ACCESS_TOKEN_HEADER = "accesstoken";
-const CSV_REFRESH_TOKEN_HEADER = "refreshtoken";
+const IMPORT_SOURCE_LABEL = "OpenAI Codex OmniOnboard/CPA/Sub2API JSON";
+const CSV_ACCESS_TOKEN_HEADERS = new Set(["accesstoken", "primarytoken", "legacytoken", "token"]);
 const ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIGNATURE = 0x02014b50;
 const ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034b50;
 const ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054b50;
@@ -31,7 +30,7 @@ const inflateRawAsync = promisify(inflateRaw) as (buffer: Buffer) => Promise<Buf
 export type OpenAICodexImportFormat = "json" | "csv" | "zip";
 
 export type OpenAICodexImportCredential = OAuthCredentials & {
-	accountId: string;
+	accountId?: string;
 	email?: string;
 	clientId?: string;
 	idToken?: string;
@@ -151,8 +150,19 @@ function resolveImportedExpiration(record: Record<string, unknown>, accessToken:
 }
 
 function flattenCredentialRecord(record: Record<string, unknown>): Record<string, unknown> {
+	const providerSpecificData = isRecord(record.provider_specific_data)
+		? record.provider_specific_data
+		: isRecord(record.providerSpecificData)
+			? record.providerSpecificData
+			: undefined;
+	const tokens = isRecord(record.tokens) ? record.tokens : undefined;
 	const credentials = isRecord(record.credentials) ? record.credentials : undefined;
-	return credentials ? { ...record, ...credentials } : record;
+	return {
+		...(providerSpecificData ?? {}),
+		...record,
+		...(tokens ?? {}),
+		...(credentials ?? {}),
+	};
 }
 
 function toImportCredential(
@@ -160,14 +170,20 @@ function toImportCredential(
 	ordinal: number,
 ): { ok: true; credential: OpenAICodexImportCredential } | { ok: false; message: string } {
 	const flattened = flattenCredentialRecord(record);
-	const access = getStringField(flattened, ["access", "access_token", "accessToken", "token"]);
+	const access = getStringField(flattened, [
+		"access",
+		"access_token",
+		"accessToken",
+		"token",
+		"primary_token",
+		"primaryToken",
+		"legacy_token",
+		"legacyToken",
+	]);
 	const refresh = getStringField(flattened, ["refresh", "refresh_token", "refreshToken"]);
 
 	if (!access) {
 		return { ok: false, message: `Record #${ordinal} is missing access_token.` };
-	}
-	if (!refresh) {
-		return { ok: false, message: `Record #${ordinal} is missing refresh_token.` };
 	}
 
 	const accountId = getStringField(flattened, [
@@ -175,19 +191,15 @@ function toImportCredential(
 		"account_id",
 		"chatgptAccountId",
 		"chatgpt_account_id",
+		"userId",
+		"user_id",
 	]);
-	const email = getStringField(flattened, ["email", "name"]);
-	const identity = extractCodexCredentialIdentity({ access, accountId, email });
-	const resolvedAccountId = accountId ?? identity.accountId ?? undefined;
-	if (!resolvedAccountId) {
-		return {
-			ok: false,
-			message: `Record #${ordinal} is missing account_id and the access token did not contain a ChatGPT account identity.`,
-		};
-	}
-
+	const email = getStringField(flattened, ["email", "name", "username"]);
 	const clientId = getStringField(flattened, ["clientId", "client_id"]);
 	const idToken = getStringField(flattened, ["idToken", "id_token"]);
+	const identity = extractCodexCredentialIdentity({ access, accountId, email, idToken });
+	const resolvedAccountId = accountId ?? identity.accountId ?? undefined;
+
 	const sessionToken = getStringField(flattened, ["sessionToken", "session_token"]);
 	const workspaceId = getStringField(flattened, [
 		"workspaceId",
@@ -198,9 +210,9 @@ function toImportCredential(
 	const resolvedEmail = email ?? identity.email ?? undefined;
 	const credential: OpenAICodexImportCredential = {
 		access,
-		refresh,
+		refresh: refresh ?? "",
 		expires: resolveImportedExpiration(flattened, access),
-		accountId: resolvedAccountId,
+		...(resolvedAccountId && { accountId: resolvedAccountId }),
 		...(resolvedEmail && { email: resolvedEmail }),
 		...(clientId && { clientId }),
 		...(idToken && { idToken }),
@@ -224,14 +236,27 @@ function collectJsonCredentialRecords(value: unknown): Record<string, unknown>[]
 			return;
 		}
 
-		if (Array.isArray(item.accounts)) {
-			for (const account of item.accounts) {
+		const nestedAccounts = Array.isArray(item.accounts)
+			? item.accounts
+			: Array.isArray(item.items)
+				? item.items
+				: undefined;
+		if (nestedAccounts) {
+			for (const account of nestedAccounts) {
 				if (!isRecord(account)) {
 					continue;
 				}
-				const credentials = isRecord(account.credentials) ? account.credentials : {};
-				records.push({ ...account, ...credentials });
+				records.push(flattenCredentialRecord(account));
 			}
+			return;
+		}
+
+		const providers = isRecord(item.providers) ? item.providers : undefined;
+		const chatgptConfig = providers
+			? getRecordField(providers, ["chatgptConfig", "chatgpt_config", "openai", "chatgpt"])
+			: undefined;
+		if (isRecord(chatgptConfig)) {
+			records.push(flattenCredentialRecord({ ...item, ...chatgptConfig }));
 			return;
 		}
 
@@ -292,8 +317,7 @@ function csvRowsToRecords(rows: string[][]): { records: Record<string, unknown>[
 	}
 
 	const headers = nonEmptyRows[0]?.map((header) => header.replace(/^\uFEFF/, "").trim()) ?? [];
-	const normalizedHeaders = new Set(headers.map(normalizeRecordKey));
-	if (!normalizedHeaders.has(CSV_ACCESS_TOKEN_HEADER) || !normalizedHeaders.has(CSV_REFRESH_TOKEN_HEADER)) {
+	if (!headers.some((header) => CSV_ACCESS_TOKEN_HEADERS.has(normalizeRecordKey(header)))) {
 		return null;
 	}
 
@@ -326,7 +350,7 @@ function buildCredentialDeduplicationKey(credential: OpenAICodexImportCredential
 	if (identity.email) {
 		return `email:${identity.email.toLowerCase()}`;
 	}
-	return `refresh:${credential.refresh}`;
+	return credential.refresh ? `refresh:${credential.refresh}` : `access:${credential.access}`;
 }
 
 function buildParsedImport(
@@ -361,7 +385,7 @@ function buildParsedImport(
 			: "";
 		return {
 			ok: false,
-			message: `No importable OpenAI Codex credentials found. Paste a ${IMPORT_SOURCE_LABEL} JSON or CSV export with access_token and refresh_token.${invalidHint}`,
+			message: `No importable OpenAI Codex credentials found. Paste a ${IMPORT_SOURCE_LABEL} JSON or CSV export with access_token.${invalidHint}`,
 		};
 	}
 
