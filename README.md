@@ -12,6 +12,7 @@
 ## Capabilities
 
 - Wraps discovered Pi providers with multi-account rotation, quota-aware cooldowns, failover, health scoring, and optional pool selection.
+- Automatically passes through providers owned by other extensions when they share a wrapped API but are not registered for multi-auth rotation, preserving their native auth handling.
 - Supports OAuth credential management for providers exposed by Pi and registers first-class Cline and Kilo OAuth login and refresh handling.
 - Applies per-credential request overrides for provider base URLs and headers, with Cloudflare Workers AI credentials using account-scoped OpenAI-compatible base URLs and token/account discovery during credential setup.
 - Enriches status-only provider failures with bounded diagnostic probes so authentication, permission, billing, and rate-limit errors include actionable provider response details when available.
@@ -71,7 +72,7 @@ Runtime configuration lives in `config.json` at the extension root. The extensio
 | Key | Type | Default | Purpose |
 |-----|------|---------|---------|
 | `debug` | `boolean` | `false` | Enables JSONL debug logging under `debug/pi-multi-auth-debug.jsonl` |
-| `excludeProviders` | `string[]` | `[]` | Prevents selected providers from being wrapped by multi-auth |
+| `excludeProviders` | `string[]` | `[]` | Prevents selected providers from being wrapped by multi-auth; providers not discovered by multi-auth are also passed through automatically |
 | `cascade` | `object` | built-in defaults | Tunes retry backoff and retained failure history |
 | `health` | `object` | built-in defaults | Tunes rolling health windows and scoring weights |
 | `historyPersistence` | `object` | built-in defaults | Controls extracted health and cascade history file names under `debug/` |

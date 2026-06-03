@@ -718,6 +718,22 @@ function resolveCredentialProviderId(
 	return providerFromModel.length > 0 ? providerFromModel : fallbackProvider;
 }
 
+type ProviderPassthroughReason = "excluded" | "unmanaged_provider";
+
+function resolveProviderPassthroughReason(
+	provider: SupportedProviderId,
+	excludedProviders?: ReadonlySet<string>,
+	managedProviders?: ReadonlySet<string>,
+): ProviderPassthroughReason | null {
+	if (excludedProviders?.has(provider)) {
+		return "excluded";
+	}
+	if (managedProviders && !managedProviders.has(provider)) {
+		return "unmanaged_provider";
+	}
+	return null;
+}
+
 async function resolveRotationAttemptLimit(
 	accountManager: AccountManager,
 	providerId: SupportedProviderId,
@@ -745,6 +761,7 @@ export function createRotatingStreamWrapper(
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
 	excludedProviders?: ReadonlySet<string>,
+	managedProviders?: ReadonlySet<string>,
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -786,11 +803,17 @@ export function createRotatingStreamWrapper(
 				stream.end(assistantAbort.error);
 			};
 
-			if (excludedProviders?.has(activeProviderId)) {
-				multiAuthDebugLogger.log("provider_excluded_passthrough", {
+			const passthroughReason = resolveProviderPassthroughReason(
+				activeProviderId,
+				excludedProviders,
+				managedProviders,
+			);
+			if (passthroughReason) {
+				multiAuthDebugLogger.log("provider_passthrough", {
 					provider: activeProviderId,
 					model: activeModel.id,
 					api: activeModel.api,
+					reason: passthroughReason,
 				});
 				try {
 					const innerStream = activeBaseProvider.streamSimple(activeModel, context, {
@@ -1440,6 +1463,8 @@ export async function registerMultiAuthProviders(
 		recordProviderDiscovery(metadata.provider);
 	}
 
+	const managedProviders = new Set(metadataToRegister.map((metadata) => metadata.provider));
+
 	// Auto-seed API keys from models.json into auth.json for custom providers
 	// that have an apiKey defined but no credentials stored yet.
 	for (const metadata of metadataToRegister) {
@@ -1509,6 +1534,7 @@ export async function registerMultiAuthProviders(
 			baseProvider,
 			baseProvidersByApi,
 			excludeSet,
+			managedProviders,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

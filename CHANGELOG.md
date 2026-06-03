@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- Passed through unmanaged providers that share a wrapped API, preventing multi-auth credential rotation from intercepting auth owned by other extensions such as `grok-cli`.
+
 ## 0.7.0 - 2026-05-04
 
 ### Added
