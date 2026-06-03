@@ -16,6 +16,7 @@ import {
 import {
 	isPlanEligibleForModel,
 	modelPrefersFreePlan,
+	modelPrefersPaidPlan,
 	modelRequiresEntitlement,
 	normalizeCodexPlanType,
 } from "../src/model-entitlements.js";
@@ -149,34 +150,40 @@ test("codex plan normalization recognizes paid-plan labels for restricted models
 	assert.equal(isPlanEligibleForModel("enterprise"), true);
 	assert.equal(isPlanEligibleForModel("free"), false);
 	assert.equal(isPlanEligibleForModel("unknown"), false);
-	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
+	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), false);
+	assert.equal(modelPrefersPaidPlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
+	assert.equal(modelPrefersPaidPlan(CODEX_PROVIDER_ID, undefined), true);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.4"), false);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.5"), false);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.3-codex"), true);
 });
 
-test("account manager preserves current selection for unconstrained codex requests", async (t) => {
-	const accountManager = await createCodexAccountManager(t, [
+test("account manager prioritizes paid codex credentials for unconstrained requests", async (t) => {
+	const credentials = [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
-	]);
+	] as const;
+	const accountManager = await createCodexAccountManager(t, credentials);
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
-	assert.equal(selected.credentialId, "openai-codex");
+	assert.equal(selected.credentialId, "openai-codex-1");
 	assert.equal(selected.provider, CODEX_PROVIDER_ID);
 });
 
-test("account manager prefers free codex credentials for free-eligible models", async (t) => {
-	const accountManager = await createCodexAccountManager(t, [
+test("account manager prioritizes paid codex credentials for free-eligible models", async (t) => {
+	const credentials = [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
 		{ credentialId: "openai-codex-2", secret: "sk-pro-key", planType: "pro" },
-	]);
+	] as const;
+	const accountManager = await createCodexAccountManager(t, credentials);
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5.4",
 	});
-	assert.equal(selected.credentialId, "openai-codex");
+	assert.equal(selected.credentialId, "openai-codex-1");
 });
 
 test("account manager reuses codex model routing usage lookups across repeated selections", async (t) => {
@@ -263,6 +270,21 @@ test("account manager falls back to paid codex credentials when free usage is ex
 	});
 	assert.equal(selected.credentialId, "openai-codex-1");
 });
+
+test("account manager falls back to free codex credentials when paid usage is exhausted", async (t) => {
+	const credentials = [
+		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free", primaryUsedPercent: 10 },
+		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus", primaryUsedPercent: 100 },
+	] as const;
+	const accountManager = await createCodexAccountManager(t, credentials);
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
+		modelId: "gpt-5.4",
+	});
+	assert.equal(selected.credentialId, "openai-codex");
+});
+
 
 test("account manager skips free codex credentials for paid-only models", async (t) => {
 	const accountManager = await createCodexAccountManager(t, [

@@ -933,28 +933,56 @@ export class KeyDistributor {
 			return available.has(manualCredentialId) ? manualCredentialId : null;
 		}
 
-		switch (snapshot.providerState.rotationMode) {
-			case "round-robin": {
-				const selectedIndex = getRoundRobinCandidateIndex(snapshot.providerState, available);
-				return selectedIndex === undefined
-					? null
-					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
+		const preferredAvailable = context.preferredIds && context.preferredIds.length > 0
+			? new Set(context.preferredIds.filter((credentialId) => available.has(credentialId)))
+			: null;
+		const selectionPasses = preferredAvailable && preferredAvailable.size > 0
+			? [preferredAvailable, available]
+			: [available];
+
+		for (const selectionAvailable of selectionPasses) {
+			switch (snapshot.providerState.rotationMode) {
+				case "round-robin": {
+					const selectedIndex = getRoundRobinCandidateIndex(snapshot.providerState, selectionAvailable);
+					if (selectedIndex !== undefined) {
+						return snapshot.providerState.credentialIds[selectedIndex] ?? null;
+					}
+					break;
+				}
+				case "usage-based": {
+					const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, selectionAvailable);
+					if (selectedIndex !== undefined) {
+						return snapshot.providerState.credentialIds[selectedIndex] ?? null;
+					}
+					break;
+				}
+				case "balancer":
+				default: {
+					const selectionExcludedIds = new Set(context.excludedIds);
+					for (const credentialId of snapshot.credentialIds) {
+						if (!selectionAvailable.has(credentialId)) {
+							selectionExcludedIds.add(credentialId);
+						}
+					}
+					const selectedCredentialId = selectBestCredential(
+						{ ...context, excludedIds: [...selectionExcludedIds] },
+						snapshot,
+						{
+							waitTimeoutMs: this.config.waitTimeoutMs,
+							defaultCooldownMs: this.config.defaultCooldownMs,
+							maxConcurrentPerKey: this.config.maxConcurrentPerKey,
+							tolerance: this.config.tolerance,
+						},
+					);
+					if (selectedCredentialId) {
+						return selectedCredentialId;
+					}
+					break;
+				}
 			}
-			case "usage-based": {
-				const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, available);
-				return selectedIndex === undefined
-					? null
-					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
-			}
-			case "balancer":
-			default:
-				return selectBestCredential(context, snapshot, {
-					waitTimeoutMs: this.config.waitTimeoutMs,
-					defaultCooldownMs: this.config.defaultCooldownMs,
-					maxConcurrentPerKey: this.config.maxConcurrentPerKey,
-					tolerance: this.config.tolerance,
-				});
 		}
+
+		return null;
 	}
 
 	private resolveNextActiveIndex(
@@ -1120,9 +1148,14 @@ export class KeyDistributor {
 			excludedIds.add(credentialId);
 		}
 
+		const eligibleIds = new Set(eligibility.eligibleCredentialIds);
+		const preferredIds = eligibility.preferredCredentialIds
+			?.filter((credentialId) => eligibleIds.has(credentialId) && !excludedIds.has(credentialId));
+
 		return {
 			...context,
 			excludedIds: [...excludedIds],
+			preferredIds: preferredIds && preferredIds.length > 0 ? preferredIds : context.preferredIds,
 		};
 	}
 

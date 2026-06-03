@@ -58,7 +58,7 @@ import {
 	type CredentialModelEligibility,
 	formatModelReference,
 	isPlanEligibleForModel,
-	modelPrefersFreePlan,
+	modelPrefersPaidPlan,
 	modelRequiresEntitlement,
 	normalizeCodexPlanType,
 	normalizeModelId,
@@ -5385,7 +5385,7 @@ export class AccountManager {
 		credentialIds: readonly string[],
 		normalizedModelId: string | undefined,
 		requiresEntitlement: boolean,
-		prefersFreePlan: boolean,
+		prefersPaidPlan: boolean,
 		usageContext: CredentialUsageContext | undefined,
 		signal: AbortSignal | undefined,
 	): Promise<CredentialModelEligibility> {
@@ -5481,7 +5481,7 @@ export class AccountManager {
 			}
 
 			pushUnique(verifiedEligibleCredentialIds, credentialId);
-			if (prefersFreePlan && planType === "free") {
+			if (prefersPaidPlan && isPlanEligibleForModel(planType)) {
 				pushUnique(preferredCredentialIds, credentialId);
 			}
 		};
@@ -5506,7 +5506,7 @@ export class AccountManager {
 				? normalizeCodexPlanType(usage.snapshot.planType)
 				: "unknown";
 			if (
-				requiresEntitlement &&
+				(requiresEntitlement || prefersPaidPlan) &&
 				!usage?.error &&
 				(!hasPlanEvidence || planType === "unknown")
 			) {
@@ -5517,8 +5517,10 @@ export class AccountManager {
 
 		let bootstrapPerformed = false;
 		let synchronousFetchCount = 0;
+		const shouldBootstrapPaidPreference =
+			!requiresEntitlement && prefersPaidPlan && preferredCredentialIds.length === 0;
 		const bootstrapCredentialIds =
-			requiresEntitlement && verifiedEligibleCredentialIds.length === 0
+			(requiresEntitlement && verifiedEligibleCredentialIds.length === 0) || shouldBootstrapPaidPreference
 				? [...bootstrapCandidateCredentialIds]
 				: [];
 
@@ -5556,12 +5558,17 @@ export class AccountManager {
 					const usageResult = usageResults[index];
 					if (usageResult?.status === "fulfilled") {
 						processUsage(credentialId, usageResult.value);
-					} else {
+					} else if (requiresEntitlement) {
 						pushUnique(usageFailureCredentialIds, credentialId);
 						hasUsageFailure = true;
+					} else {
+						pushUnique(verifiedEligibleCredentialIds, credentialId);
 					}
 				}
-				if (verifiedEligibleCredentialIds.length >= 1) {
+				if (
+					(requiresEntitlement && verifiedEligibleCredentialIds.length >= 1) ||
+					(shouldBootstrapPaidPreference && preferredCredentialIds.length >= 1)
+				) {
 					break;
 				}
 			}
@@ -5659,8 +5666,8 @@ export class AccountManager {
 		);
 		const normalizedModelId = normalizeModelId(modelId) ?? undefined;
 		const requiresEntitlement = modelRequiresEntitlement(provider, normalizedModelId);
-		const prefersFreePlan = modelPrefersFreePlan(provider, normalizedModelId);
-		if (!requiresEntitlement && !prefersFreePlan) {
+		const prefersPaidPlan = modelPrefersPaidPlan(provider, normalizedModelId);
+		if (!requiresEntitlement && !prefersPaidPlan) {
 			return {
 				appliesConstraint: false,
 				eligibleCredentialIds: [...credentialIds],
@@ -5674,7 +5681,7 @@ export class AccountManager {
 				credentialIds,
 				normalizedModelId,
 				requiresEntitlement,
-				prefersFreePlan,
+				prefersPaidPlan,
 				usageContext,
 				effectiveSignal,
 			);
@@ -5776,7 +5783,7 @@ export class AccountManager {
 				}
 
 				verifiedEligibleCredentialIds.push(credentialId);
-				if (prefersFreePlan && planType === "free") {
+				if (prefersPaidPlan && isPlanEligibleForModel(planType)) {
 					preferredCredentialIds.push(credentialId);
 				}
 			}

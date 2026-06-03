@@ -38,6 +38,7 @@ export interface SelectionContext {
 	excludedIds: readonly string[];
 	requestingSessionId: string;
 	modelId?: string;
+	preferredIds?: readonly string[];
 }
 
 export interface DelegatedCredentialRequest {

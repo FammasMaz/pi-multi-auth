@@ -69,10 +69,6 @@ export function formatModelReference(
 	return `${normalizeProviderId(providerId)}/${modelId}`;
 }
 
-function isCodexGptModel(normalizedModelId: string): boolean {
-	return normalizedModelId.startsWith("gpt-");
-}
-
 function isCodexFreeBlockedModel(normalizedModelId: string): boolean {
 	return (
 		OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS.has(normalizedModelId) ||
@@ -128,19 +124,23 @@ export function modelRequiresEntitlement(
 
 /**
  * Indicates whether eligible free Codex credentials should be prioritized for a model.
+ * Free accounts are fallback-only, so this is intentionally disabled.
  */
 export function modelPrefersFreePlan(
-	providerId: SupportedProviderId,
-	modelId: string | undefined,
+	_providerId: SupportedProviderId,
+	_modelId: string | undefined,
 ): boolean {
-	if (normalizeProviderId(providerId) !== "openai-codex") {
-		return false;
-	}
+	return false;
+}
 
-	const normalizedModelId = normalizeModelId(modelId);
-	return normalizedModelId !== null &&
-		isCodexGptModel(normalizedModelId) &&
-		!isCodexFreeBlockedModel(normalizedModelId);
+/**
+ * Indicates whether eligible paid Codex credentials should be prioritized.
+ */
+export function modelPrefersPaidPlan(
+	providerId: SupportedProviderId,
+	_modelId: string | undefined,
+): boolean {
+	return normalizeProviderId(providerId) === "openai-codex";
 }
 
 /**

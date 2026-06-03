@@ -243,6 +243,60 @@ test("KeyDistributor accepts delegated credential request objects and preserves 
 	}
 });
 
+test("KeyDistributor prioritizes preferred model credentials before fallback", async () => {
+	const providerId = "openai-codex";
+	const credentialIds = ["codex-free-credential", "codex-paid-credential"] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-preferred-routing-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+
+	try {
+		distributor.setModelEligibilityResolver((currentProviderId, ids, modelId) => ({
+			appliesConstraint: currentProviderId === providerId && modelId === "gpt-5.4",
+			eligibleCredentialIds: ids,
+			ineligibleCredentialIds: [],
+			preferredCredentialIds: ids.slice(1),
+		}));
+		await authWriter.setApiKeyCredential(credentialIds[0], "free-plan-key");
+		await authWriter.setApiKeyCredential(credentialIds[1], "paid-plan-key");
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "round-robin";
+			providerState.activeIndex = 0;
+			return { result: undefined, next: state };
+		});
+
+		const paidLease = await distributor.acquireForSubagent("preferred-child-1", providerId, {
+			modelId: "gpt-5.4",
+		});
+		assert.equal(paidLease.credentialId, credentialIds[1]);
+		distributor.releaseFromSubagent("preferred-child-1");
+
+		await distributor.applyCooldown(
+			credentialIds[1],
+			60_000,
+			"quota-exhausted",
+			providerId,
+		);
+
+		const fallbackLease = await distributor.acquireForSubagent("preferred-child-2", providerId, {
+			modelId: "gpt-5.4",
+		});
+		assert.equal(fallbackLease.credentialId, credentialIds[0]);
+		distributor.releaseFromSubagent("preferred-child-2");
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+
 test("KeyDistributor exposes redacted delegated routing capabilities", async () => {
 	const providerId = "openai-codex";
 	const credentialIds = ["codex-free-credential", "codex-paid-credential"] as const;
