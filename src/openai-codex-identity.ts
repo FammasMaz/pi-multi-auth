@@ -14,6 +14,7 @@ export interface CodexCredentialIdentity {
 	accountUserId: string | null;
 	email: string | null;
 	accountId: string | null;
+	planType: string | null;
 }
 
 
@@ -72,5 +73,6 @@ export function extractCodexCredentialIdentity(
 			asNonEmptyString(credential.accountId) ??
 			asNonEmptyString(authClaim?.chatgpt_account_id) ??
 			asNonEmptyString(idTokenPayload?.chatgpt_account_id),
+		planType: asNonEmptyString(authClaim?.chatgpt_plan_type),
 	};
 }

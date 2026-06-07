@@ -55,6 +55,7 @@ import {
 	summarizeCodexAggregateCredits,
 	type CodexAggregateCreditUsage,
 } from "./usage/codex.js";
+import { normalizeCodexPlanType, isPlanEligibleForModel } from "./model-entitlements.js";
 import type { UsageSnapshot } from "./usage/types.js";
 
 interface ThemeLike {
@@ -456,6 +457,71 @@ function getPlanHighlightColor(planType: string | null | undefined): PlanHighlig
 function formatPlanDetailLabel(planType: string | null | undefined, displayOnly: boolean): string {
 	const label = normalizePlanLabel(planType);
 	return displayOnly ? `${label} (last known)` : label;
+}
+
+export type PlanFilterMode = "all" | "paid" | "free";
+
+const PLAN_FILTER_SEQUENCE: readonly PlanFilterMode[] = ["all", "paid", "free"];
+
+function formatPlanFilterLabel(mode: PlanFilterMode): string {
+	switch (mode) {
+		case "paid":
+			return "Plus/Paid";
+		case "free":
+			return "Free";
+		default:
+			return "All";
+	}
+}
+
+/**
+ * Resolves the best-known plan label for a credential, preferring the live usage
+ * snapshot and falling back to the plan tier decoded from the credential token.
+ */
+export function resolveCredentialPlanLabel(credential: CredentialStatus): string | null {
+	const snapshotPlan = normalizeInlineText(credential.usageSnapshot?.planType ?? "").trim();
+	if (snapshotPlan) {
+		return snapshotPlan;
+	}
+	const tier = normalizeInlineText(credential.planTier ?? "").trim();
+	return tier || null;
+}
+
+/**
+ * Classifies a credential as a paid or free plan, returning null when the plan is unknown.
+ */
+export function classifyCredentialPlanTier(
+	credential: CredentialStatus,
+): "paid" | "free" | null {
+	const planLabel = resolveCredentialPlanLabel(credential);
+	if (!planLabel) {
+		return null;
+	}
+	const normalized = normalizeCodexPlanType(planLabel);
+	if (normalized === "unknown") {
+		return null;
+	}
+	return isPlanEligibleForModel(normalized) ? "paid" : "free";
+}
+
+/**
+ * Filters credentials by plan filter mode. Unknown-plan credentials are always shown
+ * so they remain discoverable while their plan tier is still being resolved.
+ */
+export function filterCredentialsByPlan(
+	credentials: readonly CredentialStatus[],
+	mode: PlanFilterMode,
+): CredentialStatus[] {
+	if (mode === "all") {
+		return [...credentials];
+	}
+	return credentials.filter((credential) => {
+		const tier = classifyCredentialPlanTier(credential);
+		if (tier === null) {
+			return true;
+		}
+		return mode === "paid" ? tier === "paid" : tier === "free";
+	});
 }
 
 function resolveAccountColumnWidths(contentWidth: number): AccountColumnWidths | null {
@@ -920,6 +986,7 @@ class MultiAuthManagerModal {
 	private readonly hiddenProviders: Set<SupportedProviderId>;
 	private showHiddenProviders = false;
 	private showDisabledAccounts = false;
+	private planFilterMode: PlanFilterMode = "all";
 
 	constructor(
 		private readonly ctx: ExtensionCommandContext,
@@ -1040,6 +1107,9 @@ class MultiAuthManagerModal {
 				selectedProviderStatus !== null && this.getBatchSelectedCredentialIds(selectedProviderStatus).length > 0,
 			selectedAccountMarked:
 				selectedProviderStatus !== null && this.isSelectedAccountMarked(selectedProviderStatus),
+			supportsPlanFilter:
+				selectedProviderStatus !== null && this.providerSupportsPlanFilter(selectedProviderStatus),
+			planFilterLabel: formatPlanFilterLabel(this.planFilterMode),
 		});
 		const wrapped = renderWrappedFooterActions(actions, lineWidth);
 		if (wrapped.length === 0) {
@@ -1061,6 +1131,11 @@ class MultiAuthManagerModal {
 
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done();
+			return;
+		}
+
+		if (matchesKey(data, "tab")) {
+			this.cyclePlanFilter();
 			return;
 		}
 
@@ -1184,7 +1259,11 @@ class MultiAuthManagerModal {
 		const accountCountLabel = selectedProviderStatus
 			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
 			: "0";
-		const accountTitleText = `Accounts: ${accountProviderLabel} (${accountCountLabel})`;
+		const planFilterSuffix =
+			selectedProviderStatus && this.providerSupportsPlanFilter(selectedProviderStatus)
+				? ` [${formatPlanFilterLabel(this.planFilterMode)}]`
+				: "";
+		const accountTitleText = `Accounts: ${accountProviderLabel} (${accountCountLabel})${planFilterSuffix}`;
 		const accountHeaderCell = renderGridCell(accountTitleText, widths.accounts);
 		const detailsHeaderCell = renderGridCell("Account Details", widths.details);
 		const providerTitle =
@@ -1247,7 +1326,11 @@ class MultiAuthManagerModal {
 		const accountCountLabel = selectedProviderStatus
 			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
 			: "0";
-		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${accountCountLabel})`));
+		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${accountCountLabel})${
+			selectedProviderStatus && this.providerSupportsPlanFilter(selectedProviderStatus)
+				? ` [${formatPlanFilterLabel(this.planFilterMode)}]`
+				: ""
+		}`));
 		for (const line of this.buildAccountsPaneLines(selectedProviderStatus, width)) {
 			rows.push(line);
 		}
@@ -1313,7 +1396,7 @@ class MultiAuthManagerModal {
 		const statusCell = this.getAccountStatusCell(credential);
 		const alias = this.colorizePlanText(
 			padRight(getCredentialAlias(credential), columnWidths.alias),
-			credential.usageSnapshot?.planType,
+			resolveCredentialPlanLabel(credential),
 		);
 		const accountLines = wrapAccountDisplayNameLines(
 			getCredentialAccountLabel(credential),
@@ -1339,7 +1422,7 @@ class MultiAuthManagerModal {
 		const cursor = isSelected ? "▶" : " ";
 		const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
 		const statusCell = this.getAccountStatusCell(credential);
-		const alias = this.colorizePlanText(getCredentialAlias(credential), credential.usageSnapshot?.planType);
+		const alias = this.colorizePlanText(getCredentialAlias(credential), resolveCredentialPlanLabel(credential));
 		const prefix = `${cursor} ${activeMarker} ${statusCell} ${alias}`;
 		const accountWidth = Math.max(1, contentWidth - visibleWidth(prefix) - 1);
 		const accountLines = wrapAccountDisplayNameLines(getCredentialAccountLabel(credential), accountWidth);
@@ -1363,6 +1446,17 @@ class MultiAuthManagerModal {
 		const contentWidth = Math.max(1, getPaneContentWidth(columnWidth));
 		const selectedEntryIndex = this.getSelectedEntryIndex(status);
 		const lines: string[] = [];
+		if (
+			visibleCredentials.length === 0 &&
+			this.providerSupportsPlanFilter(status) &&
+			this.planFilterMode !== "all" &&
+			status.credentials.length > 0
+		) {
+			lines.push(
+				padRight(`No ${formatPlanFilterLabel(this.planFilterMode)} accounts.`, contentWidth),
+				padRight("Press [Tab] to change the plan filter.", contentWidth),
+			);
+		}
 		for (const [index, credential] of visibleCredentials.entries()) {
 			lines.push(
 				...this.buildAccountEntryLines(
@@ -1390,6 +1484,14 @@ class MultiAuthManagerModal {
 		const selectedEntryIndex = this.getSelectedEntryIndex(status);
 		const contentWidth = Math.max(1, getPaneContentWidth(columnWidth));
 		let lineIndex = 0;
+		if (
+			visibleCredentials.length === 0 &&
+			this.providerSupportsPlanFilter(status) &&
+			this.planFilterMode !== "all" &&
+			status.credentials.length > 0
+		) {
+			lineIndex += 2;
+		}
 		for (const [index, credential] of visibleCredentials.entries()) {
 			if (index === selectedEntryIndex) {
 				return lineIndex;
@@ -1457,7 +1559,8 @@ class MultiAuthManagerModal {
 		const selectedCredential = selectedEntry.credential;
 		const batchSelectionCount = this.getBatchSelectedCredentialIds(status).length;
 		const state = this.getCredentialState(selectedCredential);
-		const planType = selectedCredential.usageSnapshot?.planType;
+		const planType =
+			selectedCredential.usageSnapshot?.planType ?? selectedCredential.planTier ?? null;
 		const planLabel = this.colorizePlanText(
 			formatPlanDetailLabel(planType, Boolean(selectedCredential.usageSnapshotDisplayOnly)),
 			planType,
@@ -1848,6 +1951,28 @@ class MultiAuthManagerModal {
 		this.infoMessage = this.showDisabledAccounts
 			? "Showing disabled accounts."
 			: "Hiding disabled accounts.";
+		this.requestRender();
+	}
+
+	private providerSupportsPlanFilter(status: ProviderStatus): boolean {
+		return status.provider === "openai-codex";
+	}
+
+	private cyclePlanFilter(): void {
+		const status = this.getSelectedProviderStatus();
+		if (!status || !this.providerSupportsPlanFilter(status)) {
+			this.ctx.ui.notify("Plan filter is only available for openai-codex.", "warning");
+			return;
+		}
+
+		const currentIndex = PLAN_FILTER_SEQUENCE.indexOf(this.planFilterMode);
+		const nextMode = PLAN_FILTER_SEQUENCE[(currentIndex + 1) % PLAN_FILTER_SEQUENCE.length];
+		this.planFilterMode = nextMode;
+		this.syncSelectionState(this.selectedProviderId ?? undefined);
+		this.infoMessage =
+			nextMode === "all"
+				? "Showing all plans."
+				: `Showing ${formatPlanFilterLabel(nextMode)} accounts only.`;
 		this.requestRender();
 	}
 
@@ -2591,10 +2716,13 @@ class MultiAuthManagerModal {
 	}
 
 	private getVisibleCredentials(status: ProviderStatus): CredentialStatus[] {
-		if (this.showDisabledAccounts) {
-			return status.credentials;
+		const base = this.showDisabledAccounts
+			? status.credentials
+			: status.credentials.filter((credential) => !credential.disabledError);
+		if (!this.providerSupportsPlanFilter(status) || this.planFilterMode === "all") {
+			return base;
 		}
-		return status.credentials.filter((credential) => !credential.disabledError);
+		return filterCredentialsByPlan(base, this.planFilterMode);
 	}
 
 	private getBatchSelectedCredentialIdSet(status: ProviderStatus): Set<string> {

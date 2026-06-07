@@ -21,6 +21,10 @@ export interface FooterActionOptions {
 	showDisabledAccounts: boolean;
 	hasBatchSelection: boolean;
 	selectedAccountMarked: boolean;
+	/** Whether the selected provider exposes plan tiers (free vs paid) that can be filtered. */
+	supportsPlanFilter?: boolean;
+	/** Current plan filter label shown in the [Tab] footer action. */
+	planFilterLabel?: string;
 }
 
 export interface ProviderVisibilitySummary<TStatus extends ProviderLike = ProviderLike> {
@@ -106,6 +110,9 @@ export function resolveFooterActions(options: FooterActionOptions): string[] {
 
 	const actions: string[] = [];
 	const appendCommonActions = (): void => {
+		if (options.supportsPlanFilter) {
+			actions.push(`[Tab] Plan: ${options.planFilterLabel ?? "All"}`);
+		}
 		if (options.hasHiddenProviders || options.showHiddenProviders) {
 			actions.push(
 				options.showHiddenProviders ? "[v] Hide Hidden/Empty" : "[v] Show Hidden/Empty",

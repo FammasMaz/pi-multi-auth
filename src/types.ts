@@ -156,6 +156,8 @@ export interface CredentialStatus {
 	usageSnapshotDisplayOnly?: boolean;
 	usageFetchError?: string;
 	disabledError?: string;
+	/** Plan tier label decoded from the credential token (e.g. "plus", "free", "team"). */
+	planTier?: string;
 }
 
 /** Readable provider status for command output. */

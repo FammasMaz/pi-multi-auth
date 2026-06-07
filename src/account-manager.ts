@@ -4350,6 +4350,10 @@ export class AccountManager {
 				: null;
 			const disabledError = state.disabledCredentials?.[credentialId]?.error;
 			const lastQuotaError = state.lastQuotaError?.[credentialId];
+			const planTier =
+				provider === OPENAI_CODEX_PROVIDER_ID && credential.type === "oauth"
+					? extractCodexCredentialIdentity(credential).planType ?? undefined
+					: undefined;
 
 			credentials.push({
 				credentialId,
@@ -4376,6 +4380,7 @@ export class AccountManager {
 				usageSnapshotDisplayOnly: usage?.displayOnly,
 				usageFetchError: usage?.error ?? undefined,
 				disabledError,
+				...(planTier ? { planTier } : {}),
 			});
 		}
 
