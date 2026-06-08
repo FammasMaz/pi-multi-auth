@@ -88,6 +88,29 @@ type ModelEligibilityResolver = (
 	signal?: AbortSignal,
 ) => Promise<CredentialModelEligibility> | CredentialModelEligibility;
 
+function buildSelectionPasses(
+	available: ReadonlySet<string>,
+	preferredIdGroups?: readonly (readonly string[])[],
+	preferredIds?: readonly string[],
+): Set<string>[] {
+	const priorityGroups = preferredIdGroups
+		?.map((group) => new Set(group.filter((credentialId) => available.has(credentialId))))
+		.filter((group) => group.size > 0);
+	if (priorityGroups && priorityGroups.length > 0) {
+		const coveredCredentialIds = new Set(priorityGroups.flatMap((group) => [...group]));
+		return coveredCredentialIds.size >= available.size
+			? priorityGroups
+			: [...priorityGroups, new Set(available)];
+	}
+
+	const preferredAvailable = preferredIds && preferredIds.length > 0
+		? new Set(preferredIds.filter((credentialId) => available.has(credentialId)))
+		: null;
+	return preferredAvailable && preferredAvailable.size > 0
+		? [preferredAvailable, new Set(available)]
+		: [new Set(available)];
+}
+
 /**
  * Balancer service that coordinates credential leases, cooldowns, and weighted key selection.
  */
@@ -933,12 +956,11 @@ export class KeyDistributor {
 			return available.has(manualCredentialId) ? manualCredentialId : null;
 		}
 
-		const preferredAvailable = context.preferredIds && context.preferredIds.length > 0
-			? new Set(context.preferredIds.filter((credentialId) => available.has(credentialId)))
-			: null;
-		const selectionPasses = preferredAvailable && preferredAvailable.size > 0
-			? [preferredAvailable, available]
-			: [available];
+		const selectionPasses = buildSelectionPasses(
+			available,
+			context.preferredIdGroups,
+			context.preferredIds,
+		);
 
 		for (const selectionAvailable of selectionPasses) {
 			switch (snapshot.providerState.rotationMode) {
@@ -1151,11 +1173,19 @@ export class KeyDistributor {
 		const eligibleIds = new Set(eligibility.eligibleCredentialIds);
 		const preferredIds = eligibility.preferredCredentialIds
 			?.filter((credentialId) => eligibleIds.has(credentialId) && !excludedIds.has(credentialId));
+		const preferredIdGroups = eligibility.credentialPriorityGroups
+			?.map((group) =>
+				group.filter((credentialId) => eligibleIds.has(credentialId) && !excludedIds.has(credentialId)),
+			)
+			.filter((group) => group.length > 0);
 
 		return {
 			...context,
 			excludedIds: [...excludedIds],
 			preferredIds: preferredIds && preferredIds.length > 0 ? preferredIds : context.preferredIds,
+			preferredIdGroups: preferredIdGroups && preferredIdGroups.length > 0
+				? preferredIdGroups
+				: context.preferredIdGroups,
 		};
 	}
 

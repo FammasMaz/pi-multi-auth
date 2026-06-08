@@ -1,3 +1,7 @@
+import {
+	isAccountBannedOrRevokedError,
+	isRotationSummaryError,
+} from "./credential-disable-policy.js";
 import { quotaClassifier } from "./quota-classifier.js";
 import type { QuotaClassification, QuotaWindow, RecoveryAction } from "./types-quota.js";
 
@@ -50,7 +54,7 @@ const AUTH_TOKEN_INVALIDATED_PATTERNS: RegExp[] = [
 	/(?:auth(?:entication)?|access|oauth)\s+token[^\n.]*invalidated/i,
 	/invalidated[^\n.]*\b(?:auth(?:entication)?|access|oauth)\s+token\b/i,
 	/(?:^|[^\p{L}\p{N}])token[_-]?(?:revoked|invalidated)(?:$|[^\p{L}\p{N}])/iu,
-	/try\s+signing\s+in\s+again/i,
+	/encountered invalidated oauth token/i,
 ];
 
 const AUTH_PATTERNS: RegExp[] = [
@@ -304,6 +308,17 @@ export function classifyCredentialError(
 		};
 	}
 
+	if (isRotationSummaryError(message)) {
+		return {
+			kind: "unknown",
+			shouldRotateCredential: true,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: false,
+			reason: "Rotation summary error — not a single-credential ban",
+		};
+	}
+
 	if (matchesAny(message, CONTEXT_LIMIT_PATTERNS)) {
 		return {
 			kind: "context_limit",
@@ -316,13 +331,16 @@ export function classifyCredentialError(
 	}
 
 	if (matchesAny(message, AUTH_TOKEN_INVALIDATED_PATTERNS)) {
+		const shouldDisable = isAccountBannedOrRevokedError(message);
 		return {
 			kind: "authentication",
 			shouldRotateCredential: true,
 			shouldRetrySameCredential: false,
 			shouldApplyCooldown: false,
-			shouldDisableCredential: true,
-			reason: "Authentication token invalidated - credential disabled until re-authenticated",
+			shouldDisableCredential: shouldDisable,
+			reason: shouldDisable
+				? "Authentication token revoked or invalidated — credential disabled until manual review"
+				: "Authentication token invalidated — rotate or re-authenticate without disabling",
 		};
 	}
 

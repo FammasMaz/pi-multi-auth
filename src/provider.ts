@@ -1000,18 +1000,30 @@ export function createRotatingStreamWrapper(
 
 					if (classification.shouldDisableCredential) {
 						try {
-							await accountManager.disableApiKeyCredential(
-								activeProviderId,
-								selected.credentialId,
-								message,
-								classification.kind,
+							const { shouldPermanentlyDisableCredential } = await import(
+								"./credential-disable-policy.js"
 							);
-							multiAuthDebugLogger.log("credential_disabled", {
-								provider: activeProviderId,
-								credentialId: selected.credentialId,
-								kind: classification.kind,
-								reason: message.slice(0, 200),
-							});
+							if (!shouldPermanentlyDisableCredential(message, classification.kind)) {
+								multiAuthDebugLogger.log("credential_disable_skipped", {
+									provider: activeProviderId,
+									credentialId: selected.credentialId,
+									kind: classification.kind,
+									reason: message.slice(0, 200),
+								});
+							} else {
+								await accountManager.disableApiKeyCredential(
+									activeProviderId,
+									selected.credentialId,
+									message,
+									classification.kind,
+								);
+								multiAuthDebugLogger.log("credential_disabled", {
+									provider: activeProviderId,
+									credentialId: selected.credentialId,
+									kind: classification.kind,
+									reason: message.slice(0, 200),
+								});
+							}
 						} catch (error: unknown) {
 							multiAuthDebugLogger.log("credential_disable_failed", {
 								provider: activeProviderId,

@@ -54,9 +54,11 @@ import {
 	type SupportedProviderId,
 } from "./types.js";
 import {
+	CODEX_BEST_PLAN_SELECTION_PRIORITY,
 	type CodexPlanType,
 	type CredentialModelEligibility,
 	formatModelReference,
+	getCodexPlanSelectionPriority,
 	isPlanEligibleForModel,
 	modelPrefersPaidPlan,
 	modelRequiresEntitlement,
@@ -105,6 +107,7 @@ import {
 	DEFAULT_MULTI_AUTH_CONFIG,
 	type MultiAuthExtensionConfig,
 } from "./config.js";
+import { shouldPermanentlyDisableCredential } from "./credential-disable-policy.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import {
@@ -398,6 +401,63 @@ function isStrongCodexIdentityKey(identityKey: string): boolean {
 function normalizeKnownCodexPlanType(planType: string | null | undefined): CodexPlanType | undefined {
 	const normalizedPlanType = normalizeCodexPlanType(planType);
 	return normalizedPlanType === "unknown" ? undefined : normalizedPlanType;
+}
+
+function getBestCodexPlanSelectionPriority(
+	credentialIds: readonly string[],
+	credentialPlanTypes: ReadonlyMap<string, CodexPlanType>,
+): number {
+	return credentialIds.reduce(
+		(bestPriority, credentialId) =>
+			Math.min(
+				bestPriority,
+				getCodexPlanSelectionPriority(credentialPlanTypes.get(credentialId) ?? "unknown"),
+			),
+		Number.POSITIVE_INFINITY,
+	);
+}
+
+function buildCredentialPriorityGroups(
+	credentialIds: readonly string[],
+	credentialPlanTypes: ReadonlyMap<string, CodexPlanType>,
+): string[][] {
+	const groups = new Map<number, string[]>();
+	for (const credentialId of credentialIds) {
+		const priority = getCodexPlanSelectionPriority(
+			credentialPlanTypes.get(credentialId) ?? "unknown",
+		);
+		const group = groups.get(priority) ?? [];
+		group.push(credentialId);
+		groups.set(priority, group);
+	}
+
+	return [...groups.entries()]
+		.sort((left, right) => left[0] - right[0])
+		.map((entry) => entry[1]);
+}
+
+function buildCredentialSelectionPasses(
+	available: ReadonlySet<string>,
+	modelEligibility: CredentialModelEligibility,
+): Set<string>[] {
+	const priorityGroups = modelEligibility.credentialPriorityGroups
+		?.map((group) => new Set(group.filter((credentialId) => available.has(credentialId))))
+		.filter((group) => group.size > 0);
+	if (priorityGroups && priorityGroups.length > 0) {
+		const coveredCredentialIds = new Set(
+			priorityGroups.flatMap((group) => [...group]),
+		);
+		return coveredCredentialIds.size >= available.size
+			? priorityGroups
+			: [...priorityGroups, new Set(available)];
+	}
+
+	const preferredAvailable = new Set(
+		[...available].filter((credentialId) =>
+			modelEligibility.preferredCredentialIds?.includes(credentialId),
+		),
+	);
+	return preferredAvailable.size > 0 ? [preferredAvailable, new Set(available)] : [new Set(available)];
 }
 
 function inferCredentialFriendlyName(
@@ -2703,6 +2763,16 @@ export class AccountManager {
 			throw new Error("Cannot disable credential without a non-empty error message.");
 		}
 
+		if (!shouldPermanentlyDisableCredential(errorMessage, errorKind)) {
+			multiAuthDebugLogger.log("credential_disable_skipped", {
+				provider,
+				credentialRef: redactUsageCredentialIdentifier(credentialId),
+				errorKind,
+				message: errorMessage.slice(0, 200),
+			});
+			return;
+		}
+
 		const disabledPlanType = provider === OPENAI_CODEX_PROVIDER_ID
 			? this.readCachedCodexCredentialPlanType(credentialId)
 			: undefined;
@@ -2912,26 +2982,15 @@ export class AccountManager {
 				return failure;
 			}
 
-			if (provider === "openai-codex") {
-				await this.disableCredential(provider, credentialId, failure.message, "authentication");
-				multiAuthDebugLogger.log("oauth_refresh_codex_disabled", {
-					provider,
-					credentialRef: redactUsageCredentialIdentifier(credentialId),
-					message: failure.message,
-					status: failure.details.status,
-					errorCode: failure.details.errorCode,
-					reason: failure.details.reason,
-				});
-			} else {
-				await this.disableCredential(provider, credentialId, failure.message, "authentication");
-				multiAuthDebugLogger.log("oauth_refresh_permanently_disabled", {
-					provider,
-					credentialRef: redactUsageCredentialIdentifier(credentialId),
-					message: failure.message,
-					status: failure.details.status,
-					errorCode: failure.details.errorCode,
-				});
-			}
+			await this.disableCredential(provider, credentialId, failure.message, "authentication");
+			multiAuthDebugLogger.log("oauth_refresh_permanent_disable_attempt", {
+				provider,
+				credentialRef: redactUsageCredentialIdentifier(credentialId),
+				message: failure.message,
+				status: failure.details.status,
+				errorCode: failure.details.errorCode,
+				reason: failure.details.reason,
+			});
 		}
 
 		return failure;
@@ -3646,12 +3705,7 @@ export class AccountManager {
 				);
 			}
 
-			const preferredAvailable = new Set(
-				[...available].filter((credentialId) =>
-					modelEligibility.preferredCredentialIds?.includes(credentialId),
-				),
-			);
-			const selectionPasses = preferredAvailable.size > 0 ? [preferredAvailable, available] : [available];
+			const selectionPasses = buildCredentialSelectionPasses(available, modelEligibility);
 			for (const selectionAvailable of selectionPasses) {
 				const pooledSelection = await this.selectPooledCredential(
 					provider,
@@ -5401,6 +5455,7 @@ export class AccountManager {
 		const unknownPlanCredentialIds: string[] = [];
 		const ineligibleCredentialIds: string[] = [];
 		const bootstrapCandidateCredentialIds: string[] = [];
+		const credentialPlanTypes = new Map<string, CodexPlanType>();
 		let staleCredentialCount = 0;
 		let hasUnknownPlanType = false;
 		let hasUsageFailure = false;
@@ -5456,6 +5511,7 @@ export class AccountManager {
 			}
 
 			const planType = normalizeCodexPlanType(snapshot.planType);
+			credentialPlanTypes.set(credentialId, planType);
 			const quotaState = usage.displayOnly || options.planOnly
 				? ({ state: "unknown" } satisfies UsageQuotaState)
 				: inferQuotaStateFromUsage(snapshot);
@@ -5522,12 +5578,16 @@ export class AccountManager {
 
 		let bootstrapPerformed = false;
 		let synchronousFetchCount = 0;
-		const shouldBootstrapPaidPreference =
-			!requiresEntitlement && prefersPaidPlan && preferredCredentialIds.length === 0;
-		const bootstrapCredentialIds =
-			(requiresEntitlement && verifiedEligibleCredentialIds.length === 0) || shouldBootstrapPaidPreference
-				? [...bootstrapCandidateCredentialIds]
-				: [];
+		const bestKnownPlanPriority = getBestCodexPlanSelectionPriority(
+			verifiedEligibleCredentialIds,
+			credentialPlanTypes,
+		);
+		const shouldBootstrapHigherPriorityPlan =
+			(requiresEntitlement || prefersPaidPlan) &&
+			bestKnownPlanPriority > CODEX_BEST_PLAN_SELECTION_PRIORITY;
+		const bootstrapCredentialIds = shouldBootstrapHigherPriorityPlan
+			? [...bootstrapCandidateCredentialIds]
+			: [];
 
 		if (bootstrapCredentialIds.length > 0) {
 			bootstrapPerformed = true;
@@ -5570,10 +5630,11 @@ export class AccountManager {
 						pushUnique(verifiedEligibleCredentialIds, credentialId);
 					}
 				}
-				if (
-					(requiresEntitlement && verifiedEligibleCredentialIds.length >= 1) ||
-					(shouldBootstrapPaidPreference && preferredCredentialIds.length >= 1)
-				) {
+				const bestResolvedPlanPriority = getBestCodexPlanSelectionPriority(
+					verifiedEligibleCredentialIds,
+					credentialPlanTypes,
+				);
+				if (bestResolvedPlanPriority <= CODEX_BEST_PLAN_SELECTION_PRIORITY) {
 					break;
 				}
 			}
@@ -5633,6 +5694,11 @@ export class AccountManager {
 			}
 		}
 
+		const credentialPriorityGroups = buildCredentialPriorityGroups(
+			eligibleCredentialIds,
+			credentialPlanTypes,
+		);
+
 		multiAuthDebugLogger.log("codex_entitlement_selection_timing", {
 			provider,
 			modelId: normalizedModelId ?? "unknown",
@@ -5653,6 +5719,7 @@ export class AccountManager {
 			eligibleCredentialIds,
 			ineligibleCredentialIds,
 			preferredCredentialIds,
+			credentialPriorityGroups,
 			failureMessage,
 		};
 	}

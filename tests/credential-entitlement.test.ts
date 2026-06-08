@@ -171,6 +171,52 @@ test("account manager prioritizes paid codex credentials for unconstrained reque
 	assert.equal(selected.provider, CODEX_PROVIDER_ID);
 });
 
+test("account manager prioritizes team before plus before free codex credentials", async (t) => {
+	const credentials = [
+		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
+		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
+		{ credentialId: "openai-codex-2", secret: "sk-team-key", planType: "team" },
+	] as const;
+	const accountManager = await createCodexAccountManager(t, credentials);
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
+	assert.equal(selected.credentialId, "openai-codex-2");
+});
+
+test("account manager bootstraps later codex accounts to find team before plus", async (t) => {
+	const credentials = [
+		{ credentialId: "openai-codex", secret: "bootstrap-free-key", planType: "free" },
+		{ credentialId: "openai-codex-1", secret: "bootstrap-plus-key", planType: "plus" },
+		{ credentialId: "openai-codex-2", secret: "bootstrap-team-key", planType: "team" },
+	] as const;
+	const extensionConfig: MultiAuthExtensionConfig = {
+		...DEFAULT_MULTI_AUTH_CONFIG,
+		usageCoordination: {
+			...DEFAULT_MULTI_AUTH_CONFIG.usageCoordination,
+			globalMaxConcurrentFreshRequests: 2,
+			perProviderMaxConcurrentFreshRequests: 2,
+			entitlementCandidateWindow: 2,
+		},
+	};
+	const fetchedCredentialIds: string[] = [];
+	const accountManager = await createCodexAccountManager(t, credentials, {
+		extensionConfig,
+		onFetchUsage: (credential) => {
+			if (credential) {
+				fetchedCredentialIds.push(credential.credentialId);
+			}
+		},
+	});
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
+	assert.equal(selected.credentialId, "openai-codex-2");
+	assert.deepEqual(
+		fetchedCredentialIds,
+		credentials.map((credential) => credential.credentialId),
+	);
+});
+
 test("account manager prioritizes paid codex credentials for free-eligible models", async (t) => {
 	const credentials = [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },

@@ -21,6 +21,8 @@ export interface CredentialModelEligibility {
 	ineligibleCredentialIds: readonly string[];
 	/** Credential IDs that should be attempted before other eligible credentials. */
 	preferredCredentialIds?: readonly string[];
+	/** Ordered credential ID groups to try from highest to lowest account priority. */
+	credentialPriorityGroups?: readonly (readonly string[])[];
 	failureMessage?: string;
 }
 
@@ -38,6 +40,18 @@ const OPENAI_CODEX_PAID_PLAN_TYPES = new Set<CodexPlanType>([
 	"business",
 	"enterprise",
 ]);
+
+export const CODEX_BEST_PLAN_SELECTION_PRIORITY = 0;
+
+const OPENAI_CODEX_PLAN_SELECTION_PRIORITY: Readonly<Record<CodexPlanType, number>> = {
+	team: CODEX_BEST_PLAN_SELECTION_PRIORITY,
+	business: CODEX_BEST_PLAN_SELECTION_PRIORITY,
+	enterprise: CODEX_BEST_PLAN_SELECTION_PRIORITY,
+	plus: 1,
+	pro: 1,
+	free: 2,
+	unknown: 3,
+};
 
 function normalizeProviderId(providerId: SupportedProviderId): SupportedProviderId {
 	return providerId.trim().toLowerCase();
@@ -101,6 +115,13 @@ export function normalizeCodexPlanType(planType: string | null | undefined): Cod
 		default:
 			return "unknown";
 	}
+}
+
+/**
+ * Returns the account selection priority for a normalized Codex plan. Lower wins.
+ */
+export function getCodexPlanSelectionPriority(planType: CodexPlanType): number {
+	return OPENAI_CODEX_PLAN_SELECTION_PRIORITY[planType];
 }
 
 /**
