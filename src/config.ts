@@ -33,6 +33,13 @@ export interface ModelEntitlementConfig {
 	codex: CodexModelEntitlementConfig;
 }
 
+export interface StreamTimeoutConfig {
+	/** Maximum wall-clock duration for one provider attempt. 0 disables the attempt watchdog. */
+	attemptTimeoutMs: number;
+	/** Maximum time between provider stream events. 0 disables the idle watchdog. */
+	idleTimeoutMs: number;
+}
+
 export interface MultiAuthExtensionConfig {
 	debug: boolean;
 	/** Providers to exclude from multi-auth rotation (handled by dedicated auth extensions). */
@@ -43,6 +50,7 @@ export interface MultiAuthExtensionConfig {
 	modelEntitlements: ModelEntitlementConfig;
 	oauthRefresh: OAuthRefreshConfig;
 	usageCoordination: UsageCoordinationConfig;
+	streamTimeouts: StreamTimeoutConfig;
 }
 
 export interface MultiAuthConfigLoadResult {
@@ -63,6 +71,11 @@ export const DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG: CodexModelEntitlementConfig
 
 export const DEFAULT_MODEL_ENTITLEMENT_CONFIG: ModelEntitlementConfig = {
 	codex: { ...DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG },
+};
+
+export const DEFAULT_STREAM_TIMEOUT_CONFIG: StreamTimeoutConfig = {
+	attemptTimeoutMs: 600_000,
+	idleTimeoutMs: 45_000,
 };
 
 export function cloneOAuthRefreshConfig(
@@ -86,6 +99,7 @@ export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	modelEntitlements: cloneModelEntitlementConfig(DEFAULT_MODEL_ENTITLEMENT_CONFIG),
 	oauthRefresh: cloneOAuthRefreshConfig(DEFAULT_OAUTH_CONFIG),
 	usageCoordination: { ...DEFAULT_USAGE_COORDINATION_CONFIG },
+	streamTimeouts: { ...DEFAULT_STREAM_TIMEOUT_CONFIG },
 };
 
 export function cloneHistoryPersistenceConfig(
@@ -114,6 +128,15 @@ export function cloneModelEntitlementConfig(
 	};
 }
 
+export function cloneStreamTimeoutConfig(
+	config: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
+): StreamTimeoutConfig {
+	return {
+		attemptTimeoutMs: config.attemptTimeoutMs,
+		idleTimeoutMs: config.idleTimeoutMs,
+	};
+}
+
 export function cloneMultiAuthExtensionConfig(
 	config: MultiAuthExtensionConfig = DEFAULT_MULTI_AUTH_CONFIG,
 ): MultiAuthExtensionConfig {
@@ -129,6 +152,7 @@ export function cloneMultiAuthExtensionConfig(
 		modelEntitlements: cloneModelEntitlementConfig(config.modelEntitlements),
 		oauthRefresh: cloneOAuthRefreshConfig(config.oauthRefresh),
 		usageCoordination: { ...config.usageCoordination },
+		streamTimeouts: cloneStreamTimeoutConfig(config.streamTimeouts),
 	};
 }
 
@@ -623,6 +647,25 @@ function normalizeOAuthRefreshConfig(value: unknown, warnings: string[]): OAuthR
 	};
 }
 
+function normalizeStreamTimeoutConfig(value: unknown, warnings: string[]): StreamTimeoutConfig {
+	const defaults = DEFAULT_STREAM_TIMEOUT_CONFIG;
+	const record = toRecord(value);
+	return {
+		attemptTimeoutMs: readNonNegativeInteger(
+			record.attemptTimeoutMs,
+			"streamTimeouts.attemptTimeoutMs",
+			defaults.attemptTimeoutMs,
+			warnings,
+		),
+		idleTimeoutMs: readNonNegativeInteger(
+			record.idleTimeoutMs,
+			"streamTimeouts.idleTimeoutMs",
+			defaults.idleTimeoutMs,
+			warnings,
+		),
+	};
+}
+
 function normalizeUsageCoordinationConfig(
 	value: unknown,
 	warnings: string[],
@@ -737,6 +780,7 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 			modelEntitlements: normalizeModelEntitlementConfig(record.modelEntitlements, warnings),
 			oauthRefresh: normalizeOAuthRefreshConfig(record.oauthRefresh, warnings),
 			usageCoordination: normalizeUsageCoordinationConfig(record.usageCoordination, warnings),
+			streamTimeouts: normalizeStreamTimeoutConfig(record.streamTimeouts, warnings),
 		},
 		warnings,
 	};
