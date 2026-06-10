@@ -79,6 +79,7 @@ Runtime configuration lives in `config.json` at the extension root. The extensio
 | `modelEntitlements` | `object` | built-in defaults | Controls provider-specific model entitlement behavior such as Codex usage lookup failures |
 | `oauthRefresh` | `object` | built-in defaults | Controls proactive OAuth token refresh scheduling, concurrency, and excluded providers |
 | `usageCoordination` | `object` | built-in defaults | Bounds fresh usage lookups with global/per-provider concurrency, operation-specific candidate windows, account/provider cooldowns, and circuit breakers |
+| `credentialRotation` | `object` | `{ "autoDisableBrokenCredentials": true }` | When enabled (default), credentials that fail with re-login OAuth errors, dead refresh tokens, or invalid sessions are stored in `disabledCredentials` and skipped until re-enabled in `/multi-auth` |
 
 The published package intentionally excludes `config.json` and `debug/`; both are created locally as needed by the running extension. Usage snapshots are cached in Pi's runtime directory as `multi-auth-usage-cache.json` so operational and display-only usage state can survive extension restarts without publishing local state.
 

@@ -36,6 +36,20 @@ const REAUTH_ONLY_PATTERNS: RegExp[] = [
 	/sign in again/i,
 ];
 
+/** OAuth/session failures that should skip rotation until re-login (when auto-disable is on). */
+const BROKEN_OAUTH_SESSION_PATTERNS: RegExp[] = [
+	/app_session_terminated/i,
+	/openai codex token expired or invalid/i,
+	/openai codex refresh rejected permanently/i,
+	/openai codex refresh failed/i,
+	/token expired or invalid/i,
+];
+
+export interface CredentialDisablePolicyOptions {
+	/** When true (default), reauth and broken OAuth session errors disable the credential in multi-auth. */
+	autoDisableBrokenCredentials?: boolean;
+}
+
 export function isRotationSummaryError(message: string): boolean {
 	const normalized = message.trim();
 	if (!normalized) {
@@ -63,25 +77,47 @@ export function isReauthOnlyError(message: string): boolean {
 	return REAUTH_ONLY_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+export function isBrokenOAuthSessionError(message: string): boolean {
+	const normalized = message.trim();
+	if (!normalized) {
+		return false;
+	}
+	if (isRotationSummaryError(normalized)) {
+		return false;
+	}
+	return BROKEN_OAUTH_SESSION_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 /**
- * Only these failures should persist a credential in disabledCredentials.
- * Expired tokens, refresh reuse, quotas, and rotation summaries are not bans.
+ * Whether a credential should be persisted in disabledCredentials.
+ * With autoDisableBrokenCredentials (default true), reauth and dead OAuth sessions disable too.
  */
 export function shouldPermanentlyDisableCredential(
 	message: string,
 	kind: CredentialErrorKind,
+	options: CredentialDisablePolicyOptions = {},
 ): boolean {
+	const autoDisableBroken = options.autoDisableBrokenCredentials !== false;
 	const normalized = message.trim();
 	if (!normalized || isRotationSummaryError(normalized)) {
-		return false;
-	}
-	if (isReauthOnlyError(normalized)) {
 		return false;
 	}
 	if (isAccountBannedOrRevokedError(normalized)) {
 		return true;
 	}
 	if (kind === "organization_disabled" || kind === "balance_exhausted") {
+		return true;
+	}
+	if (!autoDisableBroken) {
+		if (isReauthOnlyError(normalized)) {
+			return false;
+		}
+		return false;
+	}
+	if (isReauthOnlyError(normalized) || isBrokenOAuthSessionError(normalized)) {
+		return true;
+	}
+	if (kind === "authentication" && /token expired|invalid|unauthorized|\b401\b/i.test(normalized)) {
 		return true;
 	}
 	return false;

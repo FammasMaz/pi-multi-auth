@@ -40,6 +40,11 @@ export interface StreamTimeoutConfig {
 	idleTimeoutMs: number;
 }
 
+export interface CredentialRotationConfig {
+	/** When true (default), dead OAuth / reauth failures disable credentials until re-enabled. */
+	autoDisableBrokenCredentials: boolean;
+}
+
 export interface MultiAuthExtensionConfig {
 	debug: boolean;
 	/** Providers to exclude from multi-auth rotation (handled by dedicated auth extensions). */
@@ -51,6 +56,7 @@ export interface MultiAuthExtensionConfig {
 	oauthRefresh: OAuthRefreshConfig;
 	usageCoordination: UsageCoordinationConfig;
 	streamTimeouts: StreamTimeoutConfig;
+	credentialRotation: CredentialRotationConfig;
 }
 
 export interface MultiAuthConfigLoadResult {
@@ -78,6 +84,10 @@ export const DEFAULT_STREAM_TIMEOUT_CONFIG: StreamTimeoutConfig = {
 	idleTimeoutMs: 45_000,
 };
 
+export const DEFAULT_CREDENTIAL_ROTATION_CONFIG: CredentialRotationConfig = {
+	autoDisableBrokenCredentials: true,
+};
+
 export function cloneOAuthRefreshConfig(
 	config: OAuthRefreshConfig = DEFAULT_OAUTH_CONFIG,
 ): OAuthRefreshConfig {
@@ -100,6 +110,7 @@ export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	oauthRefresh: cloneOAuthRefreshConfig(DEFAULT_OAUTH_CONFIG),
 	usageCoordination: { ...DEFAULT_USAGE_COORDINATION_CONFIG },
 	streamTimeouts: { ...DEFAULT_STREAM_TIMEOUT_CONFIG },
+	credentialRotation: { ...DEFAULT_CREDENTIAL_ROTATION_CONFIG },
 };
 
 export function cloneHistoryPersistenceConfig(
@@ -137,6 +148,14 @@ export function cloneStreamTimeoutConfig(
 	};
 }
 
+export function cloneCredentialRotationConfig(
+	config: CredentialRotationConfig = DEFAULT_CREDENTIAL_ROTATION_CONFIG,
+): CredentialRotationConfig {
+	return {
+		autoDisableBrokenCredentials: config.autoDisableBrokenCredentials,
+	};
+}
+
 export function cloneMultiAuthExtensionConfig(
 	config: MultiAuthExtensionConfig = DEFAULT_MULTI_AUTH_CONFIG,
 ): MultiAuthExtensionConfig {
@@ -153,6 +172,9 @@ export function cloneMultiAuthExtensionConfig(
 		oauthRefresh: cloneOAuthRefreshConfig(config.oauthRefresh),
 		usageCoordination: { ...config.usageCoordination },
 		streamTimeouts: cloneStreamTimeoutConfig(config.streamTimeouts),
+		credentialRotation: cloneCredentialRotationConfig(
+			config.credentialRotation ?? DEFAULT_CREDENTIAL_ROTATION_CONFIG,
+		),
 	};
 }
 
@@ -781,8 +803,25 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 			oauthRefresh: normalizeOAuthRefreshConfig(record.oauthRefresh, warnings),
 			usageCoordination: normalizeUsageCoordinationConfig(record.usageCoordination, warnings),
 			streamTimeouts: normalizeStreamTimeoutConfig(record.streamTimeouts, warnings),
+			credentialRotation: normalizeCredentialRotationConfig(record.credentialRotation, warnings),
 		},
 		warnings,
+	};
+}
+
+function normalizeCredentialRotationConfig(
+	value: unknown,
+	warnings: string[],
+): CredentialRotationConfig {
+	const defaults = DEFAULT_CREDENTIAL_ROTATION_CONFIG;
+	const record = toRecord(value);
+	return {
+		autoDisableBrokenCredentials: readBoolean(
+			record.autoDisableBrokenCredentials,
+			"credentialRotation.autoDisableBrokenCredentials",
+			defaults.autoDisableBrokenCredentials,
+			warnings,
+		),
 	};
 }
 

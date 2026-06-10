@@ -1060,39 +1060,37 @@ export function createRotatingStreamWrapper(
 						errorMessage: message.slice(0, 200),
 					});
 
-					if (classification.shouldDisableCredential) {
-						try {
-							const { shouldPermanentlyDisableCredential } = await import(
-								"./credential-disable-policy.js"
+					try {
+						const { shouldPermanentlyDisableCredential } = await import(
+							"./credential-disable-policy.js"
+						);
+						if (shouldPermanentlyDisableCredential(message, classification.kind)) {
+							await accountManager.disableApiKeyCredential(
+								activeProviderId,
+								selected.credentialId,
+								message,
+								classification.kind,
 							);
-							if (!shouldPermanentlyDisableCredential(message, classification.kind)) {
-								multiAuthDebugLogger.log("credential_disable_skipped", {
-									provider: activeProviderId,
-									credentialId: selected.credentialId,
-									kind: classification.kind,
-									reason: message.slice(0, 200),
-								});
-							} else {
-								await accountManager.disableApiKeyCredential(
-									activeProviderId,
-									selected.credentialId,
-									message,
-									classification.kind,
-								);
-								multiAuthDebugLogger.log("credential_disabled", {
-									provider: activeProviderId,
-									credentialId: selected.credentialId,
-									kind: classification.kind,
-									reason: message.slice(0, 200),
-								});
-							}
-						} catch (error: unknown) {
-							multiAuthDebugLogger.log("credential_disable_failed", {
+							multiAuthDebugLogger.log("credential_disabled", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
-								error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+									kind: classification.kind,
+									reason: message.slice(0, 200),
+							});
+						} else if (classification.shouldDisableCredential) {
+							multiAuthDebugLogger.log("credential_disable_skipped", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+									kind: classification.kind,
+									reason: message.slice(0, 200),
 							});
 						}
+					} catch (error: unknown) {
+						multiAuthDebugLogger.log("credential_disable_failed", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+						});
 					}
 
 					if (hasForwardedSubstantiveEvent) {

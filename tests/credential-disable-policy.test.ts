@@ -16,12 +16,25 @@ test("rotation summary errors must not disable credentials", () => {
 	assert.equal(c.shouldDisableCredential, false);
 });
 
-test("expired token messages are reauth-only, not permanent disable", () => {
+test("expired token messages disable by default (auto-disable broken)", () => {
 	const msg = "Provided authentication token is expired. Please try signing in again.";
 	assert.equal(isReauthOnlyError(msg), true);
-	assert.equal(shouldPermanentlyDisableCredential(msg, "authentication"), false);
+	assert.equal(shouldPermanentlyDisableCredential(msg, "authentication"), true);
+	assert.equal(
+		shouldPermanentlyDisableCredential(msg, "authentication", {
+			autoDisableBrokenCredentials: false,
+		}),
+		false,
+	);
 	const c = classifyCredentialError(msg, { providerId: "openai-codex" });
 	assert.equal(c.shouldDisableCredential, false);
+	assert.equal(shouldPermanentlyDisableCredential(msg, c.kind), true);
+});
+
+test("refresh_token_reused disables by default", () => {
+	const msg =
+		"OpenAI Codex refresh rejected permanently (HTTP 401, code=refresh_token_reused)";
+	assert.equal(shouldPermanentlyDisableCredential(msg, "authentication"), true);
 });
 
 test("token_revoked still disables", () => {

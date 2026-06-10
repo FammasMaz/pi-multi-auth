@@ -134,13 +134,7 @@ const PRESERVED_OAUTH_REFRESH_MIN_REMAINING_MS = 30_000;
 const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 const PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER = new Map<string, ReadonlySet<string>>([
 	["cline", new Set(["failed_to_refresh_token"])],
-	[OPENAI_CODEX_PROVIDER_ID, new Set([
-		"invalid_grant",
-		"refresh_token_expired",
-		"refresh_token_invalidated",
-		"refresh_token_reused",
-		"token_expired",
-	])],
+	// Codex: do not keep broken refresh rows in rotation when access cannot be renewed.
 ]);
 
 const MIN_QUOTA_RETRY_WINDOW_MS = 60_000;
@@ -2763,7 +2757,11 @@ export class AccountManager {
 			throw new Error("Cannot disable credential without a non-empty error message.");
 		}
 
-		if (!shouldPermanentlyDisableCredential(errorMessage, errorKind)) {
+		const disablePolicy = {
+			autoDisableBrokenCredentials:
+				this.extensionConfig.credentialRotation.autoDisableBrokenCredentials,
+		};
+		if (!shouldPermanentlyDisableCredential(errorMessage, errorKind, disablePolicy)) {
 			multiAuthDebugLogger.log("credential_disable_skipped", {
 				provider,
 				credentialRef: redactUsageCredentialIdentifier(credentialId),
