@@ -7,6 +7,17 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Passed through unmanaged providers that share a wrapped API, preventing multi-auth credential rotation from intercepting auth owned by other extensions such as `grok-cli`.
 
+## 0.7.1 - 2026-06-16
+
+### Added
+- Added `noCooldownProviders` to skip quota and transient credential cooldowns for configured providers.
+- Added `noStreamWatchdogProviders` to disable attempt and idle stream timeouts for configured providers.
+- Added `providerStreamTimeouts` for per-provider partial overrides of global `streamTimeouts`.
+
+### Changed
+- Default `noCooldownProviders` and `noStreamWatchdogProviders` include `LiteLLM` so slow LiteLLM/LiteLLM-proxy streams are not cut off by multi-auth watchdogs or backoff cooldowns.
+- Stream watchdog limits are resolved per active provider on each request (including failover targets).
+
 ## 0.7.0 - 2026-05-04
 
 ### Added
