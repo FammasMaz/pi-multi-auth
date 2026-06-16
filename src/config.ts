@@ -54,6 +54,8 @@ export interface MultiAuthExtensionConfig {
 	excludeProviders: string[];
 	/** Providers that never get quota/transient cooldowns (still rotate on hard failures). */
 	noCooldownProviders: string[];
+	/** Providers with no stream attempt/idle watchdogs (0 = disabled). */
+	noStreamWatchdogProviders: string[];
 	cascade: CascadeConfig;
 	health: HealthMetricsConfig;
 	historyPersistence: HistoryPersistenceConfig;
@@ -107,7 +109,8 @@ export function cloneOAuthRefreshConfig(
 export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	debug: false,
 	excludeProviders: [],
-	noCooldownProviders: [],
+	noCooldownProviders: ["LiteLLM"],
+	noStreamWatchdogProviders: ["LiteLLM"],
 	cascade: { ...DEFAULT_CASCADE_CONFIG },
 	health: {
 		...DEFAULT_HEALTH_CONFIG,
@@ -206,6 +209,7 @@ export function cloneMultiAuthExtensionConfig(
 		debug: config.debug,
 		excludeProviders: [...config.excludeProviders],
 		noCooldownProviders: [...config.noCooldownProviders],
+		noStreamWatchdogProviders: [...config.noStreamWatchdogProviders],
 		cascade: { ...config.cascade },
 		health: {
 			...config.health,
@@ -888,6 +892,12 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 				record.noCooldownProviders,
 				"noCooldownProviders",
 				DEFAULT_MULTI_AUTH_CONFIG.noCooldownProviders,
+				warnings,
+			),
+			noStreamWatchdogProviders: readStringArray(
+				record.noStreamWatchdogProviders,
+				"noStreamWatchdogProviders",
+				DEFAULT_MULTI_AUTH_CONFIG.noStreamWatchdogProviders,
 				warnings,
 			),
 			cascade: normalizeCascadeConfig(record.cascade, warnings),

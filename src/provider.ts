@@ -714,12 +714,18 @@ function resolveStreamWatchdogTimeoutsForProvider(
 	providerId: SupportedProviderId,
 	defaults: StreamTimeoutConfig,
 	providerStreamTimeouts: ProviderStreamTimeoutOverrides,
+	noStreamWatchdogProviders: readonly string[] = [],
 ): { attemptTimeoutMs: number | undefined; idleTimeoutMs: number | undefined } {
+	if (noStreamWatchdogProviders.includes(providerId)) {
+		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
+	}
 	const resolved = resolveProviderStreamTimeouts(providerId, defaults, providerStreamTimeouts);
-	return {
-		attemptTimeoutMs: normalizeWatchdogTimeoutMs(resolved.attemptTimeoutMs),
-		idleTimeoutMs: normalizeWatchdogTimeoutMs(resolved.idleTimeoutMs),
-	};
+	const attemptTimeoutMs = normalizeWatchdogTimeoutMs(resolved.attemptTimeoutMs);
+	const idleTimeoutMs = normalizeWatchdogTimeoutMs(resolved.idleTimeoutMs);
+	if (attemptTimeoutMs === undefined && idleTimeoutMs === undefined) {
+		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
+	}
+	return { attemptTimeoutMs, idleTimeoutMs };
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
@@ -837,6 +843,7 @@ export function createRotatingStreamWrapper(
 	managedProviders?: ReadonlySet<string>,
 	streamTimeouts: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
 	providerStreamTimeouts: ProviderStreamTimeoutOverrides = {},
+	noStreamWatchdogProviders: readonly string[] = [],
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -1218,6 +1225,7 @@ export function createRotatingStreamWrapper(
 						activeProviderId,
 						streamTimeouts,
 						providerStreamTimeouts,
+						noStreamWatchdogProviders,
 					);
 					const providerRequestHeaders = resolveProviderRequestHeaders(
 						activeProviderId,
@@ -1540,6 +1548,7 @@ export async function registerMultiAuthProviders(
 		includeProviders?: string[];
 		streamTimeouts?: StreamTimeoutConfig;
 		providerStreamTimeouts?: ProviderStreamTimeoutOverrides;
+		noStreamWatchdogProviders?: readonly string[];
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
@@ -1549,6 +1558,7 @@ export async function registerMultiAuthProviders(
 			: null;
 	const streamTimeouts = options?.streamTimeouts ?? DEFAULT_STREAM_TIMEOUT_CONFIG;
 	const providerStreamTimeouts = options?.providerStreamTimeouts ?? {};
+	const noStreamWatchdogProviders = options?.noStreamWatchdogProviders ?? [];
 	const registry = accountManager.getProviderRegistry();
 	const providers = await registry.discoverProviderIds();
 	const metadataToRegister = (
@@ -1664,6 +1674,7 @@ export async function registerMultiAuthProviders(
 			managedProviders,
 			streamTimeouts,
 			providerStreamTimeouts,
+			noStreamWatchdogProviders,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

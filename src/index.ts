@@ -262,6 +262,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 					: undefined,
 			streamTimeouts: configLoadResult.config.streamTimeouts,
 			providerStreamTimeouts: configLoadResult.config.providerStreamTimeouts,
+			noStreamWatchdogProviders: configLoadResult.config.noStreamWatchdogProviders,
 		});
 	} catch (error) {
 		recordStartupWarning(
