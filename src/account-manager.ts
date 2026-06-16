@@ -1689,6 +1689,10 @@ export class AccountManager {
 		return this.providerRegistry;
 	}
 
+	private isNoCooldownProvider(provider: SupportedProviderId): boolean {
+		return this.extensionConfig.noCooldownProviders.includes(provider);
+	}
+
 	private isOAuthRefreshManagedForProvider(provider: SupportedProviderId): boolean {
 		return (
 			this.extensionConfig.oauthRefresh.enabled &&
@@ -3873,6 +3877,9 @@ export class AccountManager {
 			recommendedCooldownMs?: number;
 		},
 	): Promise<void> {
+		if (this.isNoCooldownProvider(provider)) {
+			return;
+		}
 		const { errorMessage, isWeekly, quotaClassification, recommendedCooldownMs } = options ?? {};
 		const normalizedMessage =
 			errorMessage?.trim() || (isWeekly ? "Weekly quota exhausted" : "Quota exhausted");
@@ -3963,6 +3970,9 @@ export class AccountManager {
 		credentialId: string,
 		errorMessage: string,
 	): Promise<number> {
+		if (this.isNoCooldownProvider(provider)) {
+			return 0;
+		}
 		const message = errorMessage.trim().slice(0, 500) || "Transient provider error";
 		await this.recordCredentialFailure(provider, credentialId, 0, "provider_transient", message);
 		let cooldownMs = TRANSIENT_COOLDOWN_BASE_MS;

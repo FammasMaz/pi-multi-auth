@@ -49,6 +49,8 @@ export interface MultiAuthExtensionConfig {
 	debug: boolean;
 	/** Providers to exclude from multi-auth rotation (handled by dedicated auth extensions). */
 	excludeProviders: string[];
+	/** Providers that never get quota/transient cooldowns (still rotate on hard failures). */
+	noCooldownProviders: string[];
 	cascade: CascadeConfig;
 	health: HealthMetricsConfig;
 	historyPersistence: HistoryPersistenceConfig;
@@ -100,6 +102,7 @@ export function cloneOAuthRefreshConfig(
 export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	debug: false,
 	excludeProviders: [],
+	noCooldownProviders: [],
 	cascade: { ...DEFAULT_CASCADE_CONFIG },
 	health: {
 		...DEFAULT_HEALTH_CONFIG,
@@ -162,6 +165,7 @@ export function cloneMultiAuthExtensionConfig(
 	return {
 		debug: config.debug,
 		excludeProviders: [...config.excludeProviders],
+		noCooldownProviders: [...config.noCooldownProviders],
 		cascade: { ...config.cascade },
 		health: {
 			...config.health,
@@ -794,6 +798,12 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 				record.excludeProviders,
 				"excludeProviders",
 				DEFAULT_MULTI_AUTH_CONFIG.excludeProviders,
+				warnings,
+			),
+			noCooldownProviders: readStringArray(
+				record.noCooldownProviders,
+				"noCooldownProviders",
+				DEFAULT_MULTI_AUTH_CONFIG.noCooldownProviders,
 				warnings,
 			),
 			cascade: normalizeCascadeConfig(record.cascade, warnings),
