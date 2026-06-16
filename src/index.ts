@@ -261,6 +261,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 					? [requestedSubagentProvider]
 					: undefined,
 			streamTimeouts: configLoadResult.config.streamTimeouts,
+			providerStreamTimeouts: configLoadResult.config.providerStreamTimeouts,
 		});
 	} catch (error) {
 		recordStartupWarning(

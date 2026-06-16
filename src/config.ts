@@ -40,6 +40,9 @@ export interface StreamTimeoutConfig {
 	idleTimeoutMs: number;
 }
 
+/** Per-provider partial overrides merged with streamTimeouts. */
+export type ProviderStreamTimeoutOverrides = Record<string, Partial<StreamTimeoutConfig>>;
+
 export interface CredentialRotationConfig {
 	/** When true (default), dead OAuth / reauth failures disable credentials until re-enabled. */
 	autoDisableBrokenCredentials: boolean;
@@ -58,6 +61,8 @@ export interface MultiAuthExtensionConfig {
 	oauthRefresh: OAuthRefreshConfig;
 	usageCoordination: UsageCoordinationConfig;
 	streamTimeouts: StreamTimeoutConfig;
+	/** Per-provider stream watchdog overrides (partial fields merge with streamTimeouts). */
+	providerStreamTimeouts: ProviderStreamTimeoutOverrides;
 	credentialRotation: CredentialRotationConfig;
 }
 
@@ -113,6 +118,7 @@ export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	oauthRefresh: cloneOAuthRefreshConfig(DEFAULT_OAUTH_CONFIG),
 	usageCoordination: { ...DEFAULT_USAGE_COORDINATION_CONFIG },
 	streamTimeouts: { ...DEFAULT_STREAM_TIMEOUT_CONFIG },
+	providerStreamTimeouts: {} as ProviderStreamTimeoutOverrides,
 	credentialRotation: { ...DEFAULT_CREDENTIAL_ROTATION_CONFIG },
 };
 
@@ -151,6 +157,40 @@ export function cloneStreamTimeoutConfig(
 	};
 }
 
+export function cloneProviderStreamTimeouts(
+	value: ProviderStreamTimeoutOverrides = {},
+): ProviderStreamTimeoutOverrides {
+	const cloned: ProviderStreamTimeoutOverrides = {};
+	for (const [providerId, timeouts] of Object.entries(value)) {
+		if (!timeouts || typeof timeouts !== "object") {
+			continue;
+		}
+		cloned[providerId] = { ...timeouts };
+	}
+	return cloned;
+}
+
+export function resolveProviderStreamTimeouts(
+	providerId: string,
+	defaults: StreamTimeoutConfig,
+	overrides: ProviderStreamTimeoutOverrides = {},
+): StreamTimeoutConfig {
+	const override = overrides[providerId];
+	if (!override) {
+		return cloneStreamTimeoutConfig(defaults);
+	}
+	return {
+		attemptTimeoutMs:
+			typeof override.attemptTimeoutMs === "number" && Number.isFinite(override.attemptTimeoutMs)
+				? override.attemptTimeoutMs
+				: defaults.attemptTimeoutMs,
+		idleTimeoutMs:
+			typeof override.idleTimeoutMs === "number" && Number.isFinite(override.idleTimeoutMs)
+				? override.idleTimeoutMs
+				: defaults.idleTimeoutMs,
+	};
+}
+
 export function cloneCredentialRotationConfig(
 	config: CredentialRotationConfig = DEFAULT_CREDENTIAL_ROTATION_CONFIG,
 ): CredentialRotationConfig {
@@ -176,6 +216,7 @@ export function cloneMultiAuthExtensionConfig(
 		oauthRefresh: cloneOAuthRefreshConfig(config.oauthRefresh),
 		usageCoordination: { ...config.usageCoordination },
 		streamTimeouts: cloneStreamTimeoutConfig(config.streamTimeouts),
+		providerStreamTimeouts: cloneProviderStreamTimeouts(config.providerStreamTimeouts),
 		credentialRotation: cloneCredentialRotationConfig(
 			config.credentialRotation ?? DEFAULT_CREDENTIAL_ROTATION_CONFIG,
 		),
@@ -692,6 +733,49 @@ function normalizeStreamTimeoutConfig(value: unknown, warnings: string[]): Strea
 	};
 }
 
+function normalizeProviderStreamTimeouts(
+	value: unknown,
+	warnings: string[],
+): ProviderStreamTimeoutOverrides {
+	const record = toRecord(value);
+	const result: ProviderStreamTimeoutOverrides = {};
+	for (const [providerId, rawEntry] of Object.entries(record)) {
+		const trimmedId = providerId.trim();
+		if (!trimmedId) {
+			continue;
+		}
+		const entry = toRecord(rawEntry);
+		const hasAttempt = entry.attemptTimeoutMs !== undefined;
+		const hasIdle = entry.idleTimeoutMs !== undefined;
+		if (!hasAttempt && !hasIdle) {
+			appendWarning(
+				warnings,
+				`providerStreamTimeouts.${trimmedId}: expected attemptTimeoutMs and/or idleTimeoutMs; entry ignored.`,
+			);
+			continue;
+		}
+		const override: Partial<StreamTimeoutConfig> = {};
+		if (hasAttempt) {
+			override.attemptTimeoutMs = readNonNegativeInteger(
+				entry.attemptTimeoutMs,
+				`providerStreamTimeouts.${trimmedId}.attemptTimeoutMs`,
+				DEFAULT_STREAM_TIMEOUT_CONFIG.attemptTimeoutMs,
+				warnings,
+			);
+		}
+		if (hasIdle) {
+			override.idleTimeoutMs = readNonNegativeInteger(
+				entry.idleTimeoutMs,
+				`providerStreamTimeouts.${trimmedId}.idleTimeoutMs`,
+				DEFAULT_STREAM_TIMEOUT_CONFIG.idleTimeoutMs,
+				warnings,
+			);
+		}
+		result[trimmedId] = override;
+	}
+	return result;
+}
+
 function normalizeUsageCoordinationConfig(
 	value: unknown,
 	warnings: string[],
@@ -813,6 +897,10 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 			oauthRefresh: normalizeOAuthRefreshConfig(record.oauthRefresh, warnings),
 			usageCoordination: normalizeUsageCoordinationConfig(record.usageCoordination, warnings),
 			streamTimeouts: normalizeStreamTimeoutConfig(record.streamTimeouts, warnings),
+			providerStreamTimeouts: normalizeProviderStreamTimeouts(
+				record.providerStreamTimeouts,
+				warnings,
+			),
 			credentialRotation: normalizeCredentialRotationConfig(record.credentialRotation, warnings),
 		},
 		warnings,

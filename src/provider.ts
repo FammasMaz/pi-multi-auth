@@ -27,6 +27,8 @@ import { isCloudflareCredentialManagedAuthProvider } from "./cloudflare-provider
 import { buildKiloRequestHeaders } from "./kilo-compat.js";
 import {
 	DEFAULT_STREAM_TIMEOUT_CONFIG,
+	resolveProviderStreamTimeouts,
+	type ProviderStreamTimeoutOverrides,
 	type StreamTimeoutConfig,
 } from "./config.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
@@ -708,6 +710,18 @@ function normalizeWatchdogTimeoutMs(value: number | undefined): number | undefin
 		: undefined;
 }
 
+function resolveStreamWatchdogTimeoutsForProvider(
+	providerId: SupportedProviderId,
+	defaults: StreamTimeoutConfig,
+	providerStreamTimeouts: ProviderStreamTimeoutOverrides,
+): { attemptTimeoutMs: number | undefined; idleTimeoutMs: number | undefined } {
+	const resolved = resolveProviderStreamTimeouts(providerId, defaults, providerStreamTimeouts);
+	return {
+		attemptTimeoutMs: normalizeWatchdogTimeoutMs(resolved.attemptTimeoutMs),
+		idleTimeoutMs: normalizeWatchdogTimeoutMs(resolved.idleTimeoutMs),
+	};
+}
+
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 	(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 }
@@ -822,6 +836,7 @@ export function createRotatingStreamWrapper(
 	excludedProviders?: ReadonlySet<string>,
 	managedProviders?: ReadonlySet<string>,
 	streamTimeouts: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
+	providerStreamTimeouts: ProviderStreamTimeoutOverrides = {},
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -833,8 +848,6 @@ export function createRotatingStreamWrapper(
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
-		const attemptTimeoutMs = normalizeWatchdogTimeoutMs(streamTimeouts.attemptTimeoutMs);
-		const idleTimeoutMs = normalizeWatchdogTimeoutMs(streamTimeouts.idleTimeoutMs);
 		let activeProviderId = resolveCredentialProviderId(model, fallbackProvider);
 		let activeModel = model;
 		let activeBaseProvider = baseProvider;
@@ -1201,6 +1214,11 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
+					const { attemptTimeoutMs, idleTimeoutMs } = resolveStreamWatchdogTimeoutsForProvider(
+						activeProviderId,
+						streamTimeouts,
+						providerStreamTimeouts,
+					);
 					const providerRequestHeaders = resolveProviderRequestHeaders(
 						activeProviderId,
 						options?.headers,
@@ -1521,6 +1539,7 @@ export async function registerMultiAuthProviders(
 		excludeProviders?: string[];
 		includeProviders?: string[];
 		streamTimeouts?: StreamTimeoutConfig;
+		providerStreamTimeouts?: ProviderStreamTimeoutOverrides;
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
@@ -1529,6 +1548,7 @@ export async function registerMultiAuthProviders(
 			? new Set(options.includeProviders)
 			: null;
 	const streamTimeouts = options?.streamTimeouts ?? DEFAULT_STREAM_TIMEOUT_CONFIG;
+	const providerStreamTimeouts = options?.providerStreamTimeouts ?? {};
 	const registry = accountManager.getProviderRegistry();
 	const providers = await registry.discoverProviderIds();
 	const metadataToRegister = (
@@ -1643,6 +1663,7 @@ export async function registerMultiAuthProviders(
 			excludeSet,
 			managedProviders,
 			streamTimeouts,
+			providerStreamTimeouts,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {
