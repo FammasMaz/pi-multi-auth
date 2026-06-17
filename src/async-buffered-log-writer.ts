@@ -174,6 +174,8 @@ export class AsyncBufferedLogWriter {
 		const flushSafely = (): void => {
 			void this.flush().catch(() => undefined);
 		};
+		// Only hook beforeExit. Pi owns SIGINT/SIGTERM for graceful TUI shutdown;
+		// registering signal handlers here can race with interactive-mode cleanup.
 		this.shutdownFlushHandler = flushSafely;
 		process.once("beforeExit", flushSafely);
 	}
