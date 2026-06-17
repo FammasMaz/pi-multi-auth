@@ -5441,7 +5441,21 @@ export class AccountManager {
 			return determineTokenExpiration(refreshed.access, refreshed.expires).expiresAt;
 		} catch (error) {
 			if (isOAuthRefreshFailureError(error) && error.details.permanent) {
-				throw error;
+				multiAuthDebugLogger.log("oauth_scheduled_refresh_permanent_failure", {
+					provider,
+					credentialRef: redactUsageCredentialIdentifier(credentialId),
+					message: error.message,
+				});
+				try {
+					await this.persistOAuthRefreshSchedule(provider);
+				} catch (persistError: unknown) {
+					multiAuthDebugLogger.log("oauth_refresh_schedule_persist_failed", {
+						provider,
+						credentialRef: redactUsageCredentialIdentifier(credentialId),
+						message: getErrorMessage(persistError),
+					});
+				}
+				return undefined;
 			}
 			return undefined;
 		}

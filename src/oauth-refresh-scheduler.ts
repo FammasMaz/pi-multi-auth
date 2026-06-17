@@ -1,4 +1,5 @@
 import { getErrorMessage } from "./auth-error-utils.js";
+import { multiAuthDebugLogger } from "./debug-logger.js";
 import {
 	DEFAULT_OAUTH_CONFIG,
 	isOAuthRefreshFailureError,
@@ -236,7 +237,12 @@ export class OAuthRefreshScheduler {
 		this.wakeTimer = setTimeout(() => {
 			this.wakeTimer = null;
 			this.wakeTimerScheduledAt = null;
-			void this.processDueRefreshes();
+			void this.processDueRefreshes().catch((error: unknown) => {
+				multiAuthDebugLogger.log("oauth_refresh_scheduler_cycle_failed", {
+					message: getErrorMessage(error),
+				});
+				this.scheduleNextWake();
+			});
 		}, delayMs);
 		this.wakeTimer.unref?.();
 	}
@@ -286,10 +292,13 @@ export class OAuthRefreshScheduler {
 			this.scheduleRetry(entry, Date.now() + this.config.minRefreshWindowMs);
 		}
 
-		await Promise.allSettled(
-			entriesToRefresh.map((entry) => this.triggerRefresh(entry.credentialId, entry.providerId)),
-		);
-		this.scheduleNextWake();
+		try {
+			await Promise.allSettled(
+				entriesToRefresh.map((entry) => this.triggerRefresh(entry.credentialId, entry.providerId)),
+			);
+		} finally {
+			this.scheduleNextWake();
+		}
 	}
 
 	private async triggerRefresh(credentialId: string, providerId: string): Promise<RefreshResult> {
