@@ -2492,12 +2492,29 @@ class MultiAuthManagerModal {
 	): Promise<{ message: string; credentialId: string } | null> {
 		const capabilities = this.accountManager.getProviderCapabilities(provider);
 		const supportsBatchAdd = !capabilities.supportsOAuth;
-		const cloudflareHint = isCloudflareWorkersAiProvider(provider)
-			? " Include an account ID, dashboard token URL, or Workers AI base URL to skip account discovery."
-			: "";
 		const apiKeyInput = supportsBatchAdd
-			? await this.ctx.ui.editor(`Paste API key(s) for ${provider} (one per line).${cloudflareHint}`)
-			: await this.ctx.ui.input(`Paste API key for ${provider}.${cloudflareHint}`);
+			? await this.ctx.ui.editor(
+					isCloudflareWorkersAiProvider(provider)
+						? [
+								`Cloudflare Workers AI — ${provider}`,
+								"",
+								"Line 1: API token (must start with cfat_)",
+								"Line 2+ (recommended): 32-char account ID OR full base URL:",
+								"  https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
+								"",
+								"Without line 2, multi-auth calls Cloudflare account discovery (needs Account:Read on the token).",
+								"Lines starting with # are ignored.",
+								"",
+								"cfat_your_token_here",
+								"your_32_character_account_id_here",
+							].join("\n")
+						: `Paste API key(s) for ${provider} (one per line).`,
+				)
+			: await this.ctx.ui.input(
+					isCloudflareWorkersAiProvider(provider)
+						? `Paste Cloudflare API token (cfat_...). Add account ID on a second line via the multiline editor (batch add).`
+						: `Paste API key for ${provider}.`,
+				);
 		if (!apiKeyInput) {
 			return null;
 		}

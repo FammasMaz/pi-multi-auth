@@ -21,7 +21,10 @@ import {
 } from "./cloudflare-credential-identity.js";
 import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
 import { CLINE_REFRESH_LEAD_TIME_MS } from "./cline-compat.js";
-import { isValidCloudflareOpenAIBaseUrl } from "./credential-request-overrides.js";
+import {
+	isValidCloudflareOpenAIBaseUrl,
+	resolveCloudflareWorkersAiBaseUrlFromCredential,
+} from "./credential-request-overrides.js";
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import { FailoverChainManager } from "./failover-chain.js";
 import { HealthScorer } from "./health-scorer.js";
@@ -4510,6 +4513,19 @@ export class AccountManager {
 			isValidCloudflareOpenAIBaseUrl(configuredBaseUrl)
 		) {
 			return credential;
+		}
+
+		const envBaseUrl = resolveCloudflareWorkersAiBaseUrlFromCredential(credential);
+		if (envBaseUrl) {
+			const updatedCredential = await this.authWriter.setCredentialRequestOverrides(
+				credentialId,
+				{ baseUrl: envBaseUrl },
+			);
+			multiAuthDebugLogger.log("cloudflare_account_base_url_from_env", {
+				provider,
+				credentialRef: redactUsageCredentialIdentifier(credentialId),
+			});
+			return updatedCredential;
 		}
 
 		const apiToken = getCredentialRequestSecret(provider, credential).trim();

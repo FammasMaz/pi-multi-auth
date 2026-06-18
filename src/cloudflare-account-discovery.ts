@@ -78,6 +78,9 @@ function resolveCloudflareDiscoveryHint(
 	if (status === 401) {
 		return "Check that the pasted value is a Cloudflare API token and not a redacted token preview.";
 	}
+	if (codes.has(6003) || /invalid request headers/i.test(messages)) {
+		return "Use a Cloudflare API Token (cfat_...) created in the dashboard, not a Global API Key. Paste the token on one line and your 32-character account ID (or full Workers AI base URL) on the next line in /multi-auth to skip account discovery.";
+	}
 	if (status === 403) {
 		return "Grant account read/list access for automatic discovery, or paste the account ID, dashboard token URL, or full Workers AI base URL alongside the token.";
 	}

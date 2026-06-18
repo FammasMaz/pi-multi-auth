@@ -5,9 +5,11 @@ import {
 } from "./credential-request-overrides.js";
 import type { CredentialRequestOverrides } from "./types.js";
 
-const CLOUDFLARE_API_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])cfat_[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
+const CLOUDFLARE_API_TOKEN_PATTERN =
+	/(?<![A-Za-z0-9_-])(?:cfat_|cfut_)[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
 const CLOUDFLARE_WORKERS_AI_BASE_URL_PATTERN =
 	/https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/[a-f0-9]{32}\/ai\/v1\/?/gi;
+const CLOUDFLARE_STANDALONE_ACCOUNT_ID_PATTERN = /^[a-f0-9]{32}$/i;
 const CLOUDFLARE_ACCOUNT_ID_PATTERNS: readonly RegExp[] = [
 	/dash\.cloudflare\.com\/([a-f0-9]{32})(?:\/|$|[?#])/gi,
 	/(?:\/api\/v4|\/client\/v4)\/accounts\/([a-f0-9]{32})(?:\/|$|[?#])/gi,
@@ -71,6 +73,12 @@ function extractCloudflareWorkersAiBaseUrls(value: string): string[] {
 function extractCloudflareAccountIds(value: string): string[] {
 	const normalized = normalizeCloudflareScanText(value);
 	const accountIds: string[] = [];
+	for (const line of normalized.split("\n")) {
+		const trimmed = line.trim();
+		if (CLOUDFLARE_STANDALONE_ACCOUNT_ID_PATTERN.test(trimmed)) {
+			accountIds.push(trimmed.toLowerCase());
+		}
+	}
 	for (const pattern of CLOUDFLARE_ACCOUNT_ID_PATTERNS) {
 		for (const match of normalized.matchAll(pattern)) {
 			const accountId = match[1]?.trim().toLowerCase();
@@ -156,7 +164,7 @@ export function parseCloudflareCredentialBatchInput(
 
 	for (const line of lines) {
 		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("```")) {
+		if (!trimmed || trimmed.startsWith("```") || trimmed.startsWith("#")) {
 			ignoredLineCount += 1;
 			continue;
 		}

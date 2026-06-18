@@ -829,12 +829,16 @@ interface RotationFailureDetails {
 
 function parseRotationFailureDetails(errorMessage: string): RotationFailureDetails {
 	const details: RotationFailureDetails = {};
-	const credentialCountMatch = /All\s+(\d+)\s+rotated credential\(s\)/i.exec(errorMessage);
+	const credentialCountMatch =
+		/All\s+(\d+)\s+rotated credential\(s\)/i.exec(errorMessage) ??
+		/(\d+)\s+credential\(s\)\s+tried/i.exec(errorMessage);
 	if (credentialCountMatch?.[1]) {
 		details.credentialCount = Number.parseInt(credentialCountMatch[1], 10);
 	}
 
-	const lastCredentialErrorMatch = /Last (?:credential )?error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage);
+	const lastCredentialErrorMatch =
+		/Last (?:credential )?error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage) ??
+		/Last error:\s*([^]*?)$/i.exec(errorMessage);
 	if (lastCredentialErrorMatch?.[1]?.trim()) {
 		details.lastCredentialError = lastCredentialErrorMatch[1].trim();
 	}

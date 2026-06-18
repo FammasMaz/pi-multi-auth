@@ -3,6 +3,12 @@ import type { StoredAuthCredential, SupportedProviderId } from "./types.js";
 import { isRecord } from "./auth-error-utils.js";
 import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
 
+const CLOUDFLARE_ACCOUNT_ID_ENV_KEYS = [
+	"CLOUDFLARE_ACCOUNT_ID",
+	"CF_ACCOUNT_ID",
+	"ACCOUNT_ID",
+] as const;
+
 const CLOUDFLARE_OPENAI_BASE_URL_PATTERN =
 	/^\/client\/v4\/accounts\/[^/]+\/ai\/v1\/?$/;
 const LOOPBACK_IPV4_PREFIX = "127.";
@@ -125,6 +131,42 @@ function validateHeaders(
 	return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+function readCloudflareAccountIdFromCredentialEnv(
+	credential: StoredAuthCredential,
+): string | undefined {
+	if (credential.type !== "api_key") {
+		return undefined;
+	}
+	const rawEnv = (credential as StoredAuthCredential & { env?: unknown }).env;
+	if (!isRecord(rawEnv)) {
+		return undefined;
+	}
+	for (const key of CLOUDFLARE_ACCOUNT_ID_ENV_KEYS) {
+		const value = rawEnv[key];
+		if (typeof value === "string" && /^[a-f0-9]{32}$/i.test(value.trim())) {
+			return value.trim().toLowerCase();
+		}
+	}
+	return undefined;
+}
+
+export function resolveCloudflareWorkersAiBaseUrlFromCredential(
+	credential: StoredAuthCredential,
+): string | undefined {
+	const configuredBaseUrl = credential.request?.baseUrl;
+	if (
+		typeof configuredBaseUrl === "string" &&
+		isValidCloudflareOpenAIBaseUrl(configuredBaseUrl)
+	) {
+		return configuredBaseUrl.replace(/\/$/, "");
+	}
+	const accountId = readCloudflareAccountIdFromCredentialEnv(credential);
+	if (!accountId) {
+		return undefined;
+	}
+	return buildCloudflareWorkersAiBaseUrl(accountId);
+}
+
 export function buildCloudflareWorkersAiBaseUrl(accountId: string): string {
 	const normalized = accountId.trim();
 	if (!normalized) {
@@ -220,6 +262,14 @@ export function applyCredentialRequestOverrides({
 			...model,
 			baseUrl: validateBaseUrl(provider, credentialId, configuredBaseUrl),
 		};
+	} else if (isCloudflareWorkersAiProvider(provider)) {
+		const envBaseUrl = resolveCloudflareWorkersAiBaseUrlFromCredential(credential);
+		if (envBaseUrl) {
+			effectiveModel = {
+				...model,
+				baseUrl: validateBaseUrl(provider, credentialId, envBaseUrl),
+			};
+		}
 	}
 
 	if (isCloudflareWorkersAiProvider(provider)) {
