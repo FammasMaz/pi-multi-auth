@@ -336,6 +336,31 @@ export function rankBlazeApiCredentialsByPlanTier(
 }
 
 // ---------------------------------------------------------------------------
+// Codex entitlement helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex/GPT credential routing order, highest priority first.
+ *
+ * The user-facing preference is Pro → Plus → Business/Team → Free. Enterprise
+ * is grouped with Pro because it has the same high-tier quota shape in Codex
+ * usage metadata, while Team shares the Business tier. Unknown plans are still
+ * tried after verified tiers as a last resort.
+ */
+const CODEX_PLAN_TIER_GROUPS: readonly (readonly CodexPlanType[])[] = [
+	["pro", "enterprise"],
+	["plus"],
+	["business", "team"],
+	["free"],
+];
+
+export function rankCodexCredentialsByPlanTier(
+	credentialPlanTypes: ReadonlyMap<string, CodexPlanType>,
+): readonly (readonly string[])[] {
+	return rankCredentialsByPlanTierGroups(credentialPlanTypes, CODEX_PLAN_TIER_GROUPS);
+}
+
+// ---------------------------------------------------------------------------
 // Kiro entitlement helpers
 // ---------------------------------------------------------------------------
 
@@ -435,9 +460,21 @@ function rankCredentialsByPlanTier<TPlan extends string>(
 	credentialPlanTypes: ReadonlyMap<string, TPlan>,
 	planOrder: readonly TPlan[],
 ): readonly (readonly string[])[] {
+	return rankCredentialsByPlanTierGroups(
+		credentialPlanTypes,
+		planOrder.map((tier) => [tier]),
+	);
+}
+
+function rankCredentialsByPlanTierGroups<TPlan extends string>(
+	credentialPlanTypes: ReadonlyMap<string, TPlan>,
+	planGroups: readonly (readonly TPlan[])[],
+): readonly (readonly string[])[] {
 	const bucketByTier = new Map<TPlan, string[]>();
-	for (const tier of planOrder) {
-		bucketByTier.set(tier, []);
+	for (const group of planGroups) {
+		for (const tier of group) {
+			bucketByTier.set(tier, []);
+		}
 	}
 	const unknownBucket: string[] = [];
 	for (const [credentialId, planType] of credentialPlanTypes) {
@@ -449,10 +486,16 @@ function rankCredentialsByPlanTier<TPlan extends string>(
 		}
 	}
 	const tiers: string[][] = [];
-	for (const tier of planOrder) {
-		const bucket = bucketByTier.get(tier);
-		if (bucket && bucket.length > 0) {
-			tiers.push(bucket);
+	for (const group of planGroups) {
+		const groupBucket: string[] = [];
+		for (const tier of group) {
+			const bucket = bucketByTier.get(tier);
+			if (bucket) {
+				groupBucket.push(...bucket);
+			}
+		}
+		if (groupBucket.length > 0) {
+			tiers.push(groupBucket);
 		}
 	}
 	if (unknownBucket.length > 0) {

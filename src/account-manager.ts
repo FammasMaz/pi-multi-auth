@@ -87,6 +87,7 @@ import {
 	normalizeModelId,
 	providerUsesPlanTierRanking,
 	rankBlazeApiCredentialsByPlanTier,
+	rankCodexCredentialsByPlanTier,
 	rankKiroCredentialsByPlanTier,
 } from "./model-entitlements.js";
 import { createUsageCredentialCacheKey, UsageService } from "./usage/index.js";
@@ -7227,8 +7228,7 @@ export class AccountManager {
 		const resolutionStartedAt = Date.now();
 		const verifiedEligibleCredentialIds: string[] = [];
 		const preferredCredentialIds: string[] = [];
-		const knownFreePlanCredentialIds: string[] = [];
-		const unknownFreePlanCredentialIds: string[] = [];
+		const codexPlanTypeByCredentialId = new Map<string, CodexPlanType>();
 		const usageFailureCredentialIds: string[] = [];
 		const unknownPlanCredentialIds: string[] = [];
 		const ineligibleCredentialIds: string[] = [];
@@ -7252,8 +7252,6 @@ export class AccountManager {
 		const removeFromEligibilityLists = (credentialId: string): void => {
 			removeFromList(verifiedEligibleCredentialIds, credentialId);
 			removeFromList(preferredCredentialIds, credentialId);
-			removeFromList(knownFreePlanCredentialIds, credentialId);
-			removeFromList(unknownFreePlanCredentialIds, credentialId);
 			removeFromList(usageFailureCredentialIds, credentialId);
 			removeFromList(unknownPlanCredentialIds, credentialId);
 			removeFromList(ineligibleCredentialIds, credentialId);
@@ -7269,10 +7267,6 @@ export class AccountManager {
 					hasUnknownPlanType = true;
 				} else {
 					pushUnique(verifiedEligibleCredentialIds, credentialId);
-					if (prefersFreePlan) {
-						pushUnique(preferredCredentialIds, credentialId);
-						pushUnique(unknownFreePlanCredentialIds, credentialId);
-					}
 				}
 				return;
 			}
@@ -7289,15 +7283,12 @@ export class AccountManager {
 					}
 				} else {
 					pushUnique(verifiedEligibleCredentialIds, credentialId);
-					if (prefersFreePlan) {
-						pushUnique(preferredCredentialIds, credentialId);
-						pushUnique(unknownFreePlanCredentialIds, credentialId);
-					}
 				}
 				return;
 			}
 
 			const planType = normalizeCodexPlanType(snapshot.planType);
+			codexPlanTypeByCredentialId.set(credentialId, planType);
 			const quotaState = usage.displayOnly || options.planOnly
 				? ({ state: "unknown" } satisfies UsageQuotaState)
 				: inferQuotaStateFromUsage(snapshot);
@@ -7328,14 +7319,6 @@ export class AccountManager {
 			}
 
 			pushUnique(verifiedEligibleCredentialIds, credentialId);
-			if (prefersFreePlan && planType === "free") {
-				pushUnique(preferredCredentialIds, credentialId);
-				pushUnique(knownFreePlanCredentialIds, credentialId);
-			}
-			if (prefersFreePlan && planType === "unknown") {
-				pushUnique(preferredCredentialIds, credentialId);
-				pushUnique(unknownFreePlanCredentialIds, credentialId);
-			}
 		};
 
 		// Quota recovery bypass: check which credentials have stale quota cooldown
@@ -7378,7 +7361,7 @@ export class AccountManager {
 				? normalizeCodexPlanType(usage.snapshot.planType)
 				: "unknown";
 			if (
-				requiresEntitlement &&
+				(requiresEntitlement || prefersFreePlan) &&
 				!usage?.error &&
 				(!hasPlanEvidence || planType === "unknown")
 			) {
@@ -7401,7 +7384,7 @@ export class AccountManager {
 		let bootstrapPerformed = false;
 		let synchronousFetchCount = 0;
 		const bootstrapCredentialIds =
-			requiresEntitlement && verifiedEligibleCredentialIds.length === 0
+			(requiresEntitlement && verifiedEligibleCredentialIds.length === 0) || prefersFreePlan
 				? bootstrapCandidateCredentialIds.filter(
 					(credentialId) => !backgroundExcludedCredentialIds.has(credentialId),
 				)
@@ -7441,9 +7424,11 @@ export class AccountManager {
 					const usageResult = usageResults[index];
 					if (usageResult?.status === "fulfilled") {
 						processUsage(credentialId, usageResult.value);
-					} else {
+					} else if (requiresEntitlement) {
 						pushUnique(usageFailureCredentialIds, credentialId);
 						hasUsageFailure = true;
+					} else {
+						processUsage(credentialId, null);
 					}
 				}
 				if (verifiedEligibleCredentialIds.length >= 1) {
@@ -7505,9 +7490,17 @@ export class AccountManager {
 			}
 		}
 
-		const preferredCredentialTiers = prefersFreePlan
-			? [knownFreePlanCredentialIds, unknownFreePlanCredentialIds].filter((tier) => tier.length > 0)
-			: undefined;
+		const codexRankingInput = new Map<string, CodexPlanType>();
+		for (const credentialId of eligibleCredentialIds) {
+			codexRankingInput.set(
+				credentialId,
+				codexPlanTypeByCredentialId.get(credentialId) ?? "unknown",
+			);
+		}
+		const preferredCredentialTiers = rankCodexCredentialsByPlanTier(codexRankingInput);
+		if (preferredCredentialIds.length === 0 && preferredCredentialTiers.length > 0) {
+			preferredCredentialIds.push(...preferredCredentialTiers[0]);
+		}
 
 		multiAuthDebugLogger.log("codex_entitlement_selection_timing", {
 			provider,

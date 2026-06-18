@@ -170,7 +170,7 @@ test("account manager preserves current selection for unconstrained codex reques
 	assert.equal(selected.provider, CODEX_PROVIDER_ID);
 });
 
-test("account manager prefers free codex credentials for free-eligible models", async (t) => {
+test("account manager ranks codex gpt credentials by plan tier", async (t) => {
 	const accountManager = await createCodexAccountManager(t, [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
@@ -180,7 +180,7 @@ test("account manager prefers free codex credentials for free-eligible models", 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5.5",
 	});
-	assert.equal(selected.credentialId, "openai-codex");
+	assert.equal(selected.credentialId, "openai-codex-2");
 });
 
 test("account manager reuses codex model routing usage lookups across repeated selections", async (t) => {
@@ -249,7 +249,7 @@ test("account manager reuses codex model routing usage lookups across repeated s
 		selectionCache,
 	});
 
-	assert.equal(first.credentialId, "openai-codex-1");
+	assert.equal(first.credentialId, "openai-codex-2");
 	assert.equal(second.credentialId, "openai-codex-2");
 	assert.deepEqual(Object.fromEntries(fetchCountBySecret), {});
 });
