@@ -132,6 +132,7 @@ import {
 	writeMultiAuthProviderHidden,
 	writeMultiAuthProviderRotationMode,
 } from "./config.js";
+import { shouldPermanentlyDisableCredential } from "./credential-disable-policy.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import {
@@ -2039,6 +2040,10 @@ export class AccountManager {
 		return this.providerRegistry;
 	}
 
+	private isNoCooldownProvider(provider: SupportedProviderId): boolean {
+		return this.extensionConfig.noCooldownProviders.includes(provider);
+	}
+
 	private isOAuthRefreshManagedForProvider(provider: SupportedProviderId): boolean {
 		return (
 			INTERNAL_OAUTH_REFRESH_CONFIG.enabled &&
@@ -3662,6 +3667,20 @@ export class AccountManager {
 			throw new Error("Cannot disable credential without a non-empty error message.");
 		}
 
+		const disablePolicy = {
+			autoDisableBrokenCredentials:
+				this.extensionConfig.credentialRotation.autoDisableBrokenCredentials,
+		};
+		if (!shouldPermanentlyDisableCredential(errorMessage, errorKind, disablePolicy)) {
+			multiAuthDebugLogger.log("credential_disable_skipped", {
+				provider,
+				credentialRef: redactUsageCredentialIdentifier(credentialId),
+				errorKind,
+				message: errorMessage.slice(0, 200),
+			});
+			return;
+		}
+
 		const disabledPlanType = provider === OPENAI_CODEX_PROVIDER_ID
 			? this.readCachedCodexCredentialPlanType(credentialId)
 			: undefined;
@@ -5125,6 +5144,9 @@ export class AccountManager {
 		credentialId: string,
 		errorMessage: string,
 	): Promise<number> {
+		if (this.isNoCooldownProvider(provider)) {
+			return 0;
+		}
 		const message = errorMessage.trim().slice(0, 500) || "Transient provider error";
 		await this.recordCredentialFailure(provider, credentialId, 0, "provider_transient", message);
 		let cooldownMs = TRANSIENT_COOLDOWN_BASE_MS;

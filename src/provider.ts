@@ -28,6 +28,12 @@ import {
 import { buildClineClientHeaders } from "./cline-compat.js";
 import { isCloudflareCredentialManagedAuthProvider } from "./cloudflare-provider.js";
 import { buildKiloRequestHeaders } from "./kilo-compat.js";
+import {
+	DEFAULT_STREAM_TIMEOUT_CONFIG,
+	resolveProviderStreamTimeouts,
+	type ProviderStreamTimeoutOverrides,
+	type StreamTimeoutConfig,
+} from "./config.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { getCredentialRequestSecret } from "./credential-display.js";
@@ -946,6 +952,110 @@ async function shouldRetryBlazeApiRequestLimitWithLiveCapacity(
 	}
 }
 
+function normalizeWatchdogTimeoutMs(value: number | undefined): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.trunc(value)
+		: undefined;
+}
+
+function resolveStreamWatchdogTimeoutsForProvider(
+	providerId: SupportedProviderId,
+	defaults: StreamTimeoutConfig,
+	providerStreamTimeouts: ProviderStreamTimeoutOverrides,
+	noStreamWatchdogProviders: readonly string[] = [],
+): { attemptTimeoutMs: number | undefined; idleTimeoutMs: number | undefined } {
+	if (noStreamWatchdogProviders.includes(providerId)) {
+		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
+	}
+	const resolved = resolveProviderStreamTimeouts(providerId, defaults, providerStreamTimeouts);
+	const attemptTimeoutMs = normalizeWatchdogTimeoutMs(resolved.attemptTimeoutMs);
+	const idleTimeoutMs = normalizeWatchdogTimeoutMs(resolved.idleTimeoutMs);
+	if (attemptTimeoutMs === undefined && idleTimeoutMs === undefined) {
+		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
+	}
+	return { attemptTimeoutMs, idleTimeoutMs };
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+	(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+}
+
+function createStreamTimeoutError(
+	kind: "attempt_timeout" | "idle_timeout",
+	providerId: SupportedProviderId,
+	credentialId: string,
+	modelId: string,
+	timeoutMs: number,
+): Error {
+	return new Error(
+		`multi-auth stream timeout (${kind}) after ${timeoutMs}ms for ${providerId} credential ${credentialId} model ${modelId}`,
+	);
+}
+
+async function readNextStreamEventWithWatchdog(
+	iterator: AsyncIterator<AssistantMessageEvent>,
+	signal: AbortSignal | undefined,
+	timeoutMs: number | undefined,
+	createTimeoutError: () => Error,
+): Promise<IteratorResult<AssistantMessageEvent>> {
+	if (timeoutMs === undefined) {
+		const next = await iterator.next();
+		return next;
+	}
+
+	let timeoutId: ReturnType<typeof setTimeout> | null = null;
+	let timedOut = false;
+	const nextPromise = Promise.resolve(iterator.next());
+	const timeoutPromise = new Promise<never>((_resolve, reject) => {
+		timeoutId = setTimeout(() => {
+			timedOut = true;
+			reject(createTimeoutError());
+		}, timeoutMs);
+		unrefTimer(timeoutId);
+	});
+
+	try {
+		if (signal?.aborted) {
+			throw signal.reason ?? new Error("Request was aborted.");
+		}
+		return await Promise.race([nextPromise, timeoutPromise]);
+	} finally {
+		if (timeoutId) {
+			clearTimeout(timeoutId);
+		}
+		if (timedOut) {
+			void nextPromise.catch(() => undefined);
+		}
+	}
+}
+
+function closeAsyncIterator(iterator: AsyncIterator<AssistantMessageEvent>): void {
+	try {
+		const closeResult = iterator.return?.();
+		if (closeResult) {
+			void Promise.resolve(closeResult).catch(() => undefined);
+		}
+	} catch {
+		// Ignore cleanup failures.
+	}
+}
+
+type ProviderPassthroughReason = "excluded" | "unmanaged_provider";
+
+function resolveProviderPassthroughReason(
+	provider: SupportedProviderId,
+	excludedProviders?: ReadonlySet<string>,
+	managedProviders?: ReadonlySet<string>,
+): ProviderPassthroughReason | null {
+	if (excludedProviders?.has(provider)) {
+		return "excluded";
+	}
+	if (managedProviders && !managedProviders.has(provider)) {
+		return "unmanaged_provider";
+	}
+	return null;
+}
+
 async function resolveRotationAttemptLimit(
 	accountManager: AccountManager,
 	providerId: SupportedProviderId,
@@ -973,6 +1083,10 @@ export function createRotatingStreamWrapper(
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
 	excludedProviders?: ReadonlySet<string>,
+	managedProviders?: ReadonlySet<string>,
+	streamTimeouts: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
+	providerStreamTimeouts: ProviderStreamTimeoutOverrides = {},
+	noStreamWatchdogProviders: readonly string[] = [],
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -1014,13 +1128,17 @@ export function createRotatingStreamWrapper(
 				stream.end(assistantAbort.error);
 			};
 
-			// Providers explicitly excluded from multi-auth rotation should pass
-			// through to the base API provider without credential management.
-			if (excludedProviders?.has(activeProviderId)) {
-				multiAuthDebugLogger.log("provider_excluded_passthrough", {
+			const passthroughReason = resolveProviderPassthroughReason(
+				activeProviderId,
+				excludedProviders,
+				managedProviders,
+			);
+			if (passthroughReason) {
+				multiAuthDebugLogger.log("provider_passthrough", {
 					provider: activeProviderId,
 					model: activeModel.id,
 					api: activeModel.api,
+					reason: passthroughReason,
 				});
 				try {
 					const innerStream = activeBaseProvider.streamSimple(activeModel, context, {
@@ -1537,6 +1655,12 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
+					const { attemptTimeoutMs, idleTimeoutMs } = resolveStreamWatchdogTimeoutsForProvider(
+						activeProviderId,
+						streamTimeouts,
+						providerStreamTimeouts,
+						noStreamWatchdogProviders,
+					);
 					const providerRequestHeaders = resolveProviderRequestHeaders(
 						activeProviderId,
 						options?.headers,
@@ -1613,8 +1737,50 @@ export function createRotatingStreamWrapper(
 					let shouldRetrySameCredential = false;
 					let shouldRotateCredential = false;
 
+					const innerIterator = innerStream[Symbol.asyncIterator]();
 					try {
-						for await (const rawEvent of innerStream) {
+						while (true) {
+							const elapsedMs = Date.now() - requestStartedAt;
+							const attemptRemainingMs = attemptTimeoutMs === undefined
+								? undefined
+								: attemptTimeoutMs - elapsedMs;
+							if (attemptRemainingMs !== undefined && attemptRemainingMs <= 0) {
+								throw createStreamTimeoutError(
+									"attempt_timeout",
+									activeProviderId,
+									selected.credentialId,
+									requestModel.id,
+									attemptTimeoutMs ?? 0,
+								);
+							}
+							const nextTimeoutMs = [attemptRemainingMs, idleTimeoutMs]
+								.filter((value): value is number => value !== undefined && value > 0)
+								.reduce<number | undefined>(
+									(min, value) => (min === undefined ? value : Math.min(min, value)),
+									undefined,
+								);
+							const timeoutKind = attemptRemainingMs !== undefined && nextTimeoutMs === attemptRemainingMs
+								? "attempt_timeout"
+								: "idle_timeout";
+							const timeoutBudgetMs = timeoutKind === "attempt_timeout"
+								? (attemptTimeoutMs ?? nextTimeoutMs ?? 0)
+								: (idleTimeoutMs ?? nextTimeoutMs ?? 0);
+							const nextEvent = await readNextStreamEventWithWatchdog(
+								innerIterator,
+								options?.signal,
+								nextTimeoutMs,
+								() => createStreamTimeoutError(
+									timeoutKind,
+									activeProviderId,
+									selected.credentialId,
+									requestModel.id,
+									timeoutBudgetMs,
+								),
+							);
+							if (nextEvent.done) {
+								break;
+							}
+							const rawEvent = nextEvent.value;
 							const forwardedEvents = sanitizeOllamaThinkingEvent(
 								rawEvent,
 								activeProviderId,
@@ -1752,6 +1918,8 @@ export function createRotatingStreamWrapper(
 								throw error;
 							}
 						}
+					} finally {
+						closeAsyncIterator(innerIterator);
 					}
 
 					if (shouldRetrySameCredential) {
@@ -1883,9 +2051,15 @@ export async function registerMultiAuthProviders(
 	options?: {
 		excludeProviders?: string[];
 		includeProviders?: string[];
+		streamTimeouts?: StreamTimeoutConfig;
+		providerStreamTimeouts?: ProviderStreamTimeoutOverrides;
+		noStreamWatchdogProviders?: readonly string[];
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
+	const streamTimeouts = options?.streamTimeouts ?? DEFAULT_STREAM_TIMEOUT_CONFIG;
+	const providerStreamTimeouts = options?.providerStreamTimeouts ?? {};
+	const noStreamWatchdogProviders = options?.noStreamWatchdogProviders ?? [];
 	const includeSet =
 		options?.includeProviders && options.includeProviders.length > 0
 			? new Set(options.includeProviders)
@@ -1928,6 +2102,8 @@ export async function registerMultiAuthProviders(
 			}),
 		)
 	).filter((metadata): metadata is ProviderRegistrationMetadata => metadata !== null);
+
+	const managedProviders = new Set(metadataToRegister.map((metadata) => metadata.provider));
 
 	for (const metadata of metadataToRegister) {
 		recordProviderDiscovery(metadata.provider);
@@ -1978,6 +2154,10 @@ export async function registerMultiAuthProviders(
 			baseProvider,
 			baseProvidersByApi,
 			excludeSet,
+			managedProviders,
+			streamTimeouts,
+			providerStreamTimeouts,
+			noStreamWatchdogProviders,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

@@ -47,13 +47,15 @@ test("cloneMultiAuthExtensionConfig returns a deep clone of defaults when called
 });
 
 test("cloneMultiAuthExtensionConfig clones arrays and objects", () => {
-	const original = {
+	const original = cloneMultiAuthExtensionConfig({
+		...DEFAULT_MULTI_AUTH_CONFIG,
 		debug: true,
 		hiddenProviders: ["provider1", "provider2"],
 		rotationModes: { provider1: "usage-based" as const },
-	};
+	});
 	const cloned = cloneMultiAuthExtensionConfig(original);
-	assert.deepEqual(cloned, original);
+	assert.equal(cloned.debug, true);
+	assert.deepEqual(cloned.hiddenProviders, ["provider1", "provider2"]);
 	cloned.hiddenProviders.push("provider3");
 	assert.equal(original.hiddenProviders.length, 2);
 });

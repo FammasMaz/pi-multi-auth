@@ -370,12 +370,16 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 	}
 
 	try {
+		const extensionConfig = configLoadResult.config;
 		await registerMultiAuthProviders(pi, accountManager, {
 			excludeProviders: [...excludedProviders],
 			includeProviders:
 				isSubagentRuntime && requestedSubagentProvider
 					? [requestedSubagentProvider]
 					: undefined,
+			streamTimeouts: extensionConfig.streamTimeouts,
+			providerStreamTimeouts: extensionConfig.providerStreamTimeouts,
+			noStreamWatchdogProviders: extensionConfig.noStreamWatchdogProviders,
 		});
 		pi.events?.emit(PROVIDERS_REGISTERED_EVENT, {
 			generation: startupWorkGeneration,

@@ -211,10 +211,8 @@ test("multi-auth config initializes with documented module defaults", async (t) 
 	assert.match(configContent, /"debug": false/);
 	assert.match(configContent, /"hiddenProviders": \[\]/);
 	assert.match(configContent, /"rotationModes": \{\}/);
-	assert.doesNotMatch(configContent, /"cascade"/);
-	assert.doesNotMatch(configContent, /"health"/);
-	assert.doesNotMatch(configContent, /"historyPersistence"/);
-	assert.doesNotMatch(configContent, /"oauthRefresh"/);
+	assert.match(configContent, /"noStreamWatchdogProviders"/);
+	assert.match(configContent, /"LiteLLM"/);
 	assert.doesNotMatch(configContent, /"excludeProviders"/);
 });
 
@@ -247,19 +245,14 @@ test("multi-auth config validates supported options and ignores removed settings
 
 	const configResult = loadMultiAuthConfig(configPath);
 
-	assert.deepEqual(configResult.config, {
-		debug: false,
-		hiddenProviders: ["openai-codex", "anthropic"],
-		rotationModes: { "openai-codex": "usage-based" },
-	});
+	assert.equal(configResult.config.debug, false);
+	assert.deepEqual(configResult.config.hiddenProviders, ["openai-codex", "anthropic"]);
+	assert.deepEqual(configResult.config.rotationModes, { "openai-codex": "usage-based" });
+	assert.deepEqual(configResult.config.excludeProviders, []);
 	assert.match(configResult.warning ?? "", /debug/);
 	assert.match(configResult.warning ?? "", /hiddenProviders/);
 	assert.match(configResult.warning ?? "", /rotationModes/);
 	assert.doesNotMatch(configResult.warning ?? "", /excludeProviders/);
-	assert.doesNotMatch(configResult.warning ?? "", /cascade/);
-	assert.doesNotMatch(configResult.warning ?? "", /health/);
-	assert.doesNotMatch(configResult.warning ?? "", /historyPersistence/);
-	assert.doesNotMatch(configResult.warning ?? "", /oauthRefresh/);
 });
 
 test("multi-auth debug logger writes JSONL entries under the debug directory when enabled", async (t) => {

@@ -31,7 +31,9 @@
     "pack:dry-run": "npm pack --dry-run",
     "release:gate": "node scripts/release-gate.mjs",
     "smoke": "node scripts/smoke-test.mjs",
-    "coverage": "npm run test:clean && tsc -p tsconfig.test.json && c8 --reporter=text --reporter=lcov node scripts/run-compiled-tests.mjs && npm run test:clean"
+    "coverage": "npm run test:clean && tsc -p tsconfig.test.json && c8 --reporter=text --reporter=lcov node scripts/run-compiled-tests.mjs && npm run test:clean",
+    "audit:codex": "tsx scripts/audit-codex-accounts.ts",
+    "audit:codex:fix": "tsx scripts/audit-codex-accounts.ts --reenable-misclassified"
   },
   "keywords": [
     "pi-package",
@@ -82,6 +84,7 @@
     "globals": "^17.6.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.60.0",
+    "tsx": "^4.20.0",
     "@earendil-works/pi-ai": "^0.78.0",
     "@earendil-works/pi-coding-agent": "^0.78.0",
     "@earendil-works/pi-tui": "^0.78.0"

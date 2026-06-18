@@ -52,7 +52,7 @@ import {
 	resolveDefaultRotationMode,
 	resolveSelectableRotationModes,
 } from "./rotation-modes.js";
-import { normalizeCodexPlanType } from "./model-entitlements.js";
+import { isPlanEligibleForModel, normalizeCodexPlanType } from "./model-entitlements.js";
 import {
 	LEGACY_SUPPORTED_PROVIDERS,
 	type CredentialRequestOverrides,
@@ -488,6 +488,60 @@ function getPlanHighlightColor(planType: string | null | undefined): PlanHighlig
 function formatPlanDetailLabel(planType: string | null | undefined, displayOnly: boolean): string {
 	const label = normalizePlanLabel(planType);
 	return displayOnly ? `${label} (last known)` : label;
+}
+
+export type PlanFilterMode = "all" | "paid" | "free";
+
+const PLAN_FILTER_SEQUENCE: readonly PlanFilterMode[] = ["all", "paid", "free"];
+
+function formatPlanFilterLabel(mode: PlanFilterMode): string {
+	switch (mode) {
+		case "paid":
+			return "Plus/Paid";
+		case "free":
+			return "Free";
+		default:
+			return "All";
+	}
+}
+
+export function resolveCredentialPlanLabel(credential: CredentialStatus): string | null {
+	const snapshotPlan = normalizeInlineText(credential.usageSnapshot?.planType ?? "").trim();
+	if (snapshotPlan) {
+		return snapshotPlan;
+	}
+	const tier = normalizeInlineText(credential.planTier ?? "").trim();
+	return tier || null;
+}
+
+export function classifyCredentialPlanTier(
+	credential: CredentialStatus,
+): "paid" | "free" | null {
+	const planLabel = resolveCredentialPlanLabel(credential);
+	if (!planLabel) {
+		return null;
+	}
+	const normalized = normalizeCodexPlanType(planLabel);
+	if (normalized === "unknown") {
+		return null;
+	}
+	return isPlanEligibleForModel(normalized) ? "paid" : "free";
+}
+
+export function filterCredentialsByPlan(
+	credentials: readonly CredentialStatus[],
+	mode: PlanFilterMode,
+): CredentialStatus[] {
+	if (mode === "all") {
+		return [...credentials];
+	}
+	return credentials.filter((credential) => {
+		const tier = classifyCredentialPlanTier(credential);
+		if (tier === null) {
+			return true;
+		}
+		return mode === "paid" ? tier === "paid" : tier === "free";
+	});
 }
 
 function resolveAccountColumnWidths(contentWidth: number): AccountColumnWidths | null {
@@ -1175,6 +1229,7 @@ class MultiAuthManagerModal {
 	private readonly hiddenProviders: Set<SupportedProviderId>;
 	private showHiddenProviders = false;
 	private showDisabledAccounts = false;
+	private planFilterMode: PlanFilterMode = "all";
 
 	constructor(
 		private readonly ctx: ExtensionCommandContext,
@@ -1365,6 +1420,9 @@ class MultiAuthManagerModal {
 				selectedProviderStatus !== null && this.getBatchSelectedCredentialIds(selectedProviderStatus).length > 0,
 			selectedAccountMarked:
 				selectedProviderStatus !== null && this.isSelectedAccountMarked(selectedProviderStatus),
+			supportsPlanFilter:
+				selectedProviderStatus !== null && this.providerSupportsPlanFilter(selectedProviderStatus),
+			planFilterLabel: formatPlanFilterLabel(this.planFilterMode),
 		});
 		const wrapped = renderWrappedFooterActions(actions, lineWidth);
 		if (wrapped.length === 0) {
@@ -1386,6 +1444,11 @@ class MultiAuthManagerModal {
 
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done();
+			return;
+		}
+
+		if (matchesKey(data, "tab")) {
+			this.cyclePlanFilter();
 			return;
 		}
 
@@ -2800,11 +2863,36 @@ class MultiAuthManagerModal {
 		return this.getProviderVisibilitySummary().displayedStatuses;
 	}
 
-	private getVisibleCredentials(status: ProviderStatus): CredentialStatus[] {
-		if (this.showDisabledAccounts) {
-			return status.credentials;
+	private providerSupportsPlanFilter(status: ProviderStatus): boolean {
+		return status.provider === "openai-codex";
+	}
+
+	private cyclePlanFilter(): void {
+		const status = this.getSelectedProviderStatus();
+		if (!status || !this.providerSupportsPlanFilter(status)) {
+			this.ctx.ui.notify("Plan filter is only available for openai-codex.", "warning");
+			return;
 		}
-		return status.credentials.filter((credential) => !credential.disabledError);
+
+		const currentIndex = PLAN_FILTER_SEQUENCE.indexOf(this.planFilterMode);
+		const nextMode = PLAN_FILTER_SEQUENCE[(currentIndex + 1) % PLAN_FILTER_SEQUENCE.length];
+		this.planFilterMode = nextMode;
+		this.syncSelectionState(this.selectedProviderId ?? undefined);
+		this.infoMessage =
+			nextMode === "all"
+				? "Showing all plans."
+				: `Showing ${formatPlanFilterLabel(nextMode)} accounts only.`;
+		this.requestRender();
+	}
+
+	private getVisibleCredentials(status: ProviderStatus): CredentialStatus[] {
+		const base = this.showDisabledAccounts
+			? status.credentials
+			: status.credentials.filter((credential) => !credential.disabledError);
+		if (!this.providerSupportsPlanFilter(status) || this.planFilterMode === "all") {
+			return base;
+		}
+		return filterCredentialsByPlan(base, this.planFilterMode);
 	}
 
 	private getBatchSelectedCredentialIdSet(status: ProviderStatus): Set<string> {
