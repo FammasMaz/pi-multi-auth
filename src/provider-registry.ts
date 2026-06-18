@@ -19,6 +19,7 @@ import {
 	type SupportedProviderId,
 } from "./types.js";
 import { isRecord } from "./auth-error-utils.js";
+import { enrichCloudflareWorkersAiRegistrationMetadata } from "./cloudflare-workers-ai-models.js";
 
 interface ModelsProviderEntry {
 	api: Api;
@@ -551,19 +552,24 @@ export class ProviderRegistry {
 			}
 
 			const apis = [...new Set(builtInModels.map((m) => m.api))];
-			return {
+			const builtInMetadata: ProviderRegistrationMetadata = {
 				provider,
 				api: firstModel.api,
 				apis,
 				baseUrl: firstModel.baseUrl,
 				models: builtInModels.map(mapBuiltInModel),
 			};
+			return enrichCloudflareWorkersAiRegistrationMetadata(
+				provider,
+				builtInMetadata,
+				this.authWriter,
+			);
 		}
 
 		const modelsFile = await this.readModelsFile();
 		const fromFile = modelsFile.providers[provider];
 		if (!fromFile || fromFile.models.length === 0) {
-			return null;
+			return enrichCloudflareWorkersAiRegistrationMetadata(provider, null, this.authWriter);
 		}
 
 		const modelApis = fromFile.models
@@ -571,7 +577,7 @@ export class ProviderRegistry {
 			.filter((api): api is Api => typeof api === "string");
 		const apis: Api[] = modelApis.length > 0 ? [...new Set(modelApis)] : [fromFile.api];
 
-		return {
+		const fromModelsFile: ProviderRegistrationMetadata = {
 			provider,
 			api: fromFile.api,
 			apis,
@@ -580,6 +586,11 @@ export class ProviderRegistry {
 			apiKey: fromFile.apiKey,
 			headers: fromFile.headers,
 		};
+		return enrichCloudflareWorkersAiRegistrationMetadata(
+			provider,
+			fromModelsFile,
+			this.authWriter,
+		);
 	}
 
 	private async readModelsFile(): Promise<ModelsFileData> {

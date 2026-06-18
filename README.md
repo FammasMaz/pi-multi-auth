@@ -32,7 +32,7 @@ The following table shows credential and usage support for each recognized provi
 | BlazeAPI | ✅ | — | ✅ | Usage via `/api/usage` (daily requests + premium credits); rotation defaults to `usage-based` and routes credentials by plan tier (Premium → Pro → Free) with automatic fallback when the active tier's daily-request or premium-credit budget is exhausted |
 | Cerebras | ✅ | — | — | |
 | Cline | — | ✅ | — | OAuth only; browser callback |
-| Cloudflare Workers AI | ✅ | — | — | Requires account-scoped base URL |
+| Cloudflare Workers AI | ✅ | — | — | Account-scoped base URL; GLM 5.2 supports `reasoning_effort` including **`max`** (Pi `xhigh` → `max`) |
 | Cloudflare AI Gateway | ✅ | — | — | |
 | DeepSeek | ✅ | — | — | |
 | Fireworks | ✅ | — | — | |
@@ -126,7 +126,9 @@ Credentials may include a `request` object with provider-specific request settin
 | `request.baseUrl` | `string` | Overrides the model base URL for that credential after URL validation |
 | `request.headers` | `Record<string, string>` | Adds credential-scoped headers to the provider request |
 
-Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL. When adding a Cloudflare API-key credential, the extension can extract `cfat_` tokens, account IDs, dashboard token URLs, or full Workers AI base URLs from pasted input. It discovers the base URL automatically when the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
+Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL (or set `env.CLOUDFLARE_ACCOUNT_ID` / paste account ID on line 2 when adding the key). When adding a Cloudflare API-key credential, the extension can extract `cfat_` / `cfut_` tokens, account IDs, dashboard token URLs, or full Workers AI base URLs from pasted input. It discovers the base URL automatically when the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
+
+**Reasoning effort:** For `@cf/zai-org/glm-5.2` (and other Workers AI models registered via multi-auth), Pi thinking levels map to API `reasoning_effort`: `high` → `high`, **`xhigh` → `max`** (tested on the live API). Set `defaultThinkingLevel` to `high` or `xhigh` in Pi settings, or add a `thinkingLevelMap` on the model in `models.json`.
 
 ## Environment variables
 
