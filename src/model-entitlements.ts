@@ -105,6 +105,10 @@ export function formatModelReference(
 	return `${normalizeProviderId(providerId)}/${modelId}`;
 }
 
+function isCodexGptModel(normalizedModelId: string): boolean {
+	return normalizedModelId.startsWith("gpt-");
+}
+
 function isCodexFreeBlockedModel(normalizedModelId: string): boolean {
 	return (
 		OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS.has(normalizedModelId) ||
@@ -137,13 +141,6 @@ export function normalizeCodexPlanType(planType: string | null | undefined): Cod
 		default:
 			return "unknown";
 	}
-}
-
-/**
- * Returns the account selection priority for a normalized Codex plan. Lower wins.
- */
-export function getCodexPlanSelectionPriority(planType: CodexPlanType): number {
-	return OPENAI_CODEX_PLAN_SELECTION_PRIORITY[planType];
 }
 
 /**
@@ -189,8 +186,8 @@ export function modelRequiresEntitlement(
  * {@link rankBlazeApiCredentialsByPlanTier}).
  */
 export function modelPrefersFreePlan(
-	_providerId: SupportedProviderId,
-	_modelId: string | undefined,
+	providerId: SupportedProviderId,
+	modelId: string | undefined,
 ): boolean {
 	const normalizedProviderId = normalizeProviderId(providerId);
 	if (normalizedProviderId === "openai-codex") {

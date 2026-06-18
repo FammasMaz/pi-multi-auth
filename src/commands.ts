@@ -21,7 +21,7 @@ import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
-import { formatCreditAmount, formatCreditFraction, formatResetCountdown } from "./formatters/bar.js";
+import { formatResetCountdown } from "./formatters/bar.js";
 import { resolveBorderGlyphs } from "./formatters/charset.js";
 import {
 	clampRenderedRows,
@@ -60,11 +60,6 @@ import {
 	type ProviderStatus,
 	type SupportedProviderId,
 } from "./types.js";
-import {
-	summarizeCodexAggregateCredits,
-	type CodexAggregateCreditUsage,
-} from "./usage/codex.js";
-import { normalizeCodexPlanType, isPlanEligibleForModel } from "./model-entitlements.js";
 import type { UsageSnapshot } from "./usage/types.js";
 
 interface ThemeLike {
@@ -495,71 +490,6 @@ function formatPlanDetailLabel(planType: string | null | undefined, displayOnly:
 	return displayOnly ? `${label} (last known)` : label;
 }
 
-export type PlanFilterMode = "all" | "paid" | "free";
-
-const PLAN_FILTER_SEQUENCE: readonly PlanFilterMode[] = ["all", "paid", "free"];
-
-function formatPlanFilterLabel(mode: PlanFilterMode): string {
-	switch (mode) {
-		case "paid":
-			return "Plus/Paid";
-		case "free":
-			return "Free";
-		default:
-			return "All";
-	}
-}
-
-/**
- * Resolves the best-known plan label for a credential, preferring the live usage
- * snapshot and falling back to the plan tier decoded from the credential token.
- */
-export function resolveCredentialPlanLabel(credential: CredentialStatus): string | null {
-	const snapshotPlan = normalizeInlineText(credential.usageSnapshot?.planType ?? "").trim();
-	if (snapshotPlan) {
-		return snapshotPlan;
-	}
-	const tier = normalizeInlineText(credential.planTier ?? "").trim();
-	return tier || null;
-}
-
-/**
- * Classifies a credential as a paid or free plan, returning null when the plan is unknown.
- */
-export function classifyCredentialPlanTier(
-	credential: CredentialStatus,
-): "paid" | "free" | null {
-	const planLabel = resolveCredentialPlanLabel(credential);
-	if (!planLabel) {
-		return null;
-	}
-	const normalized = normalizeCodexPlanType(planLabel);
-	if (normalized === "unknown") {
-		return null;
-	}
-	return isPlanEligibleForModel(normalized) ? "paid" : "free";
-}
-
-/**
- * Filters credentials by plan filter mode. Unknown-plan credentials are always shown
- * so they remain discoverable while their plan tier is still being resolved.
- */
-export function filterCredentialsByPlan(
-	credentials: readonly CredentialStatus[],
-	mode: PlanFilterMode,
-): CredentialStatus[] {
-	if (mode === "all") {
-		return [...credentials];
-	}
-	return credentials.filter((credential) => {
-		const tier = classifyCredentialPlanTier(credential);
-		if (tier === null) {
-			return true;
-		}
-		return mode === "paid" ? tier === "paid" : tier === "free";
-	});
-}
-
 function resolveAccountColumnWidths(contentWidth: number): AccountColumnWidths | null {
 	const safeWidth = Math.max(1, Math.floor(contentWidth));
 	if (safeWidth < ACCOUNT_TABLE_MIN_WIDTH) {
@@ -826,20 +756,6 @@ function formatWindowDurationLabel(windowMinutes: number | null): string | null 
 	return `${windowMinutes}-minute window`;
 }
 
-function formatWindowDurationShortLabel(windowMinutes: number | null): string | null {
-	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
-		return null;
-	}
-
-	if (windowMinutes % (24 * 60) === 0) {
-		return `${windowMinutes / (24 * 60)}d`;
-	}
-	if (windowMinutes % 60 === 0) {
-		return `${windowMinutes / 60}h`;
-	}
-	return `${windowMinutes}m`;
-}
-
 export function resolveUsageWindowLabel(
 	snapshot: UsageSnapshot,
 	slot: "primary" | "secondary",
@@ -865,51 +781,6 @@ export function resolveUsageWindowLabel(
 	}
 
 	return durationLabel;
-}
-
-function formatAggregateCreditLine(
-	fallbackLabel: string,
-	aggregate: CodexAggregateCreditUsage | null,
-): string | null {
-	if (!aggregate) {
-		return null;
-	}
-	const durationLabel = formatWindowDurationShortLabel(aggregate.windowMinutes);
-	const label = durationLabel ? `${durationLabel} pool` : fallbackLabel;
-	const remainingPercent = aggregate.capacity > 0
-		? Math.max(0, Math.round((aggregate.remaining / aggregate.capacity) * 100))
-		: 0;
-	return `${label}: ${formatCreditFraction(aggregate.remaining, aggregate.capacity)} (${remainingPercent}% left, ${aggregate.accountCount} acct${aggregate.accountCount === 1 ? "" : "s"})`;
-}
-
-export function buildCodexGlobalCreditLines(
-	credentials: readonly CredentialStatus[],
-): string[] {
-	const snapshots = credentials
-		.map((credential) => credential.usageSnapshot)
-		.filter((snapshot): snapshot is UsageSnapshot => snapshot?.provider === "openai-codex");
-	const missingCount = credentials.length - snapshots.length;
-	if (snapshots.length === 0) {
-		return missingCount > 0 ? [`Global credits: waiting on ${missingCount} account${missingCount === 1 ? "" : "s"}.`] : [];
-	}
-
-	const summary = summarizeCodexAggregateCredits(snapshots);
-	const lines = [
-		formatAggregateCreditLine("Primary pool", summary.primary),
-		formatAggregateCreditLine("Secondary pool", summary.secondary),
-	].filter((line): line is string => line !== null);
-
-	if (summary.balance !== null) {
-		lines.push(`Upstream balance: ${formatCreditAmount(summary.balance)} credit${Math.round(summary.balance) === 1 ? "" : "s"}`);
-	}
-	if (summary.unlimitedBalanceCount > 0) {
-		lines.push(`Unlimited credit balance: ${summary.unlimitedBalanceCount} account${summary.unlimitedBalanceCount === 1 ? "" : "s"}`);
-	}
-	if (missingCount > 0) {
-		lines.push(`Missing usage: ${missingCount} account${missingCount === 1 ? "" : "s"}`);
-	}
-
-	return lines.length > 0 ? lines : ["Global credits unavailable for visible accounts."];
 }
 
 async function loginProviderFromModal(
@@ -1304,7 +1175,6 @@ class MultiAuthManagerModal {
 	private readonly hiddenProviders: Set<SupportedProviderId>;
 	private showHiddenProviders = false;
 	private showDisabledAccounts = false;
-	private planFilterMode: PlanFilterMode = "all";
 
 	constructor(
 		private readonly ctx: ExtensionCommandContext,
@@ -1495,9 +1365,6 @@ class MultiAuthManagerModal {
 				selectedProviderStatus !== null && this.getBatchSelectedCredentialIds(selectedProviderStatus).length > 0,
 			selectedAccountMarked:
 				selectedProviderStatus !== null && this.isSelectedAccountMarked(selectedProviderStatus),
-			supportsPlanFilter:
-				selectedProviderStatus !== null && this.providerSupportsPlanFilter(selectedProviderStatus),
-			planFilterLabel: formatPlanFilterLabel(this.planFilterMode),
 		});
 		const wrapped = renderWrappedFooterActions(actions, lineWidth);
 		if (wrapped.length === 0) {
@@ -1519,11 +1386,6 @@ class MultiAuthManagerModal {
 
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 			this.done();
-			return;
-		}
-
-		if (matchesKey(data, "tab")) {
-			this.cyclePlanFilter();
 			return;
 		}
 
@@ -1647,11 +1509,7 @@ class MultiAuthManagerModal {
 		const accountCountLabel = selectedProviderStatus
 			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
 			: "0";
-		const planFilterSuffix =
-			selectedProviderStatus && this.providerSupportsPlanFilter(selectedProviderStatus)
-				? ` [${formatPlanFilterLabel(this.planFilterMode)}]`
-				: "";
-		const accountTitleText = `Accounts: ${accountProviderLabel} (${accountCountLabel})${planFilterSuffix}`;
+		const accountTitleText = `Accounts: ${accountProviderLabel} (${accountCountLabel})`;
 		const accountHeaderCell = renderGridCell(accountTitleText, widths.accounts);
 		const detailsHeaderCell = renderGridCell("Account Details", widths.details);
 		const providerTitle =
@@ -1714,11 +1572,7 @@ class MultiAuthManagerModal {
 		const accountCountLabel = selectedProviderStatus
 			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
 			: "0";
-		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${accountCountLabel})${
-			selectedProviderStatus && this.providerSupportsPlanFilter(selectedProviderStatus)
-				? ` [${formatPlanFilterLabel(this.planFilterMode)}]`
-				: ""
-		}`));
+		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${accountCountLabel})`));
 		for (const line of this.buildAccountsPaneLines(selectedProviderStatus, width)) {
 			rows.push(line);
 		}
@@ -1803,17 +1657,6 @@ class MultiAuthManagerModal {
 		const selectedEntryIndex = this.getSelectedEntryIndex(status);
 		const duplicateIndicators = this.getDuplicateAccountIndicators(status);
 		const lines: string[] = [];
-		if (
-			visibleCredentials.length === 0 &&
-			this.providerSupportsPlanFilter(status) &&
-			this.planFilterMode !== "all" &&
-			status.credentials.length > 0
-		) {
-			lines.push(
-				padRight(`No ${formatPlanFilterLabel(this.planFilterMode)} accounts.`, contentWidth),
-				padRight("Press [Tab] to change the plan filter.", contentWidth),
-			);
-		}
 		for (const [index, credential] of visibleCredentials.entries()) {
 			lines.push(
 				...this.buildAccountEntryLines(
@@ -1842,14 +1685,6 @@ class MultiAuthManagerModal {
 		const selectedEntryIndex = this.getSelectedEntryIndex(status);
 		const contentWidth = Math.max(1, getPaneContentWidth(columnWidth));
 		let lineIndex = 0;
-		if (
-			visibleCredentials.length === 0 &&
-			this.providerSupportsPlanFilter(status) &&
-			this.planFilterMode !== "all" &&
-			status.credentials.length > 0
-		) {
-			lineIndex += 2;
-		}
 		for (const [index, credential] of visibleCredentials.entries()) {
 			if (index === selectedEntryIndex) {
 				return lineIndex;
@@ -1904,15 +1739,6 @@ class MultiAuthManagerModal {
 			if (!this.showDisabledAccounts && disabledCount > 0) {
 				lines.push(`Hidden disabled accounts: ${disabledCount}. Press [x] to show them.`);
 			}
-			if (status.provider === "openai-codex" && visibleCredentials.length > 0) {
-				lines.push(
-					"",
-					`${BORDER_GLYPHS.horizontal.repeat(2)} Global Credits ${BORDER_GLYPHS.horizontal.repeat(2)}`,
-					...buildCodexGlobalCreditLines(visibleCredentials).flatMap((line) =>
-						wrapDetailMessageLines(line, safeDetailWidth),
-					),
-				);
-			}
 			lines.push("", "Press [Enter] or [a] to add a backup credential.", "Press [←]/[→] to switch pane focus.");
 			return lines;
 		}
@@ -1921,8 +1747,7 @@ class MultiAuthManagerModal {
 		const duplicateIndicator = this.getDuplicateAccountIndicators(status).get(selectedCredential.credentialId);
 		const batchSelectionCount = this.getBatchSelectedCredentialIds(status).length;
 		const state = this.getCredentialState(selectedCredential);
-		const planType =
-			selectedCredential.usageSnapshot?.planType ?? selectedCredential.planTier ?? null;
+		const planType = selectedCredential.usageSnapshot?.planType;
 		const planLabel = this.colorizePlanText(
 			formatPlanDetailLabel(planType, Boolean(selectedCredential.usageSnapshotDisplayOnly)),
 			planType,
@@ -1962,16 +1787,6 @@ class MultiAuthManagerModal {
 				`${BORDER_GLYPHS.horizontal.repeat(2)} Usage & Quota ${BORDER_GLYPHS.horizontal.repeat(2)}`,
 				...this.buildUsageDetailLines(selectedCredential, safeDetailWidth),
 			);
-		}
-		if (status.provider === "openai-codex") {
-			const globalCreditLines = buildCodexGlobalCreditLines(this.getVisibleCredentials(status));
-			if (globalCreditLines.length > 0) {
-				detailLines.push(
-					"",
-					`${BORDER_GLYPHS.horizontal.repeat(2)} Global Credits ${BORDER_GLYPHS.horizontal.repeat(2)}`,
-					...globalCreditLines.flatMap((line) => wrapDetailMessageLines(line, safeDetailWidth)),
-				);
-			}
 		}
 		if (batchSelectionCount > 0) {
 			detailLines.push("");
@@ -2350,28 +2165,6 @@ class MultiAuthManagerModal {
 		this.infoMessage = this.showDisabledAccounts
 			? "Showing disabled accounts."
 			: "Hiding disabled accounts.";
-		this.requestRender();
-	}
-
-	private providerSupportsPlanFilter(status: ProviderStatus): boolean {
-		return status.provider === "openai-codex";
-	}
-
-	private cyclePlanFilter(): void {
-		const status = this.getSelectedProviderStatus();
-		if (!status || !this.providerSupportsPlanFilter(status)) {
-			this.ctx.ui.notify("Plan filter is only available for openai-codex.", "warning");
-			return;
-		}
-
-		const currentIndex = PLAN_FILTER_SEQUENCE.indexOf(this.planFilterMode);
-		const nextMode = PLAN_FILTER_SEQUENCE[(currentIndex + 1) % PLAN_FILTER_SEQUENCE.length];
-		this.planFilterMode = nextMode;
-		this.syncSelectionState(this.selectedProviderId ?? undefined);
-		this.infoMessage =
-			nextMode === "all"
-				? "Showing all plans."
-				: `Showing ${formatPlanFilterLabel(nextMode)} accounts only.`;
 		this.requestRender();
 	}
 
@@ -3008,13 +2801,10 @@ class MultiAuthManagerModal {
 	}
 
 	private getVisibleCredentials(status: ProviderStatus): CredentialStatus[] {
-		const base = this.showDisabledAccounts
-			? status.credentials
-			: status.credentials.filter((credential) => !credential.disabledError);
-		if (!this.providerSupportsPlanFilter(status) || this.planFilterMode === "all") {
-			return base;
+		if (this.showDisabledAccounts) {
+			return status.credentials;
 		}
-		return filterCredentialsByPlan(base, this.planFilterMode);
+		return status.credentials.filter((credential) => !credential.disabledError);
 	}
 
 	private getBatchSelectedCredentialIdSet(status: ProviderStatus): Set<string> {

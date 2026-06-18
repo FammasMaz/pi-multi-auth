@@ -28,12 +28,6 @@ import {
 import { buildClineClientHeaders } from "./cline-compat.js";
 import { isCloudflareCredentialManagedAuthProvider } from "./cloudflare-provider.js";
 import { buildKiloRequestHeaders } from "./kilo-compat.js";
-import {
-	DEFAULT_STREAM_TIMEOUT_CONFIG,
-	resolveProviderStreamTimeouts,
-	type ProviderStreamTimeoutOverrides,
-	type StreamTimeoutConfig,
-} from "./config.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { getCredentialRequestSecret } from "./credential-display.js";
@@ -812,10 +806,7 @@ function createErrorAssistantMessage(model: Model<Api>, message: string): Assist
 	};
 }
 
-function createAbortedAssistantMessage(
-	model: Model<Api>,
-	message: string = "Request was aborted.",
-): AssistantMessage {
+function createAbortedAssistantMessage(model: Model<Api>, message: string): AssistantMessage {
 	return {
 		...createErrorAssistantMessage(model, message),
 		stopReason: "aborted",
@@ -886,174 +877,6 @@ function formatMultiAuthRotationFailureMessage(
 		`Action: ${describeCredentialErrorAction(classification.kind)}`,
 	);
 	return lines.join("\n");
-}
-
-function pushAbortedAssistantEvent(
-	stream: AssistantMessageEventStream,
-	model: Model<Api>,
-	message: string = "Request was aborted.",
-): void {
-	const abortedMessage = createAbortedAssistantMessage(model, message);
-	stream.push({
-		type: "error",
-		reason: "aborted",
-		error: abortedMessage,
-	});
-	stream.end(abortedMessage);
-}
-
-function createCallerAbortError(message: string = "Request was aborted."): Error {
-	const error = new Error(message);
-	error.name = "AbortError";
-	return error;
-}
-
-function resolveAbortReason(signal: AbortSignal): unknown {
-	const reason = signal.reason;
-	if (reason instanceof Error) {
-		return reason;
-	}
-	if (typeof reason === "string" && reason.trim().length > 0) {
-		return createCallerAbortError(reason);
-	}
-	return createCallerAbortError();
-}
-
-function isCallerAbortSignal(signal: AbortSignal | undefined, error?: unknown): boolean {
-	if (!signal?.aborted) {
-		return false;
-	}
-	if (error === undefined) {
-		return true;
-	}
-	if (error instanceof Error) {
-		return error.name === "AbortError" || /abort/i.test(error.message);
-	}
-	if (typeof error === "string") {
-		return /abort/i.test(error);
-	}
-	return true;
-}
-
-async function raceWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (!signal) {
-		return operation;
-	}
-	if (signal.aborted) {
-		throw resolveAbortReason(signal);
-	}
-
-	let abortListener: (() => void) | null = null;
-	let didAbort = false;
-	const abortPromise = new Promise<never>((_resolve, reject) => {
-		abortListener = () => {
-			didAbort = true;
-			reject(resolveAbortReason(signal));
-		};
-		signal.addEventListener("abort", abortListener, { once: true });
-	});
-
-	try {
-		return await Promise.race([operation, abortPromise]);
-	} finally {
-		if (abortListener) {
-			signal.removeEventListener("abort", abortListener);
-		}
-		if (didAbort) {
-			void operation.catch(() => undefined);
-		}
-	}
-}
-
-async function readNextStreamEventWithAbort(
-	iterator: AsyncIterator<AssistantMessageEvent>,
-	signal?: AbortSignal,
-): Promise<IteratorResult<AssistantMessageEvent>> {
-	return raceWithAbort(Promise.resolve(iterator.next()), signal);
-}
-
-function normalizeWatchdogTimeoutMs(value: number | undefined): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value > 0
-		? Math.trunc(value)
-		: undefined;
-}
-
-function resolveStreamWatchdogTimeoutsForProvider(
-	providerId: SupportedProviderId,
-	defaults: StreamTimeoutConfig,
-	providerStreamTimeouts: ProviderStreamTimeoutOverrides,
-	noStreamWatchdogProviders: readonly string[] = [],
-): { attemptTimeoutMs: number | undefined; idleTimeoutMs: number | undefined } {
-	if (noStreamWatchdogProviders.includes(providerId)) {
-		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
-	}
-	const resolved = resolveProviderStreamTimeouts(providerId, defaults, providerStreamTimeouts);
-	const attemptTimeoutMs = normalizeWatchdogTimeoutMs(resolved.attemptTimeoutMs);
-	const idleTimeoutMs = normalizeWatchdogTimeoutMs(resolved.idleTimeoutMs);
-	if (attemptTimeoutMs === undefined && idleTimeoutMs === undefined) {
-		return { attemptTimeoutMs: undefined, idleTimeoutMs: undefined };
-	}
-	return { attemptTimeoutMs, idleTimeoutMs };
-}
-
-function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
-	(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
-}
-
-function createStreamTimeoutError(
-	kind: "attempt_timeout" | "idle_timeout",
-	providerId: SupportedProviderId,
-	credentialId: string,
-	modelId: string,
-	timeoutMs: number,
-): Error {
-	return new Error(
-		`multi-auth stream timeout (${kind}) after ${timeoutMs}ms for ${providerId} credential ${credentialId} model ${modelId}`,
-	);
-}
-
-async function readNextStreamEventWithWatchdog(
-	iterator: AsyncIterator<AssistantMessageEvent>,
-	signal: AbortSignal | undefined,
-	timeoutMs: number | undefined,
-	createTimeoutError: () => Error,
-): Promise<IteratorResult<AssistantMessageEvent>> {
-	if (timeoutMs === undefined) {
-		return readNextStreamEventWithAbort(iterator, signal);
-	}
-
-	let timeoutId: ReturnType<typeof setTimeout> | null = null;
-	let timedOut = false;
-	const nextPromise = Promise.resolve(iterator.next());
-	const timeoutPromise = new Promise<never>((_resolve, reject) => {
-		timeoutId = setTimeout(() => {
-			timedOut = true;
-			reject(createTimeoutError());
-		}, timeoutMs);
-		unrefTimer(timeoutId);
-	});
-
-	try {
-		return await raceWithAbort(Promise.race([nextPromise, timeoutPromise]), signal);
-	} finally {
-		if (timeoutId) {
-			clearTimeout(timeoutId);
-		}
-		if (timedOut) {
-			void nextPromise.catch(() => undefined);
-		}
-	}
-}
-
-function closeAsyncIterator(iterator: AsyncIterator<AssistantMessageEvent>): void {
-	try {
-		const closeResult = iterator.return?.();
-		if (closeResult) {
-			void Promise.resolve(closeResult).catch(() => undefined);
-		}
-	} catch {
-		// Ignore cleanup failures; the caller is already finishing the stream.
-	}
 }
 
 function resolveCredentialProviderId(
@@ -1288,12 +1111,10 @@ export function createRotatingStreamWrapper(
 				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected: SelectedCredential;
 				try {
-					if (options?.signal?.aborted) {
-						pushAbortedAssistantEvent(stream, activeModel);
-						return;
-					}
 					if (delegatedCredentialOverride) {
-						const providerCredentialIds = await accountManager.listProviderCredentialIds(activeProviderId);
+						const providerCredentialIds = await accountManager.listProviderCredentialIds(
+							activeProviderId,
+						);
 						if (!providerCredentialIds.includes(delegatedCredentialOverride.credentialId)) {
 							throw new Error(
 								`Delegated credential '${delegatedCredentialOverride.credentialId}' is not available for ${activeProviderId}.`,
@@ -1307,35 +1128,29 @@ export function createRotatingStreamWrapper(
 							}
 						}
 
-						selected = await raceWithAbort(
-							accountManager.acquireCredential(activeProviderId, {
-								excludedCredentialIds: pinnedExcludedCredentialIds,
-								pinnedCredentialId: delegatedCredentialOverride.credentialId,
-								modelId: activeModel.id,
-								selectionCache,
-								signal: options?.signal,
-							}),
-							options?.signal,
-						);
+						selected = await accountManager.acquireCredential(activeProviderId, {
+							excludedCredentialIds: pinnedExcludedCredentialIds,
+							pinnedCredentialId: delegatedCredentialOverride.credentialId,
+							modelId: activeModel.id,
+							selectionCache,
+							signal: options?.signal,
+						});
 						multiAuthDebugLogger.log("delegated_credential_override_applied", {
 							provider: activeProviderId,
 							credentialId: delegatedCredentialOverride.credentialId,
 							model: activeModel.id,
 						});
 					} else {
-						selected = await raceWithAbort(
-							accountManager.acquireCredential(activeProviderId, {
-								excludedCredentialIds,
-								modelId: activeModel.id,
-								selectionCache,
-								signal: options?.signal,
-							}),
-							options?.signal,
-						);
+						selected = await accountManager.acquireCredential(activeProviderId, {
+							excludedCredentialIds,
+							modelId: activeModel.id,
+							selectionCache,
+							signal: options?.signal,
+						});
 					}
 				} catch (error: unknown) {
-					if (isCallerAbortSignal(options?.signal, error)) {
-						pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
+					if (options?.signal?.aborted && isAbortError(error)) {
+						emitAbortedTermination(options.signal.reason ?? error);
 						return;
 					}
 					if (excludedCredentialIds.size > 0 && (await switchToFailoverProvider())) {
@@ -1455,11 +1270,8 @@ export function createRotatingStreamWrapper(
 						errorMessage: message.slice(0, 200),
 					});
 
-					try {
-						const { shouldPermanentlyDisableCredential } = await import(
-							"./credential-disable-policy.js"
-						);
-						if (shouldPermanentlyDisableCredential(message, classification.kind)) {
+					if (classification.shouldDisableCredential) {
+						try {
 							await accountManager.disableApiKeyCredential(
 								activeProviderId,
 								selected.credentialId,
@@ -1469,23 +1281,16 @@ export function createRotatingStreamWrapper(
 							multiAuthDebugLogger.log("credential_disabled", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
-									kind: classification.kind,
-									reason: message.slice(0, 200),
+								kind: classification.kind,
+								reason: message.slice(0, 200),
 							});
-						} else if (classification.shouldDisableCredential) {
-							multiAuthDebugLogger.log("credential_disable_skipped", {
+						} catch (error: unknown) {
+							multiAuthDebugLogger.log("credential_disable_failed", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
-									kind: classification.kind,
-									reason: message.slice(0, 200),
+								error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
 							});
 						}
-					} catch (error: unknown) {
-						multiAuthDebugLogger.log("credential_disable_failed", {
-							provider: activeProviderId,
-							credentialId: selected.credentialId,
-							error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
-						});
 					}
 
 					if (hasForwardedSubstantiveEvent) {
@@ -1732,12 +1537,6 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
-					const { attemptTimeoutMs, idleTimeoutMs } = resolveStreamWatchdogTimeoutsForProvider(
-						activeProviderId,
-						streamTimeouts,
-						providerStreamTimeouts,
-						noStreamWatchdogProviders,
-					);
 					const providerRequestHeaders = resolveProviderRequestHeaders(
 						activeProviderId,
 						options?.headers,
@@ -1770,25 +1569,15 @@ export function createRotatingStreamWrapper(
 							baseUrl: requestModel.baseUrl,
 							api: requestModel.api,
 						});
-						const forwardedOptions: Record<string, unknown> = {};
-						if (options) {
-							for (const [key, value] of Object.entries(options)) {
-								if (value !== undefined) {
-									forwardedOptions[key] = value;
-								}
-							}
-						}
-						forwardedOptions.apiKey = selected.secret;
-						forwardedOptions.headers = requestHeaders;
-						forwardedOptions.signal = options?.signal;
-						innerStream = activeBaseProvider.streamSimple(
-							requestModel,
-							context,
-							forwardedOptions as SimpleStreamOptions,
-						);
+						innerStream = activeBaseProvider.streamSimple(requestModel, context, {
+							...options,
+							apiKey: selected.secret,
+							headers: requestHeaders,
+							signal: options?.signal,
+						});
 					} catch (error: unknown) {
-						if (isCallerAbortSignal(options?.signal, error)) {
-							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
+						if (isCallerAbort(options?.signal, error)) {
+							emitAbortedTermination(options?.signal?.reason ?? error);
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
@@ -1824,56 +1613,18 @@ export function createRotatingStreamWrapper(
 					let shouldRetrySameCredential = false;
 					let shouldRotateCredential = false;
 
-					const innerIterator = innerStream[Symbol.asyncIterator]();
 					try {
-						while (true) {
-							const elapsedMs = Date.now() - requestStartedAt;
-							const attemptRemainingMs = attemptTimeoutMs === undefined
-								? undefined
-								: attemptTimeoutMs - elapsedMs;
-							if (attemptRemainingMs !== undefined && attemptRemainingMs <= 0) {
-								throw createStreamTimeoutError(
-									"attempt_timeout",
-									activeProviderId,
-									selected.credentialId,
-									requestModel.id,
-									attemptTimeoutMs ?? 0,
-								);
-							}
-							const nextTimeoutMs = [attemptRemainingMs, idleTimeoutMs]
-								.filter((value): value is number => value !== undefined && value > 0)
-								.reduce<number | undefined>((min, value) => min === undefined ? value : Math.min(min, value), undefined);
-							const timeoutKind = attemptRemainingMs !== undefined && nextTimeoutMs === attemptRemainingMs
-								? "attempt_timeout"
-								: "idle_timeout";
-							const timeoutBudgetMs = timeoutKind === "attempt_timeout"
-								? (attemptTimeoutMs ?? nextTimeoutMs ?? 0)
-								: (idleTimeoutMs ?? nextTimeoutMs ?? 0);
-							const nextEvent = await readNextStreamEventWithWatchdog(
-								innerIterator,
-								options?.signal,
-								nextTimeoutMs,
-								() => createStreamTimeoutError(
-									timeoutKind,
-									activeProviderId,
-									selected.credentialId,
-									requestModel.id,
-									timeoutBudgetMs,
-								),
-							);
-							if (nextEvent.done) {
-								break;
-							}
+						for await (const rawEvent of innerStream) {
 							const forwardedEvents = sanitizeOllamaThinkingEvent(
-								nextEvent.value,
+								rawEvent,
 								activeProviderId,
 								bufferedThinkingState,
 							);
 							for (const event of forwardedEvents) {
 								if (event.type === "error") {
 									const assistantErrorMessage = getAssistantErrorMessage(event.error);
-									if (isCallerAbortSignal(options?.signal) && /abort/i.test(assistantErrorMessage)) {
-										pushAbortedAssistantEvent(stream, activeModel, assistantErrorMessage);
+									if (isCallerAbortMessage(options?.signal, assistantErrorMessage)) {
+										emitAbortedTermination(options?.signal?.reason ?? event.error.errorMessage);
 										return;
 									}
 									const message = assistantErrorMessage;
@@ -1905,7 +1656,7 @@ export function createRotatingStreamWrapper(
 									}
 
 									stream.push(event);
-									stream.end(event.error);
+									stream.end();
 									return;
 								}
 
@@ -1961,7 +1712,7 @@ export function createRotatingStreamWrapper(
 										requestModel.id,
 										getAssistantTokenEstimate(event.message),
 									);
-									stream.end(event.message);
+									stream.end();
 									return;
 								}
 							}
@@ -1971,8 +1722,8 @@ export function createRotatingStreamWrapper(
 							}
 						}
 					} catch (error: unknown) {
-						if (isCallerAbortSignal(options?.signal, error)) {
-							pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
+						if (isCallerAbort(options?.signal, error)) {
+							emitAbortedTermination(options?.signal?.reason ?? error);
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
@@ -2001,8 +1752,6 @@ export function createRotatingStreamWrapper(
 								throw error;
 							}
 						}
-					} finally {
-						closeAsyncIterator(innerIterator);
 					}
 
 					if (shouldRetrySameCredential) {
@@ -2015,7 +1764,7 @@ export function createRotatingStreamWrapper(
 
 					if (!sawDoneEvent) {
 						if (options?.signal?.aborted) {
-							pushAbortedAssistantEvent(stream, activeModel);
+							emitAbortedTermination(options.signal.reason);
 							return;
 						}
 						const message = !forwardedAnyEvent
@@ -2050,11 +1799,6 @@ export function createRotatingStreamWrapper(
 				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${rotationAttemptLimit} attempt budget, all produced rotation-triggering errors.${lastDetail}`,
 			);
 		})().catch((error: unknown) => {
-			if (isCallerAbortSignal(options?.signal, error)) {
-				pushAbortedAssistantEvent(stream, activeModel, getErrorMessage(error));
-				return;
-			}
-
 			const errorMessage = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 			const assistantError: AssistantMessageEvent = {
 				type: "error",
@@ -2065,7 +1809,7 @@ export function createRotatingStreamWrapper(
 				),
 			};
 			stream.push(assistantError);
-			stream.end(assistantError.error);
+			stream.end();
 		});
 
 		return stream;
@@ -2139,9 +1883,6 @@ export async function registerMultiAuthProviders(
 	options?: {
 		excludeProviders?: string[];
 		includeProviders?: string[];
-		streamTimeouts?: StreamTimeoutConfig;
-		providerStreamTimeouts?: ProviderStreamTimeoutOverrides;
-		noStreamWatchdogProviders?: readonly string[];
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
@@ -2149,9 +1890,6 @@ export async function registerMultiAuthProviders(
 		options?.includeProviders && options.includeProviders.length > 0
 			? new Set(options.includeProviders)
 			: null;
-	const streamTimeouts = options?.streamTimeouts ?? DEFAULT_STREAM_TIMEOUT_CONFIG;
-	const providerStreamTimeouts = options?.providerStreamTimeouts ?? {};
-	const noStreamWatchdogProviders = options?.noStreamWatchdogProviders ?? [];
 	const registry = accountManager.getProviderRegistry();
 	const providers = includeSet
 		? ([...includeSet] as SupportedProviderId[])
@@ -2193,32 +1931,6 @@ export async function registerMultiAuthProviders(
 
 	for (const metadata of metadataToRegister) {
 		recordProviderDiscovery(metadata.provider);
-	}
-
-	const managedProviders = new Set(metadataToRegister.map((metadata) => metadata.provider));
-
-	// Auto-seed API keys from models.json into auth.json for custom providers
-	// that have an apiKey defined but no credentials stored yet.
-	for (const metadata of metadataToRegister) {
-		if (!metadata.apiKey) {
-			continue;
-		}
-		try {
-			// addApiKeyCredential deduplicates, so calling it when the key
-			// is already stored is a safe no-op.
-			const result = await accountManager.addApiKeyCredential(metadata.provider, metadata.apiKey);
-			if (result.didAddCredential) {
-				multiAuthDebugLogger.log("models_json_apikey_seeded", {
-					provider: metadata.provider,
-					credentialId: result.credentialId,
-				});
-			}
-		} catch (error: unknown) {
-			multiAuthDebugLogger.log("models_json_apikey_seed_failed", {
-				provider: metadata.provider,
-				error: getErrorMessage(error),
-			});
-		}
 	}
 
 	multiAuthDebugLogger.log("providers_discovered", {
@@ -2337,7 +2049,6 @@ export async function registerMultiAuthProviders(
 		pi.registerProvider(metadata.provider, {
 			baseUrl: metadata.baseUrl,
 			apiKey: "managed-by-multi-auth",
-			headers: metadata.headers,
 			api: primaryApi,
 			models: metadata.models,
 			streamSimple: primaryWrapper,

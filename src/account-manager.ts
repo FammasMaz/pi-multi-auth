@@ -132,7 +132,6 @@ import {
 	writeMultiAuthProviderHidden,
 	writeMultiAuthProviderRotationMode,
 } from "./config.js";
-import { shouldPermanentlyDisableCredential } from "./credential-disable-policy.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import {
@@ -157,10 +156,8 @@ import type { QuotaClassification, QuotaClassificationResult, QuotaStateForCrede
 
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
 const PRESERVED_OAUTH_REFRESH_MIN_REMAINING_MS = 30_000;
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 const PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER = new Map<string, ReadonlySet<string>>([
 	["cline", new Set(["failed_to_refresh_token"])],
-	// Codex: do not keep broken refresh rows in rotation when access cannot be renewed.
 ]);
 
 const MIN_QUOTA_RETRY_WINDOW_MS = 60_000;
@@ -541,63 +538,6 @@ function isStrongCodexIdentityKey(identityKey: string): boolean {
 function normalizeKnownCodexPlanType(planType: string | null | undefined): CodexPlanType | undefined {
 	const normalizedPlanType = normalizeCodexPlanType(planType);
 	return normalizedPlanType === "unknown" ? undefined : normalizedPlanType;
-}
-
-function getBestCodexPlanSelectionPriority(
-	credentialIds: readonly string[],
-	credentialPlanTypes: ReadonlyMap<string, CodexPlanType>,
-): number {
-	return credentialIds.reduce(
-		(bestPriority, credentialId) =>
-			Math.min(
-				bestPriority,
-				getCodexPlanSelectionPriority(credentialPlanTypes.get(credentialId) ?? "unknown"),
-			),
-		Number.POSITIVE_INFINITY,
-	);
-}
-
-function buildCredentialPriorityGroups(
-	credentialIds: readonly string[],
-	credentialPlanTypes: ReadonlyMap<string, CodexPlanType>,
-): string[][] {
-	const groups = new Map<number, string[]>();
-	for (const credentialId of credentialIds) {
-		const priority = getCodexPlanSelectionPriority(
-			credentialPlanTypes.get(credentialId) ?? "unknown",
-		);
-		const group = groups.get(priority) ?? [];
-		group.push(credentialId);
-		groups.set(priority, group);
-	}
-
-	return [...groups.entries()]
-		.sort((left, right) => left[0] - right[0])
-		.map((entry) => entry[1]);
-}
-
-function buildCredentialSelectionPasses(
-	available: ReadonlySet<string>,
-	modelEligibility: CredentialModelEligibility,
-): Set<string>[] {
-	const priorityGroups = modelEligibility.credentialPriorityGroups
-		?.map((group) => new Set(group.filter((credentialId) => available.has(credentialId))))
-		.filter((group) => group.size > 0);
-	if (priorityGroups && priorityGroups.length > 0) {
-		const coveredCredentialIds = new Set(
-			priorityGroups.flatMap((group) => [...group]),
-		);
-		return coveredCredentialIds.size >= available.size
-			? priorityGroups
-			: [...priorityGroups, new Set(available)];
-	}
-
-	const preferredAvailable = new Set(
-		[...available].filter((credentialId) =>
-			modelEligibility.preferredCredentialIds?.includes(credentialId),
-		),
-	);
-	return preferredAvailable.size > 0 ? [preferredAvailable, new Set(available)] : [new Set(available)];
 }
 
 function inferCredentialFriendlyName(
@@ -1810,20 +1750,8 @@ function isCodexUsageAuthenticationFailure(
 function clearRecoveredCodexRefreshFailureState(
 	state: ProviderRotationState,
 	credentialId: string,
-	credential: StoredOAuthCredential,
-	now: number = Date.now(),
 ): boolean {
 	let changed = false;
-	const disabledEntry = state.disabledCredentials?.[credentialId];
-	if (
-		disabledEntry &&
-		isRecoverableCodexAuthenticationDisableMessage(disabledEntry.error) &&
-		hasPreservableOAuthTokenLifetime(credential, now)
-	) {
-		delete state.disabledCredentials[credentialId];
-		changed = true;
-	}
-
 	const lastQuotaError = state.lastQuotaError[credentialId];
 	if (isLegacyCodexOAuthRefreshFailureMessage(lastQuotaError)) {
 		delete state.quotaExhaustedUntil[credentialId];
@@ -1981,7 +1909,7 @@ function clearRecoveredOAuthRefreshFailureStateForCredential(
 	now: number = Date.now(),
 ): boolean {
 	if (provider === "openai-codex") {
-		return clearRecoveredCodexRefreshFailureState(state, credentialId, credential, now);
+		return clearRecoveredCodexRefreshFailureState(state, credentialId);
 	}
 	if (provider === "cline") {
 		return clearRecoveredClineRefreshFailureState(state, credentialId, credential, now);
@@ -2109,10 +2037,6 @@ export class AccountManager {
 	 */
 	public getProviderRegistry(): ProviderRegistry {
 		return this.providerRegistry;
-	}
-
-	private isNoCooldownProvider(provider: SupportedProviderId): boolean {
-		return this.extensionConfig.noCooldownProviders.includes(provider);
 	}
 
 	private isOAuthRefreshManagedForProvider(provider: SupportedProviderId): boolean {
@@ -3738,20 +3662,6 @@ export class AccountManager {
 			throw new Error("Cannot disable credential without a non-empty error message.");
 		}
 
-		const disablePolicy = {
-			autoDisableBrokenCredentials:
-				this.extensionConfig.credentialRotation.autoDisableBrokenCredentials,
-		};
-		if (!shouldPermanentlyDisableCredential(errorMessage, errorKind, disablePolicy)) {
-			multiAuthDebugLogger.log("credential_disable_skipped", {
-				provider,
-				credentialRef: redactUsageCredentialIdentifier(credentialId),
-				errorKind,
-				message: errorMessage.slice(0, 200),
-			});
-			return;
-		}
-
 		const disabledPlanType = provider === OPENAI_CODEX_PROVIDER_ID
 			? this.readCachedCodexCredentialPlanType(credentialId)
 			: undefined;
@@ -3963,15 +3873,26 @@ export class AccountManager {
 				return failure;
 			}
 
-			await this.disableCredential(provider, credentialId, failure.message, "authentication");
-			multiAuthDebugLogger.log("oauth_refresh_permanent_disable_attempt", {
-				provider,
-				credentialRef: redactUsageCredentialIdentifier(credentialId),
-				message: failure.message,
-				status: failure.details.status,
-				errorCode: failure.details.errorCode,
-				reason: failure.details.reason,
-			});
+			if (provider === "openai-codex") {
+				await this.disableCredential(provider, credentialId, failure.message, "authentication");
+				multiAuthDebugLogger.log("oauth_refresh_codex_disabled", {
+					provider,
+					credentialRef: redactUsageCredentialIdentifier(credentialId),
+					message: failure.message,
+					status: failure.details.status,
+					errorCode: failure.details.errorCode,
+					reason: failure.details.reason,
+				});
+			} else {
+				await this.disableCredential(provider, credentialId, failure.message, "authentication");
+				multiAuthDebugLogger.log("oauth_refresh_permanently_disabled", {
+					provider,
+					credentialRef: redactUsageCredentialIdentifier(credentialId),
+					message: failure.message,
+					status: failure.details.status,
+					errorCode: failure.details.errorCode,
+				});
+			}
 		}
 
 		return failure;
@@ -4162,22 +4083,6 @@ export class AccountManager {
 			return {
 				credential,
 				disposition: "skipped_missing_refresh_token",
-			};
-		}
-
-		if (provider === OPENAI_CODEX_PROVIDER_ID) {
-			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, credential);
-			this.oauthRefreshScheduler.cancelRefresh(credentialId);
-			await this.persistOAuthRefreshSchedule(provider);
-			await this.storage.withLock((stored) => {
-				const providerState = getProviderState(stored, provider);
-				providerState.lastUsedAt[credentialId] = Date.now();
-				return { result: undefined, next: stored };
-			});
-			this.usageService.clearOperationalCredential(provider, credentialId);
-			return {
-				credential,
-				disposition: "preserved_active_token",
 			};
 		}
 
@@ -5220,9 +5125,6 @@ export class AccountManager {
 		credentialId: string,
 		errorMessage: string,
 	): Promise<number> {
-		if (this.isNoCooldownProvider(provider)) {
-			return 0;
-		}
 		const message = errorMessage.trim().slice(0, 500) || "Transient provider error";
 		await this.recordCredentialFailure(provider, credentialId, 0, "provider_transient", message);
 		let cooldownMs = TRANSIENT_COOLDOWN_BASE_MS;
@@ -5966,10 +5868,6 @@ export class AccountManager {
 				: null;
 			const disabledError = state.disabledCredentials?.[credentialId]?.error;
 			const lastQuotaError = state.lastQuotaError?.[credentialId];
-			const planTier =
-				provider === OPENAI_CODEX_PROVIDER_ID && credential.type === "oauth"
-					? extractCodexCredentialIdentity(credential).planType ?? undefined
-					: undefined;
 
 			credentials.push({
 				credentialId,
@@ -5998,7 +5896,6 @@ export class AccountManager {
 				usageSnapshotDisplayOnly: usage?.displayOnly,
 				usageFetchError: usage?.error ?? undefined,
 				disabledError,
-				...(planTier ? { planTier } : {}),
 			});
 		}
 
@@ -6720,10 +6617,6 @@ export class AccountManager {
 			return credential;
 		}
 
-		if (provider === OPENAI_CODEX_PROVIDER_ID) {
-			return credential;
-		}
-
 		const safetyWindowMs = getOAuthRefreshLeadTimeMs(
 			provider,
 			INTERNAL_OAUTH_REFRESH_CONFIG.safetyWindowMs,
@@ -6742,90 +6635,15 @@ export class AccountManager {
 			this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
 			await this.persistOAuthRefreshSchedule(provider);
 			return refreshedCredential;
-		} catch (error: unknown) {
-			const isUnsupportedRefresh =
-				isOAuthRefreshFailureError(error) &&
-				error.details.errorCode === UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE;
-			const isTransientRefresh =
-				isOAuthRefreshFailureError(error) && !error.details.permanent;
-
+		} catch (error) {
 			if (
-				isUnsupportedRefresh ||
-				isTransientRefresh ||
-				(isOAuthRefreshFailureError(error) &&
-					shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error))
+				isOAuthRefreshFailureError(error) &&
+				shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error)
 			) {
-				multiAuthDebugLogger.log("oauth_refresh_fallback_to_existing", {
-					provider,
-					credentialId,
-					reason: isUnsupportedRefresh ? "unsupported_refresh_provider" : "transient_refresh_failure",
-					error: error instanceof Error ? error.message : String(error),
-				});
 				return credential;
 			}
-
 			throw error;
 		}
-	}
-
-	private async refreshCodexCredentialTokenUnderAuthLock(
-		credentialId: string,
-		credential: StoredOAuthCredential,
-	): Promise<StoredOAuthCredential> {
-		return this.authWriter.withLock(async (authData) => {
-			const currentRaw = authData[credentialId];
-			if (!isStoredOAuthCredentialForRefresh(currentRaw)) {
-				throw new Error(
-					`Credential ${credentialId} was not found in auth.json or is not an OAuth credential`,
-				);
-			}
-
-			if (hasRotatedOAuthCredential(currentRaw, credential)) {
-				multiAuthDebugLogger.log("oauth_refresh_guarded_reloaded", {
-					provider: OPENAI_CODEX_PROVIDER_ID,
-					credentialRef: redactUsageCredentialIdentifier(credentialId),
-					source: "credential",
-				});
-				return { result: currentRaw };
-			}
-
-			const siblingCredential = findRotatedCodexCredentialInAuthData(
-				authData,
-				credentialId,
-				credential,
-			);
-			if (siblingCredential) {
-				const adoptedCredential = mergeCodexOAuthCredential(currentRaw, siblingCredential);
-				multiAuthDebugLogger.log("oauth_refresh_guarded_reloaded", {
-					provider: OPENAI_CODEX_PROVIDER_ID,
-					credentialRef: redactUsageCredentialIdentifier(credentialId),
-					source: "sibling",
-				});
-				return {
-					result: adoptedCredential,
-					next: {
-						...authData,
-						[credentialId]: adoptedCredential,
-					},
-				};
-			}
-
-			const refreshed = await refreshOAuthCredential(OPENAI_CODEX_PROVIDER_ID, currentRaw, {
-				requestTimeoutMs: this.extensionConfig.oauthRefresh.requestTimeoutMs,
-			});
-			const refreshedCredential: StoredOAuthCredential = {
-				...currentRaw,
-				...refreshed,
-				type: "oauth",
-			};
-			return {
-				result: refreshedCredential,
-				next: {
-					...authData,
-					[credentialId]: refreshedCredential,
-				},
-			};
-		});
 	}
 
 	private async refreshCredentialToken(
@@ -6854,7 +6672,7 @@ export class AccountManager {
 		}
 
 		const refreshPromise = (async (): Promise<StoredOAuthCredential> => {
-			let refreshedCredential: StoredOAuthCredential;
+			let refreshed: OAuthCredentials;
 			try {
 				refreshed = await refreshOAuthCredential(provider, credential, {
 					requestTimeoutMs: INTERNAL_OAUTH_REFRESH_CONFIG.requestTimeoutMs,
@@ -6879,8 +6697,15 @@ export class AccountManager {
 				throw failure;
 			}
 
-			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, refreshedCredential);
-			return refreshedCredential;
+			await this.authWriter.setOAuthCredential(credentialId, refreshed);
+			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, {
+				type: "oauth",
+				...refreshed,
+			});
+			return {
+				type: "oauth",
+				...refreshed,
+			};
 		})().finally(() => {
 			this.oauthRefreshInFlight.delete(refreshKey);
 		});
@@ -7236,11 +7061,6 @@ export class AccountManager {
 			return;
 		}
 
-		if (provider === OPENAI_CODEX_PROVIDER_ID) {
-			this.oauthRefreshScheduler.cancelRefresh(credentialId);
-			return;
-		}
-
 		const expiration = determineTokenExpiration(credential.access, credential.expires);
 		const scheduledExpiration = getSchedulerExpirationForRefreshLeadTime(
 			provider,
@@ -7337,21 +7157,7 @@ export class AccountManager {
 			return determineTokenExpiration(refreshed.access, refreshed.expires).expiresAt;
 		} catch (error) {
 			if (isOAuthRefreshFailureError(error) && error.details.permanent) {
-				multiAuthDebugLogger.log("oauth_scheduled_refresh_permanent_failure", {
-					provider,
-					credentialRef: redactUsageCredentialIdentifier(credentialId),
-					message: error.message,
-				});
-				try {
-					await this.persistOAuthRefreshSchedule(provider);
-				} catch (persistError: unknown) {
-					multiAuthDebugLogger.log("oauth_refresh_schedule_persist_failed", {
-						provider,
-						credentialRef: redactUsageCredentialIdentifier(credentialId),
-						message: getErrorMessage(persistError),
-					});
-				}
-				return undefined;
+				throw error;
 			}
 			return undefined;
 		}
@@ -7362,7 +7168,7 @@ export class AccountManager {
 		credentialIds: readonly string[],
 		normalizedModelId: string | undefined,
 		requiresEntitlement: boolean,
-		prefersPaidPlan: boolean,
+		prefersFreePlan: boolean,
 		usageContext: CredentialUsageContext | undefined,
 		signal: AbortSignal | undefined,
 	): Promise<CredentialModelEligibility> {
@@ -7375,7 +7181,6 @@ export class AccountManager {
 		const unknownPlanCredentialIds: string[] = [];
 		const ineligibleCredentialIds: string[] = [];
 		const bootstrapCandidateCredentialIds: string[] = [];
-		const credentialPlanTypes = new Map<string, CodexPlanType>();
 		let staleCredentialCount = 0;
 		let hasUnknownPlanType = false;
 		let hasUsageFailure = false;
@@ -7441,7 +7246,6 @@ export class AccountManager {
 			}
 
 			const planType = normalizeCodexPlanType(snapshot.planType);
-			credentialPlanTypes.set(credentialId, planType);
 			const quotaState = usage.displayOnly || options.planOnly
 				? ({ state: "unknown" } satisfies UsageQuotaState)
 				: inferQuotaStateFromUsage(snapshot);
@@ -7472,7 +7276,7 @@ export class AccountManager {
 			}
 
 			pushUnique(verifiedEligibleCredentialIds, credentialId);
-			if (prefersPaidPlan && isPlanEligibleForModel(planType)) {
+			if (prefersFreePlan && planType === "free") {
 				pushUnique(preferredCredentialIds, credentialId);
 				pushUnique(knownFreePlanCredentialIds, credentialId);
 			}
@@ -7522,7 +7326,7 @@ export class AccountManager {
 				? normalizeCodexPlanType(usage.snapshot.planType)
 				: "unknown";
 			if (
-				(requiresEntitlement || prefersPaidPlan) &&
+				requiresEntitlement &&
 				!usage?.error &&
 				(!hasPlanEvidence || planType === "unknown")
 			) {
@@ -7585,18 +7389,12 @@ export class AccountManager {
 					const usageResult = usageResults[index];
 					if (usageResult?.status === "fulfilled") {
 						processUsage(credentialId, usageResult.value);
-					} else if (requiresEntitlement) {
+					} else {
 						pushUnique(usageFailureCredentialIds, credentialId);
 						hasUsageFailure = true;
-					} else {
-						pushUnique(verifiedEligibleCredentialIds, credentialId);
 					}
 				}
-				const bestResolvedPlanPriority = getBestCodexPlanSelectionPriority(
-					verifiedEligibleCredentialIds,
-					credentialPlanTypes,
-				);
-				if (bestResolvedPlanPriority <= CODEX_BEST_PLAN_SELECTION_PRIORITY) {
+				if (verifiedEligibleCredentialIds.length >= 1) {
 					break;
 				}
 			}
@@ -7716,7 +7514,7 @@ export class AccountManager {
 				credentialIds,
 				normalizedModelId,
 				requiresEntitlement,
-				prefersPaidPlan,
+				prefersFreePlan,
 				usageContext,
 				effectiveSignal,
 			);

@@ -16,7 +16,6 @@ import {
 import {
 	isPlanEligibleForModel,
 	modelPrefersFreePlan,
-	modelPrefersPaidPlan,
 	modelRequiresEntitlement,
 	normalizeCodexPlanType,
 } from "../src/model-entitlements.js";
@@ -151,9 +150,7 @@ test("codex plan normalization recognizes paid-plan labels for restricted models
 	assert.equal(isPlanEligibleForModel("enterprise"), true);
 	assert.equal(isPlanEligibleForModel("free"), false);
 	assert.equal(isPlanEligibleForModel("unknown"), false);
-	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), false);
-	assert.equal(modelPrefersPaidPlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
-	assert.equal(modelPrefersPaidPlan(CODEX_PROVIDER_ID, undefined), true);
+	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.4"), false);
 	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.5"), true);
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.5"), false);
@@ -162,78 +159,28 @@ test("codex plan normalization recognizes paid-plan labels for restricted models
 	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5-mini"), true);
 });
 
-test("account manager prioritizes paid codex credentials for unconstrained requests", async (t) => {
-	const credentials = [
+test("account manager preserves current selection for unconstrained codex requests", async (t) => {
+	const accountManager = await createCodexAccountManager(t, [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
-	] as const;
-	const accountManager = await createCodexAccountManager(t, credentials);
-	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+	]);
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
-	assert.equal(selected.credentialId, "openai-codex-1");
+	assert.equal(selected.credentialId, "openai-codex");
 	assert.equal(selected.provider, CODEX_PROVIDER_ID);
 });
 
-test("account manager prioritizes team before plus before free codex credentials", async (t) => {
-	const credentials = [
-		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
-		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
-		{ credentialId: "openai-codex-2", secret: "sk-team-key", planType: "team" },
-	] as const;
-	const accountManager = await createCodexAccountManager(t, credentials);
-	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
-
-	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
-	assert.equal(selected.credentialId, "openai-codex-2");
-});
-
-test("account manager bootstraps later codex accounts to find team before plus", async (t) => {
-	const credentials = [
-		{ credentialId: "openai-codex", secret: "bootstrap-free-key", planType: "free" },
-		{ credentialId: "openai-codex-1", secret: "bootstrap-plus-key", planType: "plus" },
-		{ credentialId: "openai-codex-2", secret: "bootstrap-team-key", planType: "team" },
-	] as const;
-	const extensionConfig: MultiAuthExtensionConfig = {
-		...DEFAULT_MULTI_AUTH_CONFIG,
-		usageCoordination: {
-			...DEFAULT_MULTI_AUTH_CONFIG.usageCoordination,
-			globalMaxConcurrentFreshRequests: 2,
-			perProviderMaxConcurrentFreshRequests: 2,
-			entitlementCandidateWindow: 2,
-		},
-	};
-	const fetchedCredentialIds: string[] = [];
-	const accountManager = await createCodexAccountManager(t, credentials, {
-		extensionConfig,
-		onFetchUsage: (credential) => {
-			if (credential) {
-				fetchedCredentialIds.push(credential.credentialId);
-			}
-		},
-	});
-
-	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID);
-	assert.equal(selected.credentialId, "openai-codex-2");
-	assert.deepEqual(
-		fetchedCredentialIds,
-		credentials.map((credential) => credential.credentialId),
-	);
-});
-
-test("account manager prioritizes paid codex credentials for free-eligible models", async (t) => {
-	const credentials = [
+test("account manager prefers free codex credentials for free-eligible models", async (t) => {
+	const accountManager = await createCodexAccountManager(t, [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
 		{ credentialId: "openai-codex-2", secret: "sk-pro-key", planType: "pro" },
-	] as const;
-	const accountManager = await createCodexAccountManager(t, credentials);
-	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+	]);
 
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5.5",
 	});
-	assert.equal(selected.credentialId, "openai-codex-1");
+	assert.equal(selected.credentialId, "openai-codex");
 });
 
 test("account manager reuses codex model routing usage lookups across repeated selections", async (t) => {
@@ -320,21 +267,6 @@ test("account manager falls back to paid codex credentials when free usage is ex
 	});
 	assert.equal(selected.credentialId, "openai-codex-1");
 });
-
-test("account manager falls back to free codex credentials when paid usage is exhausted", async (t) => {
-	const credentials = [
-		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free", primaryUsedPercent: 10 },
-		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus", primaryUsedPercent: 100 },
-	] as const;
-	const accountManager = await createCodexAccountManager(t, credentials);
-	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
-
-	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-		modelId: "gpt-5.4",
-	});
-	assert.equal(selected.credentialId, "openai-codex");
-});
-
 
 test("account manager skips free codex credentials for paid-only models", async (t) => {
 	const accountManager = await createCodexAccountManager(t, [
@@ -633,8 +565,8 @@ test("codex stale usage selection keeps local rotation fair while queueing backg
 	await sleep(5);
 	fetchCount = 0;
 
-	const first = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.3-codex" });
-	const second = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.3-codex" });
+	const first = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
+	const second = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
 
 	// Usage-based selection stays sticky on the credential with the lowest
 	// actual usage instead of rotating every request.

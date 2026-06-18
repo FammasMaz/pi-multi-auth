@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildCodexGlobalCreditLines, resolveUsageWindowLabel } from "../src/commands.js";
-import { getCodexWindowCredits } from "../src/usage/codex.js";
-import type { CredentialStatus } from "../src/types.js";
+import { resolveUsageWindowLabel } from "../src/commands.js";
 import type { UsageSnapshot } from "../src/usage/types.js";
 
 function createSnapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {

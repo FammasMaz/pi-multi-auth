@@ -55,7 +55,7 @@ const AUTH_TOKEN_INVALIDATED_PATTERNS: RegExp[] = [
 	/(?:auth(?:entication)?|access|oauth)\s+token[^\n.]*invalidated/i,
 	/invalidated[^\n.]*\b(?:auth(?:entication)?|access|oauth)\s+token\b/i,
 	/(?:^|[^\p{L}\p{N}])token[_-]?(?:revoked|invalidated)(?:$|[^\p{L}\p{N}])/iu,
-	/encountered invalidated oauth token/i,
+	/try\s+signing\s+in\s+again/i,
 ];
 
 const AUTH_PATTERNS: RegExp[] = [
@@ -125,9 +125,7 @@ const QUOTA_PATTERNS: RegExp[] = [
 	/you\s+have\s+reached\s+(?:(?:your|the)\s+)?(?:usage\s+)?limit/i,
 	/credit balance/i,
 	/out of credits?/i,
-	/monthly (?:spend|usage|quota|credit) limit/i,
-	/monthly\s+(?:quota|credits?)/i,
-	/30[\s-]?day\s+(?:usage\s+)?(?:quota|limit|window)/i,
+	/monthly (?:spend|usage) limit/i,
 	/daily\s+free\s+allocation/i,
 	/used\s+up\s+your\s+daily/i,
 	/neurons?\s+per\s+day/i,
@@ -374,17 +372,6 @@ export function classifyCredentialError(
 		};
 	}
 
-	if (isRotationSummaryError(message)) {
-		return {
-			kind: "unknown",
-			shouldRotateCredential: true,
-			shouldRetrySameCredential: false,
-			shouldApplyCooldown: false,
-			shouldDisableCredential: false,
-			reason: "Rotation summary error — not a single-credential ban",
-		};
-	}
-
 	if (matchesAny(message, CONTEXT_LIMIT_PATTERNS)) {
 		return {
 			kind: "context_limit",
@@ -397,16 +384,13 @@ export function classifyCredentialError(
 	}
 
 	if (matchesAny(message, AUTH_TOKEN_INVALIDATED_PATTERNS)) {
-		const shouldDisable = isAccountBannedOrRevokedError(message);
 		return {
 			kind: "authentication",
 			shouldRotateCredential: true,
 			shouldRetrySameCredential: false,
 			shouldApplyCooldown: false,
-			shouldDisableCredential: shouldDisable,
-			reason: shouldDisable
-				? "Authentication token revoked or invalidated — credential disabled until manual review"
-				: "Authentication token invalidated — rotate or re-authenticate without disabling",
+			shouldDisableCredential: true,
+			reason: "Authentication token invalidated - credential disabled until re-authenticated",
 		};
 	}
 
@@ -505,9 +489,7 @@ export function classifyCredentialError(
 
 	const isRateLimited = matchesAny(message, RATE_LIMIT_PATTERNS);
 	const isQuotaError = matchesAny(message, QUOTA_PATTERNS);
-	const inferredQuotaClassification = quotaClassifier.classifyFromMessage(message).classification;
-	const isWeeklyQuota =
-		matchesAny(message, WEEKLY_QUOTA_PATTERNS) && inferredQuotaClassification !== "monthly";
+	const isWeeklyQuota = matchesAny(message, WEEKLY_QUOTA_PATTERNS);
 
 	// Weekly quota errors get special handling with exponential backoff
 	if (isWeeklyQuota) {

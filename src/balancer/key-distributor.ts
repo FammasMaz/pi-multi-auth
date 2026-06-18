@@ -979,51 +979,12 @@ export class KeyDistributor {
 			return available.has(manualCredentialId) ? manualCredentialId : null;
 		}
 
-		const selectionPasses = buildSelectionPasses(
-			available,
-			context.preferredIdGroups,
-			context.preferredIds,
-		);
-
-		for (const selectionAvailable of selectionPasses) {
-			switch (snapshot.providerState.rotationMode) {
-				case "round-robin": {
-					const selectedIndex = getRoundRobinCandidateIndex(snapshot.providerState, selectionAvailable);
-					if (selectedIndex !== undefined) {
-						return snapshot.providerState.credentialIds[selectedIndex] ?? null;
-					}
-					break;
-				}
-				case "usage-based": {
-					const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, selectionAvailable);
-					if (selectedIndex !== undefined) {
-						return snapshot.providerState.credentialIds[selectedIndex] ?? null;
-					}
-					break;
-				}
-				case "balancer":
-				default: {
-					const selectionExcludedIds = new Set(context.excludedIds);
-					for (const credentialId of snapshot.credentialIds) {
-						if (!selectionAvailable.has(credentialId)) {
-							selectionExcludedIds.add(credentialId);
-						}
-					}
-					const selectedCredentialId = selectBestCredential(
-						{ ...context, excludedIds: [...selectionExcludedIds] },
-						snapshot,
-						{
-							waitTimeoutMs: this.config.waitTimeoutMs,
-							defaultCooldownMs: this.config.defaultCooldownMs,
-							maxConcurrentPerKey: this.config.maxConcurrentPerKey,
-							tolerance: this.config.tolerance,
-						},
-					);
-					if (selectedCredentialId) {
-						return selectedCredentialId;
-					}
-					break;
-				}
+		switch (snapshot.providerState.rotationMode) {
+			case "round-robin": {
+				const selectedIndex = getRoundRobinCandidateIndex(snapshot.providerState, available);
+				return selectedIndex === undefined
+					? null
+					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
 			}
 			case "usage-based": {
 				const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, available);
@@ -1095,8 +1056,6 @@ export class KeyDistributor {
 				this.stickyCredentialBySelectionSession.delete(selectionSessionKey);
 			}
 		}
-
-		return null;
 	}
 
 	private resolveNextActiveIndex(
@@ -1320,22 +1279,9 @@ export class KeyDistributor {
 			excludedIds.add(credentialId);
 		}
 
-		const eligibleIds = new Set(eligibility.eligibleCredentialIds);
-		const preferredIds = eligibility.preferredCredentialIds
-			?.filter((credentialId) => eligibleIds.has(credentialId) && !excludedIds.has(credentialId));
-		const preferredIdGroups = eligibility.credentialPriorityGroups
-			?.map((group) =>
-				group.filter((credentialId) => eligibleIds.has(credentialId) && !excludedIds.has(credentialId)),
-			)
-			.filter((group) => group.length > 0);
-
 		return {
 			...context,
 			excludedIds: [...excludedIds],
-			preferredIds: preferredIds && preferredIds.length > 0 ? preferredIds : context.preferredIds,
-			preferredIdGroups: preferredIdGroups && preferredIdGroups.length > 0
-				? preferredIdGroups
-				: context.preferredIdGroups,
 		};
 	}
 

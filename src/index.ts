@@ -376,9 +376,6 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 				isSubagentRuntime && requestedSubagentProvider
 					? [requestedSubagentProvider]
 					: undefined,
-			streamTimeouts: configLoadResult.config.streamTimeouts,
-			providerStreamTimeouts: configLoadResult.config.providerStreamTimeouts,
-			noStreamWatchdogProviders: configLoadResult.config.noStreamWatchdogProviders,
 		});
 		pi.events?.emit(PROVIDERS_REGISTERED_EVENT, {
 			generation: startupWorkGeneration,

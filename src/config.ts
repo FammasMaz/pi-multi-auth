@@ -219,22 +219,6 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 	};
 }
 
-function normalizeCredentialRotationConfig(
-	value: unknown,
-	warnings: string[],
-): CredentialRotationConfig {
-	const defaults = DEFAULT_CREDENTIAL_ROTATION_CONFIG;
-	const record = toRecord(value);
-	return {
-		autoDisableBrokenCredentials: readBoolean(
-			record.autoDisableBrokenCredentials,
-			"credentialRotation.autoDisableBrokenCredentials",
-			defaults.autoDisableBrokenCredentials,
-			warnings,
-		),
-	};
-}
-
 function joinWarnings(warnings: Array<string | undefined>): string | undefined {
 	const messages = warnings.filter((warning): warning is string => Boolean(warning?.trim()));
 	return messages.length > 0 ? messages.join(" ") : undefined;

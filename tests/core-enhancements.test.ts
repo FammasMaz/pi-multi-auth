@@ -53,9 +53,8 @@ import { PoolManager } from "../src/pool-manager.js";
 import { createRotatingStreamWrapper } from "../src/provider.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
 import { RateLimitHeaderParser } from "../src/rate-limit-headers.js";
-import { createDefaultMultiAuthState, createEmptyProviderState, getProviderState, MultiAuthStorage } from "../src/storage.js";
+import { createDefaultMultiAuthState, getProviderState, MultiAuthStorage } from "../src/storage.js";
 import { OAuthRefreshFailureError } from "../src/types-oauth.js";
-import { unregisterGlobalKeyDistributor } from "../src/balancer/index.js";
 import { selectBestCredential } from "../src/balancer/weighted-selector.js";
 import { UsageService } from "../src/usage/index.js";
 import type { StoredAuthCredential } from "../src/types.js";
@@ -1889,20 +1888,22 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 		new Map(),
 	);
 
-	const stream = wrapper(model, createTestContext(), {
-		apiKey: "secret",
-		signal: abortController.signal,
-	});
-	const events = await collectAssistantEvents(stream);
-	const result = await stream.result();
-	const abortEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), {
+			apiKey: "secret",
+			signal: abortController.signal,
+		}),
 	);
-
-	assert.equal(abortEvent?.reason, "aborted");
-	assert.equal(result.stopReason, "aborted");
-	assert.deepEqual(acquiredCredentialIds, []);
-	assert.equal(callsByApiKey.get("secret-a"), undefined);
+	assert.equal(events.length, 1);
+	assert.equal(events[0]?.type, "error");
+	if (events[0]?.type !== "error") {
+		assert.fail("Expected an aborted terminal error event.");
+	}
+	assert.equal(events[0].reason, "aborted");
+	assert.equal(events[0].error.stopReason, "aborted");
+	assert.match(events[0].error.errorMessage ?? "", /aborted/i);
+	assert.deepEqual(acquiredCredentialIds, ["credential-a"]);
+	assert.equal(callsByApiKey.get("secret-a"), 1);
 	assert.equal(callsByApiKey.get("secret-b"), undefined);
 	assert.deepEqual(transientCooldowns, []);
 });
@@ -3052,39 +3053,6 @@ test("account manager honors configured pools before default rotation", async (t
 	assert.equal(stored.providers[providerId]?.poolState?.activePoolId, "primary");
 });
 
-test("account manager aborts balancer credential acquisition when caller signal is cancelled", async (t) => {
-	unregisterGlobalKeyDistributor();
-	const providerId = "balancer-abort-provider";
-	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: { type: "api_key", key: "alpha" },
-		},
-	});
-
-	const state = createDefaultMultiAuthState();
-	state.providers[providerId] = {
-		...createEmptyProviderState("balancer"),
-		credentialIds: [providerId],
-	};
-	await writeFile(storagePath, JSON.stringify(state, null, 2), "utf-8");
-
-	await accountManager.getKeyDistributor().acquireForSubagent("held-session", providerId);
-	try {
-		const controller = new AbortController();
-		const acquisition = accountManager.acquireCredential(providerId, {
-			signal: controller.signal,
-		});
-
-		controller.abort();
-		await assert.rejects(acquisition, {
-			name: "AbortError",
-		});
-	} finally {
-		accountManager.getKeyDistributor().releaseFromSubagent("held-session");
-	}
-});
-
 test("account manager rotates across pools when provider pool failover strategy is configured", async (t) => {
 	const providerId = "pool-strategy-provider";
 	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
@@ -3378,14 +3346,6 @@ test("account manager resolves deterministic failover chains with mapped models"
 		providers: Record<string, { activeChain?: unknown }>;
 	};
 	assert.equal(stored.providers[sourceProvider]?.activeChain, undefined);
-});
-
-test("OpenAI 30-day free quota errors classify as monthly quota exhaustion", () => {
-	const classification = classifyCredentialError("You have reached your 30-day limit. Upgrade for higher limits.");
-
-	assert.equal(classification.kind, "quota");
-	assert.equal(classification.quotaClassification, "monthly");
-	assert.ok((classification.recommendedCooldownMs ?? 0) >= 29 * 24 * 60 * 60_000);
 });
 
 test("richer quota classification drives cooldown duration and persisted quota state", async (t) => {
@@ -3794,7 +3754,7 @@ test("account manager refreshCredential only updates the selected OAuth credenti
 	);
 });
 
-test("account manager never refreshes Codex tokens during manual refresh", async (t) => {
+test("account manager disables permanently invalid Codex refresh credentials without console noise", async (t) => {
 	const providerId = "openai-codex";
 	const expiredJwt = createJwtWithExp(Math.floor((Date.now() - 60_000) / 1_000));
 	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
@@ -3811,106 +3771,88 @@ test("account manager never refreshes Codex tokens during manual refresh", async
 	});
 
 	const originalFetch = globalThis.fetch;
-	let fetchCalls = 0;
+	const originalConsoleError = console.error;
+	const originalDebugLog = multiAuthDebugLogger.log.bind(multiAuthDebugLogger);
+	const debugEntries: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	let consoleErrorCalls = 0;
+
 	t.after(() => {
 		globalThis.fetch = originalFetch;
+		console.error = originalConsoleError;
+		multiAuthDebugLogger.log = originalDebugLog;
 	});
-	globalThis.fetch = async () => {
-		fetchCalls += 1;
-		return new Response("{}", { status: 500 });
+
+	globalThis.fetch = async () =>
+		new Response(
+			JSON.stringify({
+				error: "invalid_grant",
+				error_description: "Refresh token raw-refresh-token-123 has expired or was revoked.",
+				access_token: "raw-access-token-123",
+			}),
+			{
+				status: 400,
+				headers: { "Content-Type": "application/json" },
+			},
+		);
+	console.error = () => {
+		consoleErrorCalls += 1;
+	};
+	multiAuthDebugLogger.log = (event, payload = {}) => {
+		debugEntries.push({ event, payload: { ...payload } });
 	};
 
-	const refreshResult = await accountManager.refreshCredential(providerId, providerId);
+	await assert.rejects(
+		() => accountManager.refreshCredential(providerId, providerId),
+		/invalid_grant/,
+	);
+
 	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
 		providers: Record<
 			string,
 			{
-				disabledCredentials?: Record<string, unknown>;
+				disabledCredentials?: Record<string, { error: string; disabledAt: number }>;
 				quotaExhaustedUntil?: Record<string, number>;
 				lastQuotaError?: Record<string, string>;
 				oauthRefreshScheduled?: Record<string, number>;
 			}
 		>;
 	};
+	const disabledEntry = stored.providers[providerId]?.disabledCredentials?.[providerId];
+	const quotaExhaustedUntil = stored.providers[providerId]?.quotaExhaustedUntil?.[providerId];
+	const lastQuotaError = stored.providers[providerId]?.lastQuotaError?.[providerId];
+	const refreshFailureLog = debugEntries.find((entry) => entry.event === "oauth_refresh_failed");
+	const disabledLog = debugEntries.find(
+		(entry) => entry.event === "oauth_refresh_codex_disabled",
+	);
+	const providerStatus = await accountManager.getProviderStatus(providerId);
+	const statusCredential = providerStatus.credentials.find(
+		(credential) => credential.credentialId === providerId,
+	);
 
-	assert.equal(fetchCalls, 0);
-	assert.equal(refreshResult.disposition, "preserved_active_token");
-	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
-	assert.deepEqual(stored.providers[providerId]?.quotaExhaustedUntil ?? {}, {});
-	assert.deepEqual(stored.providers[providerId]?.lastQuotaError ?? {}, {});
+	assert.equal(consoleErrorCalls, 0);
+	assert.ok(refreshFailureLog);
+	assert.equal(refreshFailureLog?.payload.permanent, true);
+	assert.equal(refreshFailureLog?.payload.status, 400);
+	assert.equal(refreshFailureLog?.payload.errorCode, "invalid_grant");
+	assert.equal(refreshFailureLog?.payload.reason, "token_rejected");
+	assert.equal("errorDescription" in (refreshFailureLog?.payload ?? {}), false);
+	assert.equal("responseBody" in (refreshFailureLog?.payload ?? {}), false);
+	assert.ok(disabledLog);
+	assert.equal(disabledLog?.payload.errorCode, "invalid_grant");
+	assert.equal(quotaExhaustedUntil, undefined);
+	assert.equal(lastQuotaError, undefined);
+	assert.ok(disabledEntry);
+	assert.match(disabledEntry?.error ?? "", /invalid_grant/);
+	assert.doesNotMatch(disabledEntry?.error ?? "", /raw-refresh-token-123|raw-access-token-123|revoked/i);
+	assert.equal(statusCredential?.disabledError, disabledEntry?.error);
+	assert.doesNotMatch(
+		String(refreshFailureLog?.payload.message ?? ""),
+		/raw-refresh-token-123|raw-access-token-123|revoked/i,
+	);
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
 });
 
-test("account manager preserves active Codex access tokens after refresh-token reuse", async (t) => {
-	const providerId = "openai-codex";
-	const expiresAt = Date.now() + 10 * 60_000;
-	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
-	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: {
-				type: "oauth",
-				access: jwt,
-				refresh: "codex-refresh-token",
-				expires: expiresAt,
-				accountId: "acct_active_codex",
-			},
-		},
-	});
-
-	const originalFetch = globalThis.fetch;
-	t.after(() => {
-		globalThis.fetch = originalFetch;
-	});
-	globalThis.fetch = async () => new Response(
-		JSON.stringify({ error: { code: "refresh_token_reused", message: "Refresh token already used" } }),
-		{ status: 401, headers: { "Content-Type": "application/json" } },
-	);
-
-	const refreshResult = await accountManager.refreshCredential(providerId, providerId);
-	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
-		providers: Record<string, { disabledCredentials?: Record<string, unknown> }>;
-	};
-
-	assert.equal(refreshResult.disposition, "preserved_active_token");
-	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
-});
-
-test("account manager clears stale Codex authentication disables after reimport", async (t) => {
-	const providerId = "openai-codex";
-	const expiresAt = Date.now() + 10 * 60_000;
-	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
-	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
-		providerId,
-		authData: {
-			[providerId]: {
-				type: "oauth",
-				access: jwt,
-				refresh: "reimported-refresh-token",
-				expires: expiresAt,
-				accountId: "acct_reimported_codex",
-			},
-		},
-	});
-	const state = createDefaultMultiAuthState([providerId]);
-	const providerState = getProviderState(state, providerId);
-	providerState.credentialIds = [providerId];
-	providerState.disabledCredentials[providerId] = {
-		error: "Multi-auth rotation failed\nProvider: openai-codex\nReason: Your authentication token has been invalidated. Please try signing in again.",
-		disabledAt: Date.now() - 1_000,
-	};
-	await writeFile(storagePath, JSON.stringify(state, null, 2), "utf-8");
-
-	const status = await accountManager.getProviderStatus(providerId);
-	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
-		providers: Record<string, { disabledCredentials?: Record<string, unknown> }>;
-	};
-
-	assert.equal(status.credentials[0]?.disabledError, undefined);
-	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
-});
-
-test("account manager does not schedule automatic Codex token refresh", async (t) => {
+test("account manager persists scheduled oauth refresh timestamps for oauth credentials", async (t) => {
 	const providerId = "openai-codex";
 	const expiresAt = Date.now() + 10 * 60_000;
 	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
@@ -3931,7 +3873,10 @@ test("account manager does not schedule automatic Codex token refresh", async (t
 	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
 		providers: Record<string, { oauthRefreshScheduled?: Record<string, number> }>;
 	};
-	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
+	const scheduledAt = stored.providers[providerId]?.oauthRefreshScheduled?.[providerId];
+	assert.ok(typeof scheduledAt === "number");
+	assert.ok(scheduledAt < expiresAt);
+	assert.ok(scheduledAt > Date.now());
 });
 
 test("account manager schedules cline oauth refresh and clears stale refresh disable state", async (t) => {
