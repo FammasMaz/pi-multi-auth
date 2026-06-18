@@ -26,6 +26,8 @@ function createLoginCallbacks(
 		},
 		onPrompt: async () => manualInput,
 		onManualCodeInput: async () => manualInput,
+		onDeviceCode: () => {},
+		onSelect: async () => undefined,
 		onProgress: (message) => {
 			progressMessages.push(message);
 		},
@@ -88,9 +90,16 @@ test("createClineOAuthProvider exchanges a callback URL for OAuth credentials", 
 		}),
 	});
 
-	const callbacks = createLoginCallbacks(
-		"http://127.0.0.1:48801/auth?code=auth-code-123&provider=github",
-	);
+	const callbacks = createLoginCallbacks("");
+	const callbackUrlWithState = async (): Promise<string> => {
+		const authorizeRequestUrl = requests.find((request) => request.url.includes("/api/v1/auth/authorize"))?.url;
+		assert.ok(authorizeRequestUrl, "expected authorize request before manual callback prompt");
+		const state = new URL(authorizeRequestUrl).searchParams.get("state");
+		assert.ok(state, "expected authorize request state");
+		return `http://127.0.0.1:48801/auth?code=auth-code-123&provider=github&state=${state}`;
+	};
+	callbacks.onPrompt = async () => callbackUrlWithState();
+	callbacks.onManualCodeInput = callbackUrlWithState;
 	const credentials = await provider.login(callbacks);
 
 	assert.equal(callbacks.authCalls.length, 1);
@@ -109,6 +118,7 @@ test("createClineOAuthProvider exchanges a callback URL for OAuth credentials", 
 	assert.equal(authorizeUrl.searchParams.get("client_type"), "extension");
 	assert.equal(authorizeUrl.searchParams.get("callback_url"), "http://127.0.0.1:48801/auth");
 	assert.equal(authorizeUrl.searchParams.get("redirect_uri"), "http://127.0.0.1:48801/auth");
+	assert.match(authorizeUrl.searchParams.get("state") ?? "", /^[A-Za-z0-9_-]{43}$/);
 	const authorizeHeaders = new Headers(authorizeRequest.init?.headers);
 	assert.match(authorizeHeaders.get("User-Agent") ?? "", /^Cline\//);
 	assert.equal(authorizeHeaders.get("X-CLIENT-TYPE"), "VSCode Extension");
@@ -127,10 +137,13 @@ test("createClineOAuthProvider exchanges a callback URL for OAuth credentials", 
 
 test("createClineOAuthProvider accepts refreshToken and idToken callback parameters", async () => {
 	const exchangedCodes: string[] = [];
+	const authorizeRequests: string[] = [];
+	const callbackInputs: Array<{ paramName: "refreshToken" | "idToken"; value: string }> = [];
 	const provider = createClineOAuthProvider({
 		fetchImplementation: async (input: RequestInfo | URL, init?: RequestInit) => {
 			const url = String(input);
 			if (url.includes("/api/v1/auth/authorize")) {
+				authorizeRequests.push(url);
 				return new Response(JSON.stringify({ redirect_url: "https://auth.example.test/login" }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -157,16 +170,68 @@ test("createClineOAuthProvider accepts refreshToken and idToken callback paramet
 		},
 		startLocalCallbackServer: async () => ({
 			callbackUrl: "http://127.0.0.1:48801/auth",
+			waitForCallback: async () => {
+				const authorizeRequest = authorizeRequests.shift();
+				assert.ok(authorizeRequest, "expected authorize request before callback wait");
+				const state = new URL(authorizeRequest).searchParams.get("state");
+				assert.ok(state, "expected authorize request state");
+				const callbackInput = callbackInputs.shift();
+				assert.ok(callbackInput, "expected callback input");
+				return `http://127.0.0.1:48801/auth?${callbackInput.paramName}=${callbackInput.value}&provider=github&state=${state}`;
+			},
+			cancelWait: () => {},
+			close: async () => {},
+		}),
+	});
+
+	function callbacksWithState(paramName: "refreshToken" | "idToken", value: string): OAuthLoginCallbacks {
+		callbackInputs.push({ paramName, value });
+		const pendingManualInput = async (): Promise<string> => new Promise(() => {});
+		return {
+			onAuth: () => {},
+			onDeviceCode: () => {},
+			onPrompt: pendingManualInput,
+			onManualCodeInput: pendingManualInput,
+			onSelect: async () => undefined,
+		};
+	}
+
+	await provider.login(callbacksWithState("refreshToken", "refresh-callback"));
+	await provider.login(callbacksWithState("idToken", "id-callback"));
+
+	assert.deepEqual(exchangedCodes, ["refresh-callback", "id-callback"]);
+});
+
+test("createClineOAuthProvider rejects callback URLs with mismatched state", async () => {
+	let tokenExchangeCount = 0;
+	const provider = createClineOAuthProvider({
+		fetchImplementation: async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes("/api/v1/auth/authorize")) {
+				return new Response(JSON.stringify({ redirect_url: "https://auth.example.test/login" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url.includes("/api/v1/auth/token")) {
+				tokenExchangeCount += 1;
+				return new Response("{}", { status: 500 });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		},
+		startLocalCallbackServer: async () => ({
+			callbackUrl: "http://127.0.0.1:48801/auth",
 			waitForCallback: async () => null,
 			cancelWait: () => {},
 			close: async () => {},
 		}),
 	});
 
-	await provider.login(createLoginCallbacks("http://127.0.0.1:48801/auth?refreshToken=refresh-callback&provider=github"));
-	await provider.login(createLoginCallbacks("http://127.0.0.1:48801/auth?idToken=id-callback&provider=github"));
-
-	assert.deepEqual(exchangedCodes, ["refresh-callback", "id-callback"]);
+	await assert.rejects(
+		() => provider.login(createLoginCallbacks("http://127.0.0.1:48801/auth?code=auth-code-123&state=wrong-state")),
+		/Cline OAuth callback state did not match\./,
+	);
+	assert.equal(tokenExchangeCount, 0);
 });
 
 test("createClineOAuthProvider refreshes stored OAuth credentials", async () => {

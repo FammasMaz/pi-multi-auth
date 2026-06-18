@@ -6,8 +6,8 @@ const OPENAI_PROFILE_CLAIM_KEY = "https://api.openai.com/profile";
 export interface CodexCredentialIdentitySource {
 	access: string;
 	accountId?: unknown;
+	email?: unknown;
 	idToken?: unknown;
-	id_token?: unknown;
 }
 
 export interface CodexCredentialIdentity {
@@ -54,25 +54,37 @@ export function extractCodexCredentialIdentity(
 	credential: CodexCredentialIdentitySource,
 ): CodexCredentialIdentity {
 	const payload = decodeJwtPayload(credential.access);
-	const rawIdToken = asNonEmptyString(credential.idToken) ?? asNonEmptyString(credential.id_token);
-	const idTokenPayload = rawIdToken ? decodeJwtPayload(rawIdToken) : null;
-	const authClaimRaw = payload?.[OPENAI_AUTH_CLAIM_KEY] ?? idTokenPayload?.[OPENAI_AUTH_CLAIM_KEY];
-	const profileClaimRaw = payload?.[OPENAI_PROFILE_CLAIM_KEY] ?? idTokenPayload?.[OPENAI_PROFILE_CLAIM_KEY];
+	const idToken = asNonEmptyString(credential.idToken);
+	const idTokenPayload = idToken ? decodeJwtPayload(idToken) : null;
+	const authClaimRaw = payload?.[OPENAI_AUTH_CLAIM_KEY];
+	const profileClaimRaw = payload?.[OPENAI_PROFILE_CLAIM_KEY];
+	const idTokenAuthClaimRaw = idTokenPayload?.[OPENAI_AUTH_CLAIM_KEY];
+	const idTokenProfileClaimRaw = idTokenPayload?.[OPENAI_PROFILE_CLAIM_KEY];
 	const authClaim = isRecord(authClaimRaw) ? authClaimRaw : null;
 	const profileClaim = isRecord(profileClaimRaw) ? profileClaimRaw : null;
+	const idTokenAuthClaim = isRecord(idTokenAuthClaimRaw) ? idTokenAuthClaimRaw : null;
+	const idTokenProfileClaim = isRecord(idTokenProfileClaimRaw) ? idTokenProfileClaimRaw : null;
 
 	return {
 		accountUserId:
 			asNonEmptyString(authClaim?.chatgpt_account_user_id) ??
 			asNonEmptyString(authClaim?.chatgpt_user_id) ??
-			asNonEmptyString(authClaim?.user_id),
+			asNonEmptyString(authClaim?.user_id) ??
+			asNonEmptyString(idTokenAuthClaim?.chatgpt_account_user_id) ??
+			asNonEmptyString(idTokenAuthClaim?.chatgpt_user_id) ??
+			asNonEmptyString(idTokenAuthClaim?.user_id),
 		email:
+			asNonEmptyString(credential.email) ??
 			asNonEmptyString(profileClaim?.email) ??
+			asNonEmptyString(payload?.email) ??
+			asNonEmptyString(idTokenProfileClaim?.email) ??
 			asNonEmptyString(idTokenPayload?.email),
 		accountId:
 			asNonEmptyString(credential.accountId) ??
 			asNonEmptyString(authClaim?.chatgpt_account_id) ??
-			asNonEmptyString(idTokenPayload?.chatgpt_account_id),
-		planType: asNonEmptyString(authClaim?.chatgpt_plan_type),
+			asNonEmptyString(idTokenAuthClaim?.chatgpt_account_id),
+		planType:
+			asNonEmptyString(authClaim?.chatgpt_plan_type) ??
+			asNonEmptyString(idTokenAuthClaim?.chatgpt_plan_type),
 	};
 }

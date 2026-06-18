@@ -1,4 +1,4 @@
-import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { StoredAuthCredential, SupportedProviderId } from "./types.js";
 import { isRecord } from "./auth-error-utils.js";
 import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
@@ -27,6 +27,12 @@ interface RequestOverrideResult {
 	headers: SimpleStreamOptions["headers"];
 }
 
+interface BlazeApiRouteMetadata {
+	endpointMetadata?: {
+		providerId?: unknown;
+		routingGroup?: unknown;
+	};
+}
 
 function getRequestOverrides(
 	provider: SupportedProviderId,
@@ -158,6 +164,40 @@ function assertCloudflareBaseUrl(
 	);
 }
 
+function isBlazeApiClaudeRouteIdentifier(value: unknown): boolean {
+	return typeof value === "string" && /^route:claude-|^claude-/i.test(value.trim());
+}
+
+function isBlazeApiClaudeRouteModel(provider: SupportedProviderId, model: Model<Api>): boolean {
+	if (provider !== "blazeapi") {
+		return false;
+	}
+
+	const metadata = (model as Model<Api> & BlazeApiRouteMetadata).endpointMetadata;
+	return [
+		metadata?.routingGroup,
+		metadata?.providerId,
+		model.id,
+	].some(isBlazeApiClaudeRouteIdentifier);
+}
+
+function disableBlazeApiClaudeReasoningEffort(
+	provider: SupportedProviderId,
+	model: Model<Api>,
+): Model<Api> {
+	if (!isBlazeApiClaudeRouteModel(provider, model)) {
+		return model;
+	}
+
+	return {
+		...model,
+		compat: {
+			...model.compat,
+			supportsReasoningEffort: false,
+		},
+	};
+}
+
 export function applyCredentialRequestOverrides({
 	provider,
 	credentialId,
@@ -185,6 +225,8 @@ export function applyCredentialRequestOverrides({
 	if (isCloudflareWorkersAiProvider(provider)) {
 		assertCloudflareBaseUrl(provider, credentialId, effectiveModel.baseUrl);
 	}
+
+	effectiveModel = disableBlazeApiClaudeReasoningEffort(provider, effectiveModel);
 
 	return {
 		model: effectiveModel,

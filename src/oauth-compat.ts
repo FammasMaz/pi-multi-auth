@@ -6,10 +6,11 @@ import {
 	resetOAuthProviders as resetOAuthProvidersFromPiAi,
 	unregisterOAuthProvider as unregisterOAuthProviderFromPiAi,
 	type OAuthCredentials,
+	type OAuthDeviceCodeInfo,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
 	type OAuthProviderInterface,
-} from "@mariozechner/pi-ai/oauth";
+} from "@earendil-works/pi-ai/oauth";
 import {
 	formatOAuthRefreshFailureSummary,
 	isRecord,
@@ -278,7 +279,7 @@ async function refreshOpenAICodexCredential(
 	const identity = extractCodexCredentialIdentity({
 		access: accessToken,
 		accountId: credentials.accountId,
-		idToken,
+		idToken: credentials.idToken,
 	});
 	if (!identity.accountId) {
 		throw new OAuthRefreshFailureError(
@@ -398,6 +399,7 @@ export async function refreshOAuthCredential(
 
 export type {
 	OAuthCredentials,
+	OAuthDeviceCodeInfo,
 	OAuthLoginCallbacks,
 	OAuthProviderId,
 	OAuthProviderInterface,

@@ -1,12 +1,48 @@
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth, type OverlayOptions } from "@earendil-works/pi-tui";
 
 const FOOTER_SEPARATOR = "  ";
+
+export const RESPONSIVE_MODAL_DEFAULT_SCALE = 1.4;
+
+const BASE_FALLBACK_COLUMNS = 120;
+const BASE_FALLBACK_ROWS = 36;
+const DEFAULT_FALLBACK_COLUMNS = Math.ceil(BASE_FALLBACK_COLUMNS * RESPONSIVE_MODAL_DEFAULT_SCALE);
+const DEFAULT_FALLBACK_ROWS = Math.ceil(BASE_FALLBACK_ROWS * RESPONSIVE_MODAL_DEFAULT_SCALE);
 
 interface BodyRowBudgetOptions {
 	defaultRows: number;
 	terminalRows: number | null;
 	reservedRows: number;
 	minimumRows?: number;
+	fitAvailableRows?: boolean;
+}
+
+export interface ModalOverlayOptions {
+	anchor: "center";
+	width: number;
+	maxHeight: number;
+	margin: number;
+}
+
+interface ResponsiveOverlayOptions {
+	terminalColumns?: number | null;
+	terminalRows?: number | null;
+	fallbackColumns?: number;
+	fallbackRows?: number;
+	margin?: number;
+	minimumWidth?: number;
+	maximumWidth?: number;
+	minimumHeight?: number;
+	maximumHeight?: number;
+	widthRatio?: number;
+	heightRatio?: number;
+}
+
+interface ResponsiveRuntimeOverlayOptions {
+	margin?: number;
+	minimumWidth?: number;
+	widthRatio?: number;
+	heightRatio?: number;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -18,6 +54,24 @@ function toSafePositiveInteger(value: number, fallback: number): number {
 		return fallback;
 	}
 	return Math.max(1, Math.floor(value));
+}
+
+function toPercentSizeValue(ratio: number | undefined, fallback: number): `${number}%` {
+	const safeRatio = Number.isFinite(ratio) ? ratio as number : fallback;
+	const percent = clamp(safeRatio, 0.01, 1) * 100;
+	return `${Number(percent.toFixed(2))}%` as `${number}%`;
+}
+
+export function resolveResponsiveOverlayRuntimeOptions(
+	options: ResponsiveRuntimeOverlayOptions = {},
+): OverlayOptions {
+	return {
+		anchor: "center",
+		width: toPercentSizeValue(options.widthRatio, 0.92),
+		maxHeight: toPercentSizeValue(options.heightRatio, 0.86),
+		minWidth: Math.max(1, Math.floor(options.minimumWidth ?? 48)),
+		margin: Math.max(0, Math.floor(options.margin ?? 1)),
+	};
 }
 
 function splitLongToken(token: string, maxWidth: number): string[] {
@@ -151,6 +205,67 @@ export function resolveTerminalRows(): number | null {
 	return null;
 }
 
+export function resolveTerminalColumns(): number | null {
+	if (typeof process.stdout.columns === "number" && Number.isFinite(process.stdout.columns)) {
+		return toSafePositiveInteger(process.stdout.columns, 1);
+	}
+
+	const fromEnv = Number.parseInt(process.env.COLUMNS ?? "", 10);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) {
+		return toSafePositiveInteger(fromEnv, 1);
+	}
+
+	return null;
+}
+
+export function resolveResponsiveOverlayOptions(
+	options: ResponsiveOverlayOptions = {},
+): ModalOverlayOptions {
+	const terminalColumns = toSafePositiveInteger(
+		options.terminalColumns ?? resolveTerminalColumns() ?? options.fallbackColumns ?? DEFAULT_FALLBACK_COLUMNS,
+		options.fallbackColumns ?? DEFAULT_FALLBACK_COLUMNS,
+	);
+	const terminalRows = toSafePositiveInteger(
+		options.terminalRows ?? resolveTerminalRows() ?? options.fallbackRows ?? DEFAULT_FALLBACK_ROWS,
+		options.fallbackRows ?? DEFAULT_FALLBACK_ROWS,
+	);
+	const requestedMargin = Math.max(0, Math.floor(options.margin ?? 1));
+	const margin = terminalColumns > requestedMargin * 2 + 1 && terminalRows > requestedMargin * 2 + 1
+		? requestedMargin
+		: 0;
+	const availableWidth = Math.max(1, terminalColumns - margin * 2);
+	const availableHeight = Math.max(1, terminalRows - margin * 2);
+
+	const minimumWidth = Math.min(
+		availableWidth,
+		Math.max(1, Math.floor(options.minimumWidth ?? 48)),
+	);
+	const maximumWidth = Math.min(
+		availableWidth,
+		Math.max(minimumWidth, Math.floor(options.maximumWidth ?? availableWidth)),
+	);
+	const preferredWidth = Math.floor(terminalColumns * (options.widthRatio ?? 0.92));
+	const width = clamp(preferredWidth, minimumWidth, maximumWidth);
+
+	const minimumHeight = Math.min(
+		availableHeight,
+		Math.max(1, Math.floor(options.minimumHeight ?? 12)),
+	);
+	const maximumHeight = Math.min(
+		availableHeight,
+		Math.max(minimumHeight, Math.floor(options.maximumHeight ?? availableHeight)),
+	);
+	const preferredHeight = Math.floor(terminalRows * (options.heightRatio ?? 0.86));
+	const maxHeight = clamp(preferredHeight, minimumHeight, maximumHeight);
+
+	return {
+		anchor: "center",
+		width,
+		maxHeight,
+		margin,
+	};
+}
+
 export function resolveBodyRowBudget(options: BodyRowBudgetOptions): number {
 	const defaultRows = Math.max(1, Math.floor(options.defaultRows));
 	const minimumRows = clamp(Math.floor(options.minimumRows ?? 4), 1, defaultRows);
@@ -162,6 +277,9 @@ export function resolveBodyRowBudget(options: BodyRowBudgetOptions): number {
 	const terminalRows = toSafePositiveInteger(options.terminalRows, defaultRows);
 	const reservedRows = Math.max(0, Math.floor(options.reservedRows));
 	const availableRows = terminalRows - reservedRows;
+	if (options.fitAvailableRows && availableRows < minimumRows) {
+		return Math.max(0, Math.min(defaultRows, availableRows));
+	}
 	return clamp(availableRows, minimumRows, defaultRows);
 }
 

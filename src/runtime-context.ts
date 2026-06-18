@@ -1,9 +1,9 @@
 import type { SupportedProviderId } from "./types.js";
 
 export const PI_AGENT_ROUTER_SUBAGENT_ENV = "PI_AGENT_ROUTER_SUBAGENT";
-export const PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID";
-export const PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID";
-export const PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV = "PI_AGENT_ROUTER_DELEGATED_API_KEY";
+export const PI_DELEGATED_AUTH_PROVIDER_ID_ENV = "PI_DELEGATED_AUTH_PROVIDER_ID";
+export const PI_DELEGATED_AUTH_LEASE_ID_ENV = "PI_DELEGATED_AUTH_LEASE_ID";
+export const PI_DELEGATED_AUTH_API_KEY_ENV = "PI_DELEGATED_AUTH_API_KEY";
 
 export interface DelegatedCredentialOverride {
 	providerId: SupportedProviderId;
@@ -76,7 +76,7 @@ export function resolveDelegatedCredentialOverride(
 		return undefined;
 	}
 
-	const delegatedProviderId = normalizeProviderId(env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]);
+	const delegatedProviderId = normalizeProviderId(env[PI_DELEGATED_AUTH_PROVIDER_ID_ENV]);
 	const expectedProviderId = normalizeProviderId(providerId);
 	if (!delegatedProviderId) {
 		return undefined;
@@ -85,8 +85,8 @@ export function resolveDelegatedCredentialOverride(
 		return undefined;
 	}
 
-	const credentialId = normalizeEnvValue(env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]);
-	const apiKey = normalizeEnvValue(env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]);
+	const credentialId = normalizeEnvValue(env[PI_DELEGATED_AUTH_LEASE_ID_ENV]);
+	const apiKey = normalizeEnvValue(env[PI_DELEGATED_AUTH_API_KEY_ENV]);
 	if (!credentialId || !apiKey) {
 		return undefined;
 	}

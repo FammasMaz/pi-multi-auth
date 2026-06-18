@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-auth",
-  "version": "0.7.1",
+  "version": "0.10.0",
   "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
   "type": "module",
   "main": "./index.ts",
@@ -14,6 +14,7 @@
   "files": [
     "index.ts",
     "src",
+    ".env.example",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -27,8 +28,10 @@
     "test": "tsc -p tsconfig.test.json && node scripts/run-compiled-tests.mjs",
     "posttest": "npm run test:clean",
     "check": "npm run typecheck && npm run lint && npm run test",
-    "audit:codex": "tsx scripts/audit-codex-accounts.ts",
-    "audit:codex:fix": "tsx scripts/audit-codex-accounts.ts --reenable-misclassified"
+    "pack:dry-run": "npm pack --dry-run",
+    "release:gate": "node scripts/release-gate.mjs",
+    "smoke": "node scripts/smoke-test.mjs",
+    "coverage": "npm run test:clean && tsc -p tsconfig.test.json && c8 --reporter=text --reporter=lcov node scripts/run-compiled-tests.mjs && npm run test:clean"
   },
   "keywords": [
     "pi-package",
@@ -66,24 +69,26 @@
       "./index.ts"
     ]
   },
-  "dependencies": {
-    "proper-lockfile": "^4.1.2"
-  },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.72.0",
-    "@mariozechner/pi-coding-agent": "^0.72.0",
-    "@mariozechner/pi-tui": "^0.72.0"
+    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0",
+    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@mariozechner/pi-ai": "^0.72.0",
-    "@mariozechner/pi-coding-agent": "^0.72.0",
-    "@mariozechner/pi-tui": "^0.72.0",
-    "@types/node": "^25.6.0",
-    "@types/proper-lockfile": "^4.1.4",
-    "eslint": "^10.3.0",
+    "@types/node": "^25.9.1",
+    "c8": "^11.0.0",
+    "eslint": "^10.4.1",
     "globals": "^17.6.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.1"
+    "typescript-eslint": "^8.60.0",
+    "@earendil-works/pi-ai": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-tui": "^0.78.0"
+  },
+  "overrides": {
+    "basic-ftp": "5.3.1",
+    "fast-xml-builder": "1.1.7",
+    "ip-address": "10.1.1"
   }
 }

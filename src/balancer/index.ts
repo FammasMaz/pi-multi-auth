@@ -1,6 +1,7 @@
 export * from "./types.js";
 export * from "./weighted-selector.js";
 export * from "./credential-backoff.js";
+export * from "./retry-budget.js";
 export { KeyDistributor, DEFAULT_CONFIG } from "./key-distributor.js";
 export {
 	getGlobalKeyDistributor,

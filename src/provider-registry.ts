@@ -1,8 +1,10 @@
 import { readFile, stat } from "node:fs/promises";
-import { getModels, getProviders, type Api, type Model } from "@mariozechner/pi-ai";
+import { getModels, getProviders, type Api, type Model } from "@earendil-works/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { registerKiloOAuthProvider } from "./oauth-kilo.js";
+import { registerKimiCodingOAuthProvider } from "./oauth-kimi-coding.js";
+import { registerQwenOAuthProvider } from "./oauth-qwen.js";
 import { AuthWriter } from "./auth-writer.js";
 import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import {
@@ -58,10 +60,12 @@ const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
 	anthropic: "Anthropic",
 	"amazon-bedrock": "Amazon Bedrock",
 	"azure-openai-responses": "Azure OpenAI Responses",
+	blazeapi: "BlazeAPI",
 	cerebras: "Cerebras",
 	cloudflare: "Cloudflare Workers AI",
 	"cloudflare-workers-ai": "Cloudflare Workers AI",
 	"cloudflare-ai-gateway": "Cloudflare AI Gateway",
+	"command-code": "CommandCode",
 	deepseek: "DeepSeek",
 	fireworks: "Fireworks",
 	google: "Google Gemini",
@@ -79,6 +83,9 @@ const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
 	"vercel-ai-gateway": "Vercel AI Gateway",
 	xai: "xAI",
 	xiaomi: "Xiaomi MiMo",
+	"xiaomi-token-plan-cn": "Xiaomi MiMo Token Plan (China)",
+	"xiaomi-token-plan-ams": "Xiaomi MiMo Token Plan (Amsterdam)",
+	"xiaomi-token-plan-sgp": "Xiaomi MiMo Token Plan (Singapore)",
 	zai: "ZAI",
 };
 
@@ -93,6 +100,8 @@ const EMPTY_MODELS_FILE: ModelsFileData = {
 const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Record<string, () => void> = {
 	cline: registerClineOAuthProvider,
 	kilo: registerKiloOAuthProvider,
+	"kimi-coding": registerKimiCodingOAuthProvider,
+	qwen: registerQwenOAuthProvider,
 };
 
 const THINKING_LEVEL_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;

@@ -1,5 +1,6 @@
-import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { getErrorMessage, isRecord } from "./auth-error-utils.js";
+import { headersToRecord } from "./rate-limit-headers.js";
 
 const STATUS_ONLY_ERROR_PATTERN = /\b([1-5]\d{2})\s+status code\s*(?:\(no body\))?/i;
 const DIAGNOSTIC_HTTP_STATUSES = new Set([401, 402, 403, 429]);
@@ -12,6 +13,7 @@ export interface ProviderErrorMessageEnrichmentRequest {
 	apiKey: string;
 	headers?: SimpleStreamOptions["headers"];
 	signal?: AbortSignal;
+	onResponseHeaders?: (headers: Record<string, string>, status: number) => Promise<void> | void;
 }
 
 interface ProviderErrorSummary {
@@ -142,6 +144,7 @@ function extractJsonErrorFields(parsed: unknown): { code?: string; message?: str
 	}
 
 	const nestedError = isRecord(parsed.error) ? parsed.error : undefined;
+	const nestedDetail = isRecord(parsed.detail) ? parsed.detail : undefined;
 	const firstCloudflareError = Array.isArray(parsed.errors)
 		? parsed.errors.find(isRecord)
 		: undefined;
@@ -150,10 +153,12 @@ function extractJsonErrorFields(parsed: unknown): { code?: string; message?: str
 		stringifyJsonField(parsed.error_code) ??
 		stringifyJsonField(nestedError?.code) ??
 		stringifyJsonField(nestedError?.type) ??
+		stringifyJsonField(nestedDetail?.code) ??
 		stringifyJsonField(firstCloudflareError?.code);
 	const message =
 		stringifyJsonField(parsed.message) ??
 		stringifyJsonField(parsed.detail) ??
+		stringifyJsonField(nestedDetail?.message) ??
 		stringifyJsonField(parsed.msg) ??
 		stringifyJsonField(parsed.error) ??
 		stringifyJsonField(nestedError?.message) ??
@@ -245,6 +250,13 @@ async function probeProviderErrorBody(
 			body: JSON.stringify(buildDiagnosticPayload(request.model)),
 			signal: abortController.signal,
 		});
+		if (request.onResponseHeaders) {
+			try {
+				await request.onResponseHeaders(headersToRecord(response.headers), response.status);
+			} catch {
+				// Header harvesting is opportunistic and must not block error enrichment.
+			}
+		}
 
 		if (response.ok) {
 			await response.body?.cancel();

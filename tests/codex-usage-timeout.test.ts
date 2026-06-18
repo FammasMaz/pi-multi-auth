@@ -33,6 +33,6 @@ test("codex usage provider fails explicitly when usage fetch times out", async (
 
 	await assert.rejects(
 		() => codexUsageProvider.fetchUsage!({ accessToken: "codex-timeout-test-token" }),
-		/OpenAI Codex usage request timed out after 3000ms/,
+		/OpenAI Codex usage request timed out after 8000ms/,
 	);
 });

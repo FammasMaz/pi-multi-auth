@@ -1,4 +1,4 @@
-import type { Api } from "@mariozechner/pi-ai";
+import type { Api } from "@earendil-works/pi-ai";
 import type { CredentialErrorKind } from "./error-classifier.js";
 import type { SupportedProviderId } from "./types.js";
 
@@ -44,10 +44,6 @@ export interface ChainResult {
 	isLastProvider: boolean;
 }
 
-export interface FailoverChainConfig {
-	enabled: boolean;
-	chains: FailoverChain[];
-}
 
 export const DEFAULT_FAILOVER_TRIGGERS: CredentialErrorKind[] = [
 	"quota",

@@ -1,6 +1,7 @@
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 
+export const PI_DELEGATED_AUTH_RUNTIME_DIR_ENV = "PI_DELEGATED_AUTH_RUNTIME_DIR";
 export const PI_MULTI_AUTH_RUNTIME_DIR_ENV = "PI_MULTI_AUTH_RUNTIME_DIR";
 const PI_CODING_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 
@@ -10,9 +11,14 @@ function normalizeEnvPath(value: string | undefined): string | undefined {
 }
 
 export function getAgentRuntimeRoot(): string {
-	const delegatedRuntimeDir = normalizeEnvPath(process.env[PI_MULTI_AUTH_RUNTIME_DIR_ENV]);
+	const delegatedRuntimeDir = normalizeEnvPath(process.env[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]);
 	if (delegatedRuntimeDir) {
 		return delegatedRuntimeDir;
+	}
+
+	const legacyRuntimeDir = normalizeEnvPath(process.env[PI_MULTI_AUTH_RUNTIME_DIR_ENV]);
+	if (legacyRuntimeDir) {
+		return legacyRuntimeDir;
 	}
 
 	const configuredAgentDir = normalizeEnvPath(process.env[PI_CODING_AGENT_DIR_ENV]);

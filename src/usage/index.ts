@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { getErrorMessage } from "../auth-error-utils.js";
+import { quotaClassifier } from "../quota-classifier.js";
+import { rateLimitHeaderParser } from "../rate-limit-headers.js";
 import { usageProviders } from "./providers.js";
 import {
 	UsageSnapshotCacheStore,
@@ -125,6 +127,18 @@ function getSoonestResetAt(snapshot: UsageSnapshot | null): number | null {
 function isAuthLikeUsageError(message: string): boolean {
 	return /\b401\b|\b403\b|expired|invalid|denied|missing required usage scope|token/i.test(
 		message,
+	);
+}
+
+function hasUsableRateLimitHeaders(headers: UsageSnapshot["rateLimitHeaders"]): boolean {
+	return Boolean(
+		headers &&
+		(
+			headers.limit !== null ||
+			headers.remaining !== null ||
+			headers.resetAt !== null ||
+			headers.retryAfterSeconds !== null
+		),
 	);
 }
 
@@ -285,6 +299,60 @@ export class UsageService {
 	 */
 	readDisplayUsage(providerId: string, credentialId: string): UsageFetchResult | null {
 		return this.resolveDisplayReadForCredential(providerId, credentialId, Date.now());
+	}
+
+	/**
+	 * Updates operational usage cache from response headers observed by existing provider hooks.
+	 */
+	harvestRateLimitHeaders(
+		providerId: string,
+		credentialId: string,
+		credentialCacheKey: string,
+		headers: Record<string, string | undefined>,
+		observedAt: number = Date.now(),
+	): UsageFetchResult | null {
+		const parsedHeaders = rateLimitHeaderParser.parseHeaders(headers, providerId);
+		if (!hasUsableRateLimitHeaders(parsedHeaders)) {
+			return null;
+		}
+
+		const key = cacheKey(providerId, credentialId, credentialCacheKey);
+		const existingSnapshot = this.resolveCachedRead(key, { allowStale: true }, observedAt)?.result.snapshot ?? null;
+		const quotaClassification = quotaClassifier.classifyFromUsage(
+			existingSnapshot?.primary ?? null,
+			existingSnapshot?.secondary ?? null,
+			parsedHeaders,
+		).classification;
+		const estimatedResetAt = rateLimitHeaderParser.getEstimatedResetAt(parsedHeaders) ?? existingSnapshot?.estimatedResetAt;
+		const snapshot: UsageSnapshot = {
+			timestamp: existingSnapshot?.timestamp ?? observedAt,
+			provider: existingSnapshot?.provider ?? providerId,
+			planType: existingSnapshot?.planType ?? null,
+			primary: existingSnapshot?.primary ?? null,
+			secondary: existingSnapshot?.secondary ?? null,
+			credits: existingSnapshot?.credits ?? null,
+			copilotQuota: existingSnapshot?.copilotQuota ?? null,
+			updatedAt: observedAt,
+			rateLimitHeaders: parsedHeaders,
+			quotaClassification,
+			...(typeof estimatedResetAt === "number" ? { estimatedResetAt } : {}),
+		};
+		const result: Omit<UsageFetchResult, "fromCache"> = {
+			snapshot,
+			error: null,
+			fetchedAt: observedAt,
+		};
+		const freshTtlMs = this.resolveSuccessFreshTtlMs(snapshot, observedAt);
+		this.setCacheEntry(providerId, credentialId, credentialCacheKey, {
+			result,
+			freshUntil: observedAt + freshTtlMs,
+			staleUntil: observedAt + Math.max(this.staleTtlMs, freshTtlMs),
+		});
+
+		return {
+			...result,
+			fromCache: true,
+		};
 	}
 
 	/**
@@ -540,11 +608,19 @@ export class UsageService {
 		options: UsageFetchOptions,
 		now: number,
 	): ResolvedUsageCacheRead | null {
+		const cached = this.cache.get(key);
 		if (options.forceRefresh) {
+			if (cached && this.isFreshNegativeEntry(cached, now)) {
+				return {
+					result: {
+						...cached.result,
+						fromCache: true,
+					},
+					isStale: false,
+				};
+			}
 			return null;
 		}
-
-		const cached = this.cache.get(key);
 		if (!cached) {
 			return null;
 		}
@@ -576,6 +652,10 @@ export class UsageService {
 			},
 			isStale: true,
 		};
+	}
+
+	private isFreshNegativeEntry(entry: UsageCacheEntry, now: number): boolean {
+		return entry.result.snapshot === null && entry.result.error !== null && entry.freshUntil > now;
 	}
 
 	private isEntryFresh(entry: UsageCacheEntry, now: number, maxAgeMs?: number): boolean {

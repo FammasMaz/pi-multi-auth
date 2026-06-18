@@ -1,4 +1,5 @@
-import type { SupportedProviderId } from "../types.js";
+import type { RotationMode, SupportedProviderId } from "../types.js";
+import type { UsageSnapshot } from "../usage/types.js";
 
 /**
  * Cooldown metadata recorded when a credential should be skipped temporarily.
@@ -7,6 +8,33 @@ export interface CooldownInfo {
 	until: number;
 	reason: string;
 	appliedAt: number;
+}
+
+export type BalancerQuotaState =
+	| {
+		state: "available";
+	}
+	| {
+		state: "exhausted";
+		exhaustedUntil?: number;
+	}
+	| {
+		state: "unknown";
+	};
+
+export interface BalancerUsageSnapshot {
+	snapshot: UsageSnapshot | null;
+	usedPercent: number | null;
+	quotaState: BalancerQuotaState;
+	fromCache: boolean;
+	needsRefresh?: boolean;
+}
+
+export interface BalancerQuotaDrainState {
+	draining: boolean;
+	enteredAt?: number;
+	lastUsedPercent?: number;
+	updatedAt: number;
 }
 
 /**
@@ -18,6 +46,7 @@ export interface BalancerCredentialState {
 	activeRequests: Record<string, number>;
 	lastUsedAt: Record<string, number>;
 	healthScores?: Record<string, number>;
+	quotaDrainStates?: Record<string, BalancerQuotaDrainState>;
 }
 
 /**
@@ -38,8 +67,10 @@ export interface SelectionContext {
 	excludedIds: readonly string[];
 	requestingSessionId: string;
 	modelId?: string;
-	preferredIds?: readonly string[];
-	preferredIdGroups?: readonly (readonly string[])[];
+	/** Effective rotation mode after extension config overrides are applied. */
+	rotationMode?: RotationMode;
+	/** Whether balancer mode may reuse the previous credential for this selection session. */
+	stickyCredential?: boolean;
 }
 
 export interface DelegatedCredentialRequest {

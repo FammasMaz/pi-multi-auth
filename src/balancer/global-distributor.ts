@@ -1,37 +1,32 @@
 import { KeyDistributor } from "./key-distributor.js";
 
-type GlobalWithKeyDistributor = typeof globalThis & {
-	__piMultiAuthKeyDistributor?: KeyDistributor;
-};
+let registeredDistributor: KeyDistributor | undefined;
 
 /**
- * Registers a shared KeyDistributor instance on globalThis.
+ * Registers a shared KeyDistributor instance for this extension module.
  */
 export function registerGlobalKeyDistributor(distributor: KeyDistributor): KeyDistributor {
-	const globalScope = globalThis as GlobalWithKeyDistributor;
-	globalScope.__piMultiAuthKeyDistributor = distributor;
+	registeredDistributor = distributor;
 	return distributor;
 }
 
 /**
- * Clears the globally registered KeyDistributor instance.
+ * Clears the registered KeyDistributor instance.
  */
 export function unregisterGlobalKeyDistributor(distributor?: KeyDistributor): void {
-	const globalScope = globalThis as GlobalWithKeyDistributor;
 	if (
 		distributor !== undefined &&
-		globalScope.__piMultiAuthKeyDistributor !== undefined &&
-		globalScope.__piMultiAuthKeyDistributor !== distributor
+		registeredDistributor !== undefined &&
+		registeredDistributor !== distributor
 	) {
 		return;
 	}
-	delete globalScope.__piMultiAuthKeyDistributor;
+	registeredDistributor = undefined;
 }
 
 /**
- * Returns the globally registered KeyDistributor instance.
+ * Returns the registered KeyDistributor instance for this extension module.
  */
 export function getGlobalKeyDistributor(): KeyDistributor | null {
-	const globalScope = globalThis as GlobalWithKeyDistributor;
-	return globalScope.__piMultiAuthKeyDistributor ?? null;
+	return registeredDistributor ?? null;
 }

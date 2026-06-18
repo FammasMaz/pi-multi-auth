@@ -1,16 +1,25 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { AccountManager } from "./account-manager.js";
 import {
 	registerGlobalKeyDistributor,
 	unregisterGlobalKeyDistributor,
 } from "./balancer/index.js";
-import { registerMultiAuthCommands } from "./commands.js";
-import { getErrorMessage } from "./auth-error-utils.js";
+import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import { loadMultiAuthConfig } from "./config.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
-import { registerMultiAuthProviders } from "./provider.js";
+import {
+	registerDelegatedAuthBroker,
+	unregisterDelegatedAuthBroker,
+} from "./delegated-auth-broker.js";
+import {
+	registerMultiAuthProviders,
+	registerRuntimeProviderOverride,
+	type RuntimeProviderRegistrationPayload,
+} from "./provider.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { registerKiloOAuthProvider } from "./oauth-kilo.js";
+import { registerKimiCodingOAuthProvider } from "./oauth-kimi-coding.js";
+import { registerQwenOAuthProvider } from "./oauth-qwen.js";
 import {
 	isDelegatedSubagentRuntime,
 	resolveRequestedProviderFromArgv,
@@ -18,6 +27,14 @@ import {
 
 const STARTUP_WARMUP_DELAY_MS = 0;
 const STARTUP_REFINEMENT_DELAY_MS = 1_500;
+const RUNTIME_PROVIDER_REGISTRATION_EVENT = "pi-multi-auth:runtime-provider-registration";
+const PROVIDERS_REGISTERED_EVENT = "pi-multi-auth:providers-registered";
+const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Readonly<Record<string, () => void>> = {
+	cline: registerClineOAuthProvider,
+	kilo: registerKiloOAuthProvider,
+	"kimi-coding": registerKimiCodingOAuthProvider,
+	qwen: registerQwenOAuthProvider,
+};
 
 /**
  * Session start event payload.
@@ -28,13 +45,61 @@ interface SessionStartEvent {
 	previousSessionFile?: string;
 }
 
+function isRuntimeProviderRegistrationPayload(
+	value: unknown,
+): value is RuntimeProviderRegistrationPayload {
+	return (
+		isRecord(value) &&
+		typeof value.provider === "string" &&
+		typeof value.baseUrl === "string" &&
+		typeof value.api === "string" &&
+		Array.isArray(value.models) &&
+		typeof value.streamSimple === "function" &&
+		(value.displayName === undefined || typeof value.displayName === "string") &&
+		(value.headers === undefined || isRecord(value.headers))
+	);
+}
+
+function registerEnabledOAuthProviders(hiddenProviders: ReadonlySet<string>): void {
+	for (const [provider, registerProvider] of Object.entries(FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS)) {
+		if (!hiddenProviders.has(provider)) {
+			registerProvider();
+		}
+	}
+}
+
+function registerLazyMultiAuthCommands(
+	pi: ExtensionAPI,
+	accountManager: AccountManager,
+): void {
+	pi.registerCommand("multi-auth", {
+		description: "Open unified multi-auth account manager modal",
+		handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+			if (args.trim()) {
+				ctx.ui.notify("Usage: /multi-auth", "warning");
+				return;
+			}
+
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/multi-auth requires interactive TUI mode.", "warning");
+				return;
+			}
+
+			try {
+				const { openMultiAuthModal } = await import("./commands.js");
+				await openMultiAuthModal(ctx, accountManager);
+			} catch (error) {
+				ctx.ui.notify(`/multi-auth failed: ${getErrorMessage(error)}`, "error");
+			}
+		},
+	});
+}
+
 /**
  * pi-multi-auth extension entry point for multi-account OAuth credential management and rotation.
  */
 export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void> {
 	const configLoadResult = loadMultiAuthConfig();
-	registerClineOAuthProvider();
-	registerKiloOAuthProvider();
 	const isSubagentRuntime = isDelegatedSubagentRuntime();
 	const requestedSubagentProvider = isSubagentRuntime
 		? resolveRequestedProviderFromArgv()
@@ -73,8 +138,49 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 			startOAuthRefreshScheduler: !isSubagentRuntime,
 		},
 	);
+	let hiddenProvidersAtStartup: ReadonlySet<string> = new Set();
+	try {
+		hiddenProvidersAtStartup = new Set(await accountManager.getHiddenProviders());
+	} catch (error) {
+		recordStartupWarning(
+			`Failed to read hidden providers: ${getErrorMessage(error)}`,
+			"hidden_providers_load",
+			error,
+		);
+	}
+	registerEnabledOAuthProviders(hiddenProvidersAtStartup);
+
 	const keyDistributor = accountManager.getKeyDistributor();
 	registerGlobalKeyDistributor(keyDistributor);
+	const delegatedAuthBroker = registerDelegatedAuthBroker(accountManager);
+	const excludedProviders = new Set(hiddenProvidersAtStartup);
+	const isRuntimeProviderAllowed = (provider: string): boolean => {
+		if (excludedProviders.has(provider)) {
+			return false;
+		}
+		if (isSubagentRuntime && requestedSubagentProvider) {
+			return provider === requestedSubagentProvider;
+		}
+		return true;
+	};
+	const applyRuntimeProviderRegistration = (
+		payload: RuntimeProviderRegistrationPayload,
+		onError?: (message: string) => void,
+	): void => {
+		if (!isRuntimeProviderAllowed(payload.provider)) {
+			return;
+		}
+		try {
+			registerRuntimeProviderOverride(pi, accountManager, payload);
+		} catch (error) {
+			recordStartupWarning(
+				`Failed to register runtime provider override for ${payload.provider}: ${getErrorMessage(error)}`,
+				"runtime_provider_override",
+				error,
+				onError,
+			);
+		}
+	};
 
 	let warmupInFlight: Promise<void> | null = null;
 	let warmupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -157,6 +263,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		nextWarmup = (async () => {
 			await accountManager.ensureInitialized();
 			await accountManager.autoActivatePreferredCredentials({ avoidUsageApi: true });
+			await accountManager.warmupOperationalUsageCaches();
 		})()
 			.then(() => {
 				if (!isStartupWorkCurrent(generation)) {
@@ -235,6 +342,8 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 				onWarning?.(message);
 			} finally {
 				unregisterGlobalKeyDistributor(keyDistributor);
+				unregisterDelegatedAuthBroker(delegatedAuthBroker);
+				await multiAuthDebugLogger.dispose();
 			}
 		})();
 		return shutdownPromise;
@@ -249,13 +358,20 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		}
 	};
 
+	pi.events?.on(RUNTIME_PROVIDER_REGISTRATION_EVENT, (payload) => {
+		if (!isRuntimeProviderRegistrationPayload(payload)) {
+			return;
+		}
+		applyRuntimeProviderRegistration(payload);
+	});
+
 	if (!isSubagentRuntime) {
-		registerMultiAuthCommands(pi, accountManager);
+		registerLazyMultiAuthCommands(pi, accountManager);
 	}
 
 	try {
 		await registerMultiAuthProviders(pi, accountManager, {
-			excludeProviders: configLoadResult.config.excludeProviders,
+			excludeProviders: [...excludedProviders],
 			includeProviders:
 				isSubagentRuntime && requestedSubagentProvider
 					? [requestedSubagentProvider]
@@ -263,6 +379,9 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 			streamTimeouts: configLoadResult.config.streamTimeouts,
 			providerStreamTimeouts: configLoadResult.config.providerStreamTimeouts,
 			noStreamWatchdogProviders: configLoadResult.config.noStreamWatchdogProviders,
+		});
+		pi.events?.emit(PROVIDERS_REGISTERED_EVENT, {
+			generation: startupWorkGeneration,
 		});
 	} catch (error) {
 		recordStartupWarning(
@@ -278,6 +397,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		const startupGeneration = beginStartupWorkGeneration();
 		clearStartupTimers();
 		registerGlobalKeyDistributor(keyDistributor);
+		registerDelegatedAuthBroker(accountManager);
 		flushStartupWarnings((message) => {
 			ctx.ui.notify(`multi-auth startup warning: ${message}`, "warning");
 		});

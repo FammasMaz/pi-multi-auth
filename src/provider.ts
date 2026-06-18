@@ -9,8 +9,11 @@ import {
 	type Model,
 	registerApiProvider,
 	type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ProviderModelConfig,
+} from "@earendil-works/pi-coding-agent";
 import {
 	AccountManager,
 	createCredentialSelectionCache,
@@ -33,7 +36,10 @@ import {
 } from "./config.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
+import { getCredentialRequestSecret } from "./credential-display.js";
+import { abortableSleep } from "./async-utils.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
+import { modelRequiresEntitlement } from "./model-entitlements.js";
 import {
 	enrichProviderStatusOnlyErrorMessage,
 	formatEnrichedProviderResponseBrief,
@@ -41,14 +47,31 @@ import {
 } from "./provider-error-details.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { resolveDelegatedCredentialOverride } from "./runtime-context.js";
+import { computeExponentialBackoffMs } from "./balancer/credential-backoff.js";
+import { RetryBudget } from "./balancer/retry-budget.js";
 import type {
 	ProviderRegistrationMetadata,
+	SelectedCredential,
 	SupportedProviderId,
 } from "./types.js";
 
 const MIN_ROTATION_ATTEMPT_LIMIT = 11;
 const MAX_TRANSIENT_RETRIES_PER_CREDENTIAL = 2;
 const PROVIDER_REGISTRATION_CHURN_WINDOW_MS = 100;
+// Cap how long we wait between transient retries when no alternate credential
+// is available to rotate to. The cooldown returned by the account manager can
+// grow up to TRANSIENT_COOLDOWN_MAX_MS (~15 minutes); for sole-credential
+// providers we keep the wait short so auto-retry stays responsive.
+const SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS = 30_000;
+const MIN_SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS = 25;
+const BLAZEAPI_PROVIDER_ID = "blazeapi";
+const BLAZEAPI_REQUEST_LIMIT_MESSAGE_PATTERN = /request limit reached for your current plan/i;
+const PROVIDER_RETRY_BUDGET_WINDOW_MS = 60_000;
+const PROVIDER_RETRY_BUDGET_MAX_RETRIES = 100;
+const providerRetryBudget = new RetryBudget({
+	maxRetriesPerWindow: PROVIDER_RETRY_BUDGET_MAX_RETRIES,
+	windowMs: PROVIDER_RETRY_BUDGET_WINDOW_MS,
+});
 
 type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
 
@@ -79,6 +102,58 @@ const STRUCTURED_ERROR_MESSAGE_OPTIONS = {
 	preserveStructuredData: true,
 } as const;
 
+interface RuntimeAuthFailureMetadata {
+	status?: number;
+	code?: string;
+	message?: string;
+	refreshable?: boolean;
+	authExpired?: boolean;
+	permanent?: boolean;
+}
+
+const STRUCTURED_AUTH_STATUS_KEYS = [
+	"status",
+	"statusCode",
+	"httpStatus",
+	"http_status",
+] as const;
+const STRUCTURED_AUTH_CODE_KEYS = [
+	"code",
+	"errorCode",
+	"error_code",
+	"reason",
+	"type",
+] as const;
+const STRUCTURED_AUTH_MESSAGE_KEYS = [
+	"message",
+	"detail",
+	"description",
+	"error_description",
+] as const;
+const STRUCTURED_AUTH_REFRESHABLE_KEYS = [
+	"refreshable",
+	"authRefreshable",
+	"auth_refreshable",
+	"shouldRefreshAuth",
+	"should_refresh_auth",
+] as const;
+const STRUCTURED_AUTH_EXPIRED_KEYS = [
+	"authExpired",
+	"auth_expired",
+	"tokenExpired",
+	"token_expired",
+	"accessTokenExpired",
+	"access_token_expired",
+] as const;
+const STRUCTURED_AUTH_PERMANENT_KEYS = [
+	"permanent",
+	"fatal",
+	"requiresRelogin",
+	"requires_relogin",
+	"reloginRequired",
+	"relogin_required",
+] as const;
+
 function getAssistantErrorMessage(error: AssistantMessage): string {
 	if (typeof error.errorMessage === "string" && error.errorMessage.trim().length > 0) {
 		return error.errorMessage;
@@ -98,6 +173,183 @@ function isCallerAbort(parentSignal: AbortSignal | undefined, error?: unknown): 
 
 function isCallerAbortMessage(parentSignal: AbortSignal | undefined, message: string): boolean {
 	return Boolean(parentSignal?.aborted) && isAbortError(message);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeMetadataString(value: unknown): string | undefined {
+	if (typeof value === "string") {
+		const normalized = value.trim();
+		return normalized.length > 0 ? normalized : undefined;
+	}
+	if (typeof value === "number" || typeof value === "boolean") {
+		return String(value);
+	}
+	return undefined;
+}
+
+function normalizeMetadataBoolean(value: unknown): boolean | undefined {
+	if (typeof value === "boolean") {
+		return value;
+	}
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const normalized = value.trim().toLowerCase();
+	if (["true", "1", "yes"].includes(normalized)) {
+		return true;
+	}
+	if (["false", "0", "no"].includes(normalized)) {
+		return false;
+	}
+	return undefined;
+}
+
+function normalizeMetadataStatus(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return Math.trunc(value);
+	}
+	if (typeof value === "string") {
+		const parsed = Number.parseInt(value.trim(), 10);
+		return Number.isInteger(parsed) ? parsed : undefined;
+	}
+	return undefined;
+}
+
+function firstMetadataValue(
+	record: Record<string, unknown>,
+	keys: readonly string[],
+): unknown {
+	for (const key of keys) {
+		if (record[key] !== undefined) {
+			return record[key];
+		}
+	}
+	return undefined;
+}
+
+function mergeRuntimeAuthMetadata(
+	left: RuntimeAuthFailureMetadata,
+	right: RuntimeAuthFailureMetadata,
+): RuntimeAuthFailureMetadata {
+	return {
+		status: left.status ?? right.status,
+		code: left.code ?? right.code,
+		message: left.message ?? right.message,
+		refreshable: left.refreshable ?? right.refreshable,
+		authExpired: left.authExpired ?? right.authExpired,
+		permanent: left.permanent ?? right.permanent,
+	};
+}
+
+function extractStructuredRuntimeAuthMetadata(
+	value: unknown,
+	depth: number = 0,
+): RuntimeAuthFailureMetadata {
+	if (depth > 3) {
+		return {};
+	}
+
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+			return {};
+		}
+		try {
+			return extractStructuredRuntimeAuthMetadata(JSON.parse(trimmed) as unknown, depth + 1);
+		} catch {
+			return {};
+		}
+	}
+
+	if (Array.isArray(value)) {
+		return value.reduce<RuntimeAuthFailureMetadata>(
+			(metadata, entry) => mergeRuntimeAuthMetadata(metadata, extractStructuredRuntimeAuthMetadata(entry, depth + 1)),
+			{},
+		);
+	}
+
+	if (!isPlainRecord(value)) {
+		return {};
+	}
+
+	let metadata: RuntimeAuthFailureMetadata = {
+		status: normalizeMetadataStatus(firstMetadataValue(value, STRUCTURED_AUTH_STATUS_KEYS)),
+		code: normalizeMetadataString(firstMetadataValue(value, STRUCTURED_AUTH_CODE_KEYS)),
+		message: normalizeMetadataString(firstMetadataValue(value, STRUCTURED_AUTH_MESSAGE_KEYS)),
+		refreshable: normalizeMetadataBoolean(firstMetadataValue(value, STRUCTURED_AUTH_REFRESHABLE_KEYS)),
+		authExpired: normalizeMetadataBoolean(firstMetadataValue(value, STRUCTURED_AUTH_EXPIRED_KEYS)),
+		permanent: normalizeMetadataBoolean(firstMetadataValue(value, STRUCTURED_AUTH_PERMANENT_KEYS)),
+	};
+
+	const nestedError = value.error;
+	if (nestedError !== undefined) {
+		if (typeof nestedError === "string") {
+			metadata.message ??= normalizeMetadataString(nestedError);
+		} else {
+			metadata = mergeRuntimeAuthMetadata(
+				metadata,
+				extractStructuredRuntimeAuthMetadata(nestedError, depth + 1),
+			);
+		}
+	}
+
+	return metadata;
+}
+
+function extractHttpStatusFromMessage(message: string): number | undefined {
+	const httpMatch = /\bHTTP\s+([1-5]\d{2})\b/i.exec(message);
+	if (httpMatch?.[1]) {
+		return Number.parseInt(httpMatch[1], 10);
+	}
+	const statusCodeMatch = /\b([1-5]\d{2})\s+status code\b/i.exec(message);
+	if (statusCodeMatch?.[1]) {
+		return Number.parseInt(statusCodeMatch[1], 10);
+	}
+	return undefined;
+}
+
+function hasRefreshableAuthExpiredSignal(text: string): boolean {
+	return /\b(?:access[_\s-]?token|auth(?:entication)?|oauth|session|credential)s?[_\s-]*(?:expired|expir(?:e|ation)|invalid_token|unauthorized)\b/i.test(text) ||
+		/\b(?:token|session|credential)[_\s-]*(?:expired|invalid_token)\b/i.test(text) ||
+		/\b(?:auth|token|session)[_\s-]?expired\b/i.test(text);
+}
+
+function hasPermanentAuthFailureSignal(text: string): boolean {
+	return /\b(?:invalid[_\s-]?grant|refresh[_\s-]?token[_\s-]?(?:reused|revoked|expired|invalid)|token[_\s-]?revoked|invalid[_\s-]?api[_\s-]?key|permission[_\s-]?denied|model[_\s-]?access[_\s-]?denied|insufficient[_\s-]?scope|requires[_\s-]?relogin|relogin[_\s-]?required)\b/i.test(text);
+}
+
+function isRefreshableRuntimeAuthFailure(message: string): boolean {
+	const providerResponse = parseEnrichedProviderResponse(message);
+	const structuredMetadata = extractStructuredRuntimeAuthMetadata(message);
+	const status = structuredMetadata.status ?? providerResponse.status ?? extractHttpStatusFromMessage(message);
+	if (status !== 401 && status !== 403) {
+		return false;
+	}
+
+	const combinedMetadataText = [
+		structuredMetadata.code,
+		structuredMetadata.message,
+		providerResponse.code,
+		providerResponse.message,
+		message,
+	]
+		.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+		.join(" ");
+
+	if (structuredMetadata.permanent === true || hasPermanentAuthFailureSignal(combinedMetadataText)) {
+		return false;
+	}
+	if (structuredMetadata.refreshable === true || structuredMetadata.authExpired === true) {
+		return true;
+	}
+	if (status === 403) {
+		return hasRefreshableAuthExpiredSignal(combinedMetadataText);
+	}
+	return structuredMetadata.refreshable !== false &&
+		(/\bunauthorized\b/i.test(combinedMetadataText) || hasRefreshableAuthExpiredSignal(combinedMetadataText));
 }
 
 function getOrCreateProviderRegistrationMetricState(
@@ -399,6 +651,22 @@ function getAssistantOutputTokens(message: AssistantMessage): number | null {
 	return typeof message.usage.output === "number" && Number.isFinite(message.usage.output)
 		? message.usage.output
 		: null;
+}
+
+function getAssistantTokenEstimate(message: AssistantMessage): number | undefined {
+	const totalTokens = message.usage.totalTokens;
+	if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
+		return totalTokens;
+	}
+
+	const components = [
+		message.usage.input,
+		message.usage.output,
+		message.usage.cacheRead,
+		message.usage.cacheWrite,
+	].filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+	const sum = components.reduce((total, value) => total + value, 0);
+	return sum > 0 ? sum : undefined;
 }
 
 function isRetryableEmptyCompletion(
@@ -797,20 +1065,62 @@ function resolveCredentialProviderId(
 	return providerFromModel.length > 0 ? providerFromModel : fallbackProvider;
 }
 
-type ProviderPassthroughReason = "excluded" | "unmanaged_provider";
+function getJitteredBackoffMs(baseMs: number): number {
+	if (baseMs <= 0) {
+		return 0;
+	}
+	return Math.max(1, Math.round(baseMs * (0.5 + Math.random() * 0.5)));
+}
 
-function resolveProviderPassthroughReason(
-	provider: SupportedProviderId,
-	excludedProviders?: ReadonlySet<string>,
-	managedProviders?: ReadonlySet<string>,
-): ProviderPassthroughReason | null {
-	if (excludedProviders?.has(provider)) {
-		return "excluded";
+function usageWindowHasRemainingCapacity(
+	window: { usedPercent: number } | null | undefined,
+): boolean | null {
+	if (!window || typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) {
+		return null;
 	}
-	if (managedProviders && !managedProviders.has(provider)) {
-		return "unmanaged_provider";
+	return window.usedPercent < 100;
+}
+
+async function shouldRetryBlazeApiRequestLimitWithLiveCapacity(
+	accountManager: AccountManager,
+	providerId: SupportedProviderId,
+	credentialId: string,
+	modelId: string,
+	message: string,
+): Promise<boolean> {
+	if (providerId !== BLAZEAPI_PROVIDER_ID || !BLAZEAPI_REQUEST_LIMIT_MESSAGE_PATTERN.test(message)) {
+		return false;
 	}
-	return null;
+
+	try {
+		const usage = await accountManager.getCredentialUsageSnapshot(providerId, credentialId, {
+			forceRefresh: true,
+			coordinationOperation: "selection",
+		});
+		const snapshot = usage.snapshot;
+		if (!snapshot) {
+			return false;
+		}
+
+		const requiresPremiumCredits = modelRequiresEntitlement(providerId, modelId);
+		const windowCapacities = [
+			usageWindowHasRemainingCapacity(snapshot.primary),
+			...(requiresPremiumCredits ? [usageWindowHasRemainingCapacity(snapshot.secondary)] : []),
+		].filter((value): value is boolean => value !== null);
+		if (windowCapacities.length > 0) {
+			return windowCapacities.every(Boolean);
+		}
+
+		const remaining = snapshot.rateLimitHeaders?.remaining;
+		return typeof remaining === "number" && Number.isFinite(remaining) && remaining > 0;
+	} catch (error: unknown) {
+		multiAuthDebugLogger.log("blazeapi_request_limit_usage_probe_failed", {
+			provider: providerId,
+			credentialId,
+			error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+		});
+		return false;
+	}
 }
 
 async function resolveRotationAttemptLimit(
@@ -840,10 +1150,6 @@ export function createRotatingStreamWrapper(
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
 	excludedProviders?: ReadonlySet<string>,
-	managedProviders?: ReadonlySet<string>,
-	streamTimeouts: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
-	providerStreamTimeouts: ProviderStreamTimeoutOverrides = {},
-	noStreamWatchdogProviders: readonly string[] = [],
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -885,17 +1191,13 @@ export function createRotatingStreamWrapper(
 				stream.end(assistantAbort.error);
 			};
 
-			const passthroughReason = resolveProviderPassthroughReason(
-				activeProviderId,
-				excludedProviders,
-				managedProviders,
-			);
-			if (passthroughReason) {
-				multiAuthDebugLogger.log("provider_passthrough", {
+			// Providers explicitly excluded from multi-auth rotation should pass
+			// through to the base API provider without credential management.
+			if (excludedProviders?.has(activeProviderId)) {
+				multiAuthDebugLogger.log("provider_excluded_passthrough", {
 					provider: activeProviderId,
 					model: activeModel.id,
 					api: activeModel.api,
-					reason: passthroughReason,
 				});
 				try {
 					const innerStream = activeBaseProvider.streamSimple(activeModel, context, {
@@ -977,9 +1279,14 @@ export function createRotatingStreamWrapper(
 
 			await refreshRotationAttemptLimit();
 			for (let attempt = 0; attempt < rotationAttemptLimit; attempt += 1) {
+				if (!providerRetryBudget.tryAcquire(activeProviderId)) {
+					throw new Error(
+						`Retry budget exhausted for ${activeProviderId}: ${PROVIDER_RETRY_BUDGET_MAX_RETRIES} rotation attempt(s) per ${Math.round(PROVIDER_RETRY_BUDGET_WINDOW_MS / 1000)}s window.`,
+					);
+				}
 				const delegatedCredentialOverride = resolveDelegatedCredentialOverride(activeProviderId);
 				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
-				let selected;
+				let selected: SelectedCredential;
 				try {
 					if (options?.signal?.aborted) {
 						pushAbortedAssistantEvent(stream, activeModel);
@@ -1045,18 +1352,24 @@ export function createRotatingStreamWrapper(
 					throw error;
 				}
 
-				const resolveRetryDecision = async (
+				let authRefreshRetryAttempted = false;
+				const enrichProviderErrorMessage = async (
 					rawMessage: string,
-					hasForwardedSubstantiveEvent: boolean,
-					transientAttempt: number,
 					requestModel: Model<Api>,
 					requestHeaders: SimpleStreamOptions["headers"],
-				): Promise<"fail" | "retry_same_credential" | "rotate_credential"> => {
+				): Promise<string> => {
 					const message = await enrichProviderStatusOnlyErrorMessage(rawMessage, {
 						model: requestModel,
 						apiKey: selected.secret,
 						headers: requestHeaders,
 						signal: options?.signal,
+						onResponseHeaders: (headers, status) => accountManager.harvestProviderRateLimitHeaders(
+							activeProviderId,
+							selected.credentialId,
+							selected.credential,
+							headers,
+							status,
+						),
 					});
 					if (message !== rawMessage) {
 						multiAuthDebugLogger.log("provider_error_body_enriched", {
@@ -1066,6 +1379,68 @@ export function createRotatingStreamWrapper(
 							errorMessage: message.slice(0, 200),
 						});
 					}
+					return message;
+				};
+
+				const tryRefreshOAuthCredentialForAuthFailure = async (
+					rawMessage: string,
+					hasForwardedSubstantiveEvent: boolean,
+					requestModel: Model<Api>,
+					requestHeaders: SimpleStreamOptions["headers"],
+				): Promise<boolean> => {
+					if (authRefreshRetryAttempted || hasForwardedSubstantiveEvent) {
+						return false;
+					}
+					if (selected.credential?.type !== "oauth") {
+						return false;
+					}
+
+					const message = await enrichProviderErrorMessage(rawMessage, requestModel, requestHeaders);
+					if (!isRefreshableRuntimeAuthFailure(message)) {
+						return false;
+					}
+
+					authRefreshRetryAttempted = true;
+					lastCredentialErrorMessage = message;
+					try {
+						const failedCredential = selected.credential;
+						const refreshResult = await accountManager.refreshCredentialForAuthFailure(
+							activeProviderId,
+							selected.credentialId,
+							failedCredential,
+						);
+						selected = {
+							...selected,
+							credential: refreshResult.credential,
+							secret: getCredentialRequestSecret(activeProviderId, refreshResult.credential),
+						};
+						multiAuthDebugLogger.log("runtime_auth_refresh_replay", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							model: requestModel.id,
+							disposition: refreshResult.disposition,
+							errorMessage: message.slice(0, 200),
+						});
+						return true;
+					} catch (error: unknown) {
+						multiAuthDebugLogger.log("runtime_auth_refresh_failed", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							model: requestModel.id,
+							error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+						});
+						return false;
+					}
+				};
+
+				const resolveRetryDecision = async (
+					rawMessage: string,
+					hasForwardedSubstantiveEvent: boolean,
+					transientAttempt: number,
+					requestModel: Model<Api>,
+					requestHeaders: SimpleStreamOptions["headers"],
+				): Promise<"fail" | "retry_same_credential" | "rotate_credential"> => {
+					const message = await enrichProviderErrorMessage(rawMessage, requestModel, requestHeaders);
 					const classification = classifyCredentialError(message, {
 						providerId: activeProviderId,
 						modelId: requestModel.id,
@@ -1117,6 +1492,41 @@ export function createRotatingStreamWrapper(
 						return "fail";
 					}
 
+					const blazeApiRequestLimitHasLiveCapacity =
+						await shouldRetryBlazeApiRequestLimitWithLiveCapacity(
+							accountManager,
+							activeProviderId,
+							selected.credentialId,
+							requestModel.id,
+							message,
+						);
+					if (blazeApiRequestLimitHasLiveCapacity) {
+						lastCredentialErrorMessage = message;
+						if (transientAttempt < MAX_TRANSIENT_RETRIES_PER_CREDENTIAL) {
+							multiAuthDebugLogger.log("blazeapi_request_limit_treated_as_transient", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+								model: requestModel.id,
+								transientAttempt,
+							});
+							return "retry_same_credential";
+						}
+
+						const cooldownMs = await accountManager.markTransientProviderError(
+							activeProviderId,
+							selected.credentialId,
+							message,
+						);
+						multiAuthDebugLogger.log("blazeapi_request_limit_retry_budget_exhausted", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							model: requestModel.id,
+							transientAttempt,
+							cooldownMs,
+						});
+						return "fail";
+					}
+
 					if (
 						classification.shouldRetrySameCredential &&
 						transientAttempt < MAX_TRANSIENT_RETRIES_PER_CREDENTIAL
@@ -1146,6 +1556,106 @@ export function createRotatingStreamWrapper(
 							cooldownMs,
 							reason: message.slice(0, 200),
 						});
+
+						// Detect whether rotation has anywhere actually usable for this request.
+						// A provider can have other stored credentials that are disabled, quota-locked,
+						// or ineligible for the requested model (for example Kiro Free credentials
+						// on a Kiro Opus request). In that case, excluding the current credential
+						// would exhaust rotation and abort even though the error is transient.
+						let hasAlternateCredential = false;
+						let alternateLookupFailed = false;
+						try {
+							if (typeof accountManager.hasUsableAlternateCredential === "function") {
+								hasAlternateCredential = await accountManager.hasUsableAlternateCredential(
+									activeProviderId,
+									{
+										currentCredentialId: selected.credentialId,
+										excludedCredentialIds,
+										modelId: requestModel.id,
+										selectionCache,
+										signal: options?.signal,
+									},
+								);
+							} else {
+								const providerCredentialIds = await accountManager.listProviderCredentialIds(
+									activeProviderId,
+								);
+								hasAlternateCredential = providerCredentialIds.some(
+									(credentialId) =>
+										credentialId !== selected.credentialId &&
+										!excludedCredentialIds.has(credentialId),
+								);
+							}
+						} catch (error: unknown) {
+							alternateLookupFailed = true;
+							multiAuthDebugLogger.log("transient_alternate_lookup_failed", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+								error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+							});
+						}
+
+						if (!alternateLookupFailed && !hasAlternateCredential) {
+							// No alternate credential is available, so excluding this
+							// one would fail acquisition on the next outer iteration.
+							// Wait past the recorded cooldown (capped) and re-acquire
+							// the same credential without marking it excluded so that
+							// transient errors auto-retry instead of bubbling up.
+							const backoffBaseMs = cooldownMs > 0
+								? Math.min(cooldownMs, SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS)
+								: MIN_SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS;
+							const backoffMs = computeExponentialBackoffMs(
+								backoffBaseMs,
+								transientAttempt + 1,
+								SOLE_CREDENTIAL_TRANSIENT_RETRY_WAIT_MS,
+							);
+							const waitMs = getJitteredBackoffMs(backoffMs);
+							multiAuthDebugLogger.log("transient_retry_without_rotation", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+								cooldownMs,
+								backoffMs,
+								waitMs,
+								attempt,
+								rotationAttemptLimit,
+								reason: message.slice(0, 200),
+							});
+							if (waitMs > 0) {
+								try {
+									await abortableSleep(waitMs, options?.signal);
+								} catch (error: unknown) {
+									if (isCallerAbort(options?.signal, error)) {
+										return "fail";
+									}
+									throw error;
+								}
+							}
+							if (options?.signal?.aborted) {
+								return "fail";
+							}
+							if (typeof accountManager.releaseTransientProviderRetryBlock === "function") {
+								try {
+									await accountManager.releaseTransientProviderRetryBlock(
+										activeProviderId,
+										selected.credentialId,
+									);
+									multiAuthDebugLogger.log("transient_retry_block_released", {
+										provider: activeProviderId,
+										credentialId: selected.credentialId,
+										reason: message.slice(0, 200),
+									});
+								} catch (error: unknown) {
+									multiAuthDebugLogger.log("transient_retry_block_release_failed", {
+										provider: activeProviderId,
+										credentialId: selected.credentialId,
+										error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+									});
+									return "fail";
+								}
+							}
+							return "rotate_credential";
+						}
+
 						excludedCredentialIds.add(selected.credentialId);
 						return "rotate_credential";
 					}
@@ -1167,6 +1677,7 @@ export function createRotatingStreamWrapper(
 									isWeekly: classification.kind === "quota_weekly",
 									quotaClassification: classification.quotaClassification,
 									recommendedCooldownMs: classification.recommendedCooldownMs,
+									errorKind: classification.kind,
 								},
 							);
 						} else if (
@@ -1281,6 +1792,16 @@ export function createRotatingStreamWrapper(
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
+						if (
+							await tryRefreshOAuthCredentialForAuthFailure(
+								message,
+								false,
+								requestModel,
+								requestHeaders,
+							)
+						) {
+							continue;
+						}
 						const decision = await resolveRetryDecision(
 							message,
 							false,
@@ -1356,6 +1877,17 @@ export function createRotatingStreamWrapper(
 										return;
 									}
 									const message = assistantErrorMessage;
+									if (
+										await tryRefreshOAuthCredentialForAuthFailure(
+											message,
+											hasForwardedSubstantiveEvent,
+											requestModel,
+											requestHeaders,
+										)
+									) {
+										shouldRetrySameCredential = true;
+										break;
+									}
 									const decision = await resolveRetryDecision(
 										message,
 										hasForwardedSubstantiveEvent,
@@ -1421,11 +1953,13 @@ export function createRotatingStreamWrapper(
 								stream.push(event);
 								if (event.type === "done") {
 									sawDoneEvent = true;
+									providerRetryBudget.recordSuccess(activeProviderId);
 									await accountManager.recordCredentialSuccess(
 										activeProviderId,
 										selected.credentialId,
 										Date.now() - requestStartedAt,
 										requestModel.id,
+										getAssistantTokenEstimate(event.message),
 									);
 									stream.end(event.message);
 									return;
@@ -1442,19 +1976,30 @@ export function createRotatingStreamWrapper(
 							return;
 						}
 						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
-						const decision = await resolveRetryDecision(
-							message,
-							hasForwardedSubstantiveEvent,
-							transientAttempt,
-							requestModel,
-							requestHeaders,
-						);
-						if (decision === "retry_same_credential") {
+						if (
+							await tryRefreshOAuthCredentialForAuthFailure(
+								message,
+								hasForwardedSubstantiveEvent,
+								requestModel,
+								requestHeaders,
+							)
+						) {
 							shouldRetrySameCredential = true;
-						} else if (decision === "rotate_credential") {
-							shouldRotateCredential = true;
 						} else {
-							throw error;
+							const decision = await resolveRetryDecision(
+								message,
+								hasForwardedSubstantiveEvent,
+								transientAttempt,
+								requestModel,
+								requestHeaders,
+							);
+							if (decision === "retry_same_credential") {
+								shouldRetrySameCredential = true;
+							} else if (decision === "rotate_credential") {
+								shouldRotateCredential = true;
+							} else {
+								throw error;
+							}
 						}
 					} finally {
 						closeAsyncIterator(innerIterator);
@@ -1537,6 +2082,54 @@ export async function resolveProviderRegistrationMetadata(
 	return registry.resolveProviderRegistrationMetadata(provider);
 }
 
+export interface RuntimeProviderRegistrationPayload {
+	provider: SupportedProviderId;
+	displayName?: string;
+	baseUrl: string;
+	api: Api;
+	models: ProviderModelConfig[];
+	streamSimple: (
+		model: Model<Api>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	) => AssistantMessageEventStream;
+	headers?: Record<string, string>;
+}
+
+export function registerRuntimeProviderOverride(
+	pi: ExtensionAPI,
+	accountManager: AccountManager,
+	payload: RuntimeProviderRegistrationPayload,
+): void {
+	const baseProvider: ApiProviderRef = {
+		api: payload.api,
+		stream: (model, context, options) => payload.streamSimple(model, context, options),
+		streamSimple: payload.streamSimple,
+	};
+	const streamSimple = createRotatingStreamWrapper(
+		payload.provider,
+		accountManager,
+		baseProvider,
+		new Map([[payload.api, baseProvider]]),
+	);
+
+	multiAuthDebugLogger.log("runtime_provider_override_registering", {
+		provider: payload.provider,
+		api: payload.api,
+		modelCount: payload.models.length,
+	});
+
+	pi.registerProvider(payload.provider, {
+		name: payload.displayName,
+		baseUrl: payload.baseUrl,
+		apiKey: "managed-by-multi-auth",
+		api: payload.api,
+		headers: payload.headers,
+		models: payload.models,
+		streamSimple,
+	});
+}
+
 /**
  * Registers stream wrappers for all discovered providers with model metadata.
  */
@@ -1560,7 +2153,9 @@ export async function registerMultiAuthProviders(
 	const providerStreamTimeouts = options?.providerStreamTimeouts ?? {};
 	const noStreamWatchdogProviders = options?.noStreamWatchdogProviders ?? [];
 	const registry = accountManager.getProviderRegistry();
-	const providers = await registry.discoverProviderIds();
+	const providers = includeSet
+		? ([...includeSet] as SupportedProviderId[])
+		: await registry.discoverProviderIds();
 	const metadataToRegister = (
 		await Promise.all(
 			providers.map(async (provider) => {
@@ -1671,10 +2266,6 @@ export async function registerMultiAuthProviders(
 			baseProvider,
 			baseProvidersByApi,
 			excludeSet,
-			managedProviders,
-			streamTimeouts,
-			providerStreamTimeouts,
-			noStreamWatchdogProviders,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

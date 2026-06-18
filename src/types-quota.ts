@@ -117,8 +117,3 @@ export const QUOTA_RECOVERY_ACTIONS: Record<QuotaClassification, RecoveryAction>
 	},
 };
 
-export const DEFAULT_QUOTA_CONFIG: QuotaClassificationConfig = {
-	enabled: true,
-	cooldownOverrides: {},
-	customPatterns: {},
-};

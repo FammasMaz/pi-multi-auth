@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import type { ProviderCascadeState } from "./types-cascade.js";
 import type { FailoverChain, FailoverChainState } from "./types-failover.js";
@@ -58,6 +58,29 @@ export interface ModelCredentialIncompatibilityState {
 	error: string;
 }
 
+export interface QuotaDrainStateForCredential {
+	draining: boolean;
+	enteredAt?: number;
+	lastUsedPercent?: number;
+	updatedAt: number;
+}
+
+export type CredentialBackgroundExclusionReason = "missing_refresh_token_on_import";
+
+export interface CredentialBackgroundExclusionState {
+	reason: CredentialBackgroundExclusionReason;
+	excludedAt: number;
+}
+
+/** Soft process/session lease for a credential persisted in multi-auth.json. */
+export interface ProviderCredentialLeaseState {
+	ownerId: string;
+	credentialId: string;
+	acquiredAt: number;
+	lastSeenAt: number;
+	expiresAt: number;
+}
+
 /** Per-provider rotation state persisted in multi-auth.json. */
 export interface ProviderRotationState {
 	credentialIds: string[];
@@ -65,8 +88,14 @@ export interface ProviderRotationState {
 	rotationMode: RotationMode;
 	manualActiveCredentialId?: string;
 	lastUsedAt: Record<string, number>;
+	/** Local usage units: one per routed request plus token-weighted increments when response usage is available. */
 	usageCount: Record<string, number>;
+	/** Recent quota-error count; selection uses time/success decay instead of lifetime penalty. */
 	quotaErrorCount: Record<string, number>;
+	/** Last quota-error timestamp per credential, used to decay stale error penalties. */
+	quotaErrorLastSeenAt?: Record<string, number>;
+	/** Consecutive successful probes after a quota error, used to restore credential trust. */
+	quotaRecoverySuccessCount?: Record<string, number>;
 	quotaExhaustedUntil: Record<string, number>;
 	/** Last error message per credential, used to show users why a credential is exhausted. */
 	lastQuotaError: Record<string, string>;
@@ -100,20 +129,20 @@ export interface ProviderRotationState {
 	activeChain?: FailoverChainState;
 	/** Richer quota classifications keyed by credential ID. */
 	quotaStates?: Record<string, QuotaStateForCredential>;
+	/** Persisted balancer quota-draining hysteresis state keyed by credential ID. */
+	quotaDrainStates?: Record<string, QuotaDrainStateForCredential>;
 	/** Temporary per-model credential incompatibilities keyed by credential ID then normalized model ID. */
 	modelIncompatibilities?: Record<string, Record<string, ModelCredentialIncompatibilityState>>;
-}
-
-/** UI preferences persisted in multi-auth.json. */
-export interface MultiAuthUiState {
-	hiddenProviders: string[];
+	/** Soft process/session leases used to avoid concurrent credential reuse when alternatives exist. */
+	credentialLeases?: Record<string, ProviderCredentialLeaseState>;
+	/** Credentials excluded from automatic background refresh and usage probes. */
+	backgroundCredentialExclusions?: Record<string, CredentialBackgroundExclusionState>;
 }
 
 /** Top-level multi-auth.json shape. */
 export interface MultiAuthState {
 	version: 1;
 	providers: Record<string, ProviderRotationState>;
-	ui: MultiAuthUiState;
 }
 
 /** Credential kind shown in status output. */
@@ -134,14 +163,19 @@ export interface CredentialStatus {
 	credentialType: CredentialType;
 	redactedSecret: string;
 	friendlyName?: string;
+	/** Stable identity email extracted from OAuth claims/user profile when available. */
+	identityEmail?: string;
+	/** Stable plan label extracted from OAuth claims when usage data is unavailable. */
+	identityPlanType?: string;
 	index: number;
 	isActive: boolean;
 	isManualActive?: boolean;
 	expiresAt: number | null;
 	isExpired: boolean;
 	quotaExhaustedUntil?: number;
+	/** Local usage units: one per routed request plus token-weighted increments when response usage is available. */
 	usageCount: number;
-	/** Count of generic quota errors (hourly/daily resets). */
+	/** Count of recent generic quota errors (hourly/daily resets). */
 	quotaErrorCount: number;
 	/** Count of consecutive transient provider failures (used for exponential backoff). */
 	transientErrorCount?: number;
@@ -205,14 +239,6 @@ export interface ProviderRegistrationMetadata {
 	apiKey?: string;
 }
 
-/** Helper to construct an assistant error response. */
-export interface AssistantErrorFactoryInput {
-	provider: string;
-	api: Api;
-	model: string;
-	message: string;
-}
-
 /** Auth writer result for backup credential creation flows. */
 export interface BackupAndStoreResult {
 	credentialId: string;
@@ -224,24 +250,4 @@ export interface BackupAndStoreResult {
 	renumberedCredentialIds?: boolean;
 }
 
-/** Minimal assistant usage object for synthetic errors. */
-export interface EmptyAssistantUsage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	totalTokens: number;
-	cost: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		total: number;
-	};
-}
 
-/** Synthetic assistant error message shape. */
-export type AssistantErrorMessage = AssistantMessage & {
-	stopReason: "error";
-	errorMessage: string;
-};

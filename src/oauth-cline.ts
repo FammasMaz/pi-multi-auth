@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type {
 	OAuthCredentials,
@@ -33,6 +34,7 @@ const CALLBACK_PORT_RANGE_END = 48_811;
 const MANUAL_CALLBACK_PROMPT = "Paste the Cline callback URL or authorization code:";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const CLINE_OAUTH_CANCELLED_MESSAGE = "Cline OAuth login was cancelled.";
+const CLINE_OAUTH_STATE_BYTES = 32;
 
 const AUTH_SUCCESS_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -85,6 +87,9 @@ type ClineAuthResponse = {
 type ParsedAuthorizationInput = {
 	code?: string;
 	provider?: string;
+	state?: string;
+	stateCount: number;
+	requiresStateValidation: boolean;
 };
 
 export interface LocalCallbackServerHandle {
@@ -117,39 +122,55 @@ function createRefreshFailureDetails(
 	};
 }
 
+function parseAuthorizationParams(params: URLSearchParams, requiresStateValidation: boolean): ParsedAuthorizationInput {
+	const states = params.getAll("state");
+	return {
+		code:
+			normalizeNonEmptyString(params.get("refreshToken") ?? undefined) ??
+			normalizeNonEmptyString(params.get("idToken") ?? undefined) ??
+			normalizeNonEmptyString(params.get("code") ?? undefined),
+		provider: normalizeNonEmptyString(params.get("provider") ?? undefined),
+		state: states.length === 1 ? normalizeNonEmptyString(states[0] ?? undefined) : undefined,
+		stateCount: states.length,
+		requiresStateValidation,
+	};
+}
+
 function parseAuthorizationInput(input: string): ParsedAuthorizationInput {
 	const value = input.trim();
 	if (!value) {
-		return {};
+		return { stateCount: 0, requiresStateValidation: false };
 	}
 
 	try {
 		const url = new URL(value);
-		return {
-			code:
-				normalizeNonEmptyString(url.searchParams.get("refreshToken") ?? undefined) ??
-				normalizeNonEmptyString(url.searchParams.get("idToken") ?? undefined) ??
-				normalizeNonEmptyString(url.searchParams.get("code") ?? undefined),
-			provider: normalizeNonEmptyString(url.searchParams.get("provider") ?? undefined),
-		};
+		return parseAuthorizationParams(url.searchParams, true);
 	} catch {
 		// Ignore URL parsing errors and fall back to plain-text parsing.
 	}
 
 	if (value.includes("code=") || value.includes("refreshToken=") || value.includes("idToken=")) {
-		const params = new URLSearchParams(value);
-		return {
-			code:
-				normalizeNonEmptyString(params.get("refreshToken") ?? undefined) ??
-				normalizeNonEmptyString(params.get("idToken") ?? undefined) ??
-				normalizeNonEmptyString(params.get("code") ?? undefined),
-			provider: normalizeNonEmptyString(params.get("provider") ?? undefined),
-		};
+		return parseAuthorizationParams(new URLSearchParams(value), true);
 	}
 
 	return {
 		code: value,
+		stateCount: 0,
+		requiresStateValidation: false,
 	};
+}
+
+function createOAuthState(): string {
+	return randomBytes(CLINE_OAUTH_STATE_BYTES).toString("base64url");
+}
+
+function validateAuthorizationState(parsedInput: ParsedAuthorizationInput, expectedState: string): void {
+	if (!parsedInput.requiresStateValidation) {
+		return;
+	}
+	if (parsedInput.stateCount !== 1 || parsedInput.state !== expectedState) {
+		throw new Error("Cline OAuth callback state did not match.");
+	}
 }
 
 function parseJsonRecord(text: string): Record<string, unknown> | null {
@@ -240,12 +261,14 @@ async function readResponsePayload(response: Response): Promise<{
 async function requestAuthorizeRedirectUrl(
 	fetchImplementation: typeof fetch,
 	callbackUrl: string,
+	state: string,
 	requestTimeoutMs: number,
 ): Promise<string> {
 	const url = new URL(CLINE_AUTHORIZE_ENDPOINT, CLINE_API_BASE_URL);
 	url.searchParams.set("client_type", "extension");
 	url.searchParams.set("callback_url", callbackUrl);
 	url.searchParams.set("redirect_uri", callbackUrl);
+	url.searchParams.set("state", state);
 
 	const response = await fetchWithTimeout(
 		url,
@@ -524,6 +547,7 @@ export function createClineOAuthProvider(
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 			throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
 
+			let expectedState: string | undefined = createOAuthState();
 			let callbackServer: LocalCallbackServerHandle | null = null;
 			let callbackUrl = fallbackCallbackUrl();
 			try {
@@ -540,9 +564,14 @@ export function createClineOAuthProvider(
 
 			try {
 				callbacks.onProgress?.("Requesting Cline authorization URL...");
+				const stateForRequest = expectedState;
+				if (!stateForRequest) {
+					throw new Error("Cline OAuth state was already used.");
+				}
 				const authUrl = await requestAuthorizeRedirectUrl(
 					resolvedDependencies.fetchImplementation,
 					callbackUrl,
+					stateForRequest,
 					resolvedDependencies.requestTimeoutMs,
 				);
 				throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
@@ -556,6 +585,12 @@ export function createClineOAuthProvider(
 				const rawInput = await resolveAuthorizationInput(callbacks, callbackServer);
 				throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
 				const parsedInput = parseAuthorizationInput(rawInput);
+				const stateForValidation = expectedState;
+				expectedState = undefined;
+				if (!stateForValidation) {
+					throw new Error("Cline OAuth state was already used.");
+				}
+				validateAuthorizationState(parsedInput, stateForValidation);
 				const code = normalizeNonEmptyString(parsedInput.code);
 				if (!code) {
 					throw new Error("Cline OAuth login requires an authorization code or callback URL.");
@@ -571,6 +606,7 @@ export function createClineOAuthProvider(
 					resolvedDependencies.requestTimeoutMs,
 				);
 			} finally {
+				expectedState = undefined;
 				await closeServerSafely(callbackServer);
 			}
 		},

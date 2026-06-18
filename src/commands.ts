@@ -1,9 +1,9 @@
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
-} from "@mariozechner/pi-coding-agent";
-import { Input, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { AccountManager } from "./account-manager.js";
+} from "@earendil-works/pi-coding-agent";
+import { Input, matchesKey, truncateToWidth, visibleWidth, type OverlayOptions } from "@earendil-works/pi-tui";
+import { AccountManager, type CloudflareCredentialIdentityRefreshResult } from "./account-manager.js";
 import {
 	resolveBatchDeleteSelection,
 	pruneBatchSelection,
@@ -12,6 +12,10 @@ import {
 import { parseCloudflareCredentialBatchInput } from "./cloudflare-credential-input.js";
 import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
 import { runOAuthLoginDialog } from "./oauth-login-flow.js";
+import {
+	OPENAI_CODEX_IMPORT_PROVIDER_ID,
+	parseOpenAICodexCredentialImportInput,
+} from "./openai-codex-import.js";
 import { runProviderConfigurationDialog } from "./provider-configuration-dialog.js";
 import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
@@ -22,13 +26,17 @@ import { resolveBorderGlyphs } from "./formatters/charset.js";
 import {
 	clampRenderedRows,
 	renderWrappedFooterActions,
+	RESPONSIVE_MODAL_DEFAULT_SCALE,
 	resolveBodyRowBudget,
-	resolveTerminalRows,
+	resolveResponsiveOverlayOptions,
+	resolveResponsiveOverlayRuntimeOptions,
 	wrapTextToWidth,
+	type ModalOverlayOptions,
 } from "./formatters/responsive-modal.js";
 import {
 	formatProviderBadge,
 	normalizeInlineText,
+	truncateAccountIdentifier,
 } from "./formatters/multi-auth-display.js";
 import {
 	formatHiddenProviderHint,
@@ -44,6 +52,7 @@ import {
 	resolveDefaultRotationMode,
 	resolveSelectableRotationModes,
 } from "./rotation-modes.js";
+import { normalizeCodexPlanType } from "./model-entitlements.js";
 import {
 	LEGACY_SUPPORTED_PROVIDERS,
 	type CredentialRequestOverrides,
@@ -91,13 +100,13 @@ type SelectionAnchor =
 		kind: "add";
 	};
 
-type CredentialUsageDisplayState = {
-	usageSnapshot: CredentialStatus["usageSnapshot"];
-	usageFetchError?: string;
-	usageSnapshotDisplayOnly?: boolean;
-};
-
 type PlanHighlightColor = "accent" | "mdLink" | "success" | "text" | "toolTitle" | "warning";
+
+interface DuplicateAccountIndicator {
+	email: string;
+	planLabel: string;
+	credentialIds: string[];
+}
 
 interface AccountColumnWidths {
 	alias: number;
@@ -106,12 +115,13 @@ interface AccountColumnWidths {
 
 const ACCOUNT_ROW_PREFIX_WIDTH = 8;
 const ACCOUNT_TABLE_MIN_WIDTH = 30;
+const GRID_CELL_HORIZONTAL_PADDING = 2;
+const ACCOUNT_PANE_MIN_WIDTH = visibleWidth("Accounts: github-copilot (1)") + GRID_CELL_HORIZONTAL_PADDING * 2;
 const NEUTRAL_PLAN_LABELS = new Set(["", "free", "n/a", "na", "no plan", "none", "null", "unknown"]);
 
 const THREE_PANE_MIN_WIDTH = 96;
-const GRID_BODY_ROW_COUNT = 22;
+const GRID_BODY_ROW_COUNT = Math.ceil(22 * RESPONSIVE_MODAL_DEFAULT_SCALE);
 const MIN_BODY_ROW_COUNT = 4;
-const GRID_CELL_HORIZONTAL_PADDING = 2;
 const GRID_VERTICAL_SEPARATOR_COLUMNS = 2;
 const MODAL_TITLE_LEFT_MARGIN = 2;
 const MODAL_TITLE_BOTTOM_MARGIN_ROWS = 1;
@@ -137,7 +147,11 @@ export function resolveModalRefreshAction(
 const BORDER_GLYPHS = resolveBorderGlyphs();
 export const CUSTOM_PROVIDER_NAME_OPTION = "__custom_provider__" as const;
 
-type AddProviderMethod = "api_key" | "oauth";
+type AddProviderMethod = "api_key" | "oauth" | "import";
+
+function providerSupportsCredentialImport(provider: SupportedProviderId): boolean {
+	return provider === OPENAI_CODEX_IMPORT_PROVIDER_ID;
+}
 type ProviderStatusSummary = Pick<ProviderStatus, "provider" | "credentials">;
 
 type ProviderChoiceCandidate = {
@@ -361,6 +375,10 @@ function wrapDetailMessageLines(message: string, maxWidth: number): string[] {
 	return wrapped.length > 0 ? wrapped : [normalized];
 }
 
+export function buildMissingUsageDetailLines(maxWidth: number): string[] {
+	return wrapDetailMessageLines("No cached usage data. Press [T] to refresh this account.", maxWidth);
+}
+
 function buildUsageUnavailableLines(error: string | undefined, maxWidth: number): string[] {
 	const normalizedError = normalizeInlineText(error ?? "").trim();
 	if (!normalizedError) {
@@ -421,6 +439,24 @@ function formatProviderLabel(provider: SupportedProviderId): string {
 function normalizePlanLabel(planType: string | null | undefined): string {
 	const normalized = normalizeInlineText(planType ?? "").trim();
 	return normalized || "unknown";
+}
+
+function normalizeDuplicateEmailKey(email: string | undefined): string | null {
+	const normalized = normalizeInlineText(email ?? "").trim().toLowerCase();
+	return normalized && normalized.includes("@") ? normalized : null;
+}
+
+function normalizeDuplicatePlanKey(
+	provider: SupportedProviderId,
+	planType: string | null | undefined,
+): string | null {
+	if (provider === "openai-codex") {
+		const normalized = normalizeCodexPlanType(planType);
+		return normalized === "unknown" ? null : normalized;
+	}
+
+	const normalized = normalizePlanLabel(planType).toLowerCase();
+	return NEUTRAL_PLAN_LABELS.has(normalized) ? null : normalized;
 }
 
 function getPlanHighlightColor(planType: string | null | undefined): PlanHighlightColor {
@@ -549,6 +585,135 @@ function getCredentialAccountLabel(credential: CredentialStatus): string {
 	return friendlyName && friendlyName !== credentialId ? friendlyName : "";
 }
 
+type AccountPlanTextFormatter = (text: string, planType: string | null | undefined) => string;
+
+export interface AccountEntryLineOptions {
+	credential: CredentialStatus;
+	contentWidth: number;
+	isSelected: boolean;
+	isMarked: boolean;
+	statusCell: string;
+	formatPlanText?: AccountPlanTextFormatter;
+	singleLine?: boolean;
+}
+
+function renderUnlabeledAccountEntryLines(
+	credential: CredentialStatus,
+	contentWidth: number,
+	isSelected: boolean,
+	isMarked: boolean,
+	statusCell: string,
+	formatPlanText: AccountPlanTextFormatter,
+): string[] {
+	const cursor = isSelected ? "▶" : " ";
+	const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
+	const prefix = `${cursor} ${activeMarker} ${statusCell} `;
+	const accountWidth = Math.max(1, contentWidth - visibleWidth(prefix));
+	const accountLines = wrapAccountDisplayNameLines(getCredentialAlias(credential), accountWidth);
+	const continuationPrefix = " ".repeat(visibleWidth(prefix));
+	return accountLines.map((accountLine, lineIndex) => {
+		const formattedAccountLine = formatPlanText(accountLine, credential.usageSnapshot?.planType);
+		if (lineIndex === 0) {
+			return padRight(`${prefix}${formattedAccountLine}`, contentWidth);
+		}
+		return padRight(`${continuationPrefix}${formattedAccountLine}`, contentWidth);
+	});
+}
+
+function renderSingleLineAccountEntry(
+	credential: CredentialStatus,
+	contentWidth: number,
+	isSelected: boolean,
+	isMarked: boolean,
+	statusCell: string,
+	formatPlanText: AccountPlanTextFormatter,
+): string[] {
+	const safeContentWidth = Math.max(1, Math.floor(contentWidth));
+	const cursor = isSelected ? "▶" : " ";
+	const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
+	const prefix = `${cursor} ${activeMarker} ${statusCell} `;
+	const bodyWidth = Math.max(1, safeContentWidth - visibleWidth(prefix));
+	const alias = getCredentialAlias(credential);
+	const accountLabel = getCredentialAccountLabel(credential);
+
+	if (accountLabel && bodyWidth >= 18) {
+		const aliasWidth = clamp(Math.floor(bodyWidth * 0.46), 8, Math.max(8, bodyWidth - 7));
+		const labelWidth = Math.max(1, bodyWidth - aliasWidth - 1);
+		const aliasText = truncateAccountIdentifier(alias, aliasWidth);
+		const labelText = truncateAccountIdentifier(accountLabel, labelWidth);
+		const formattedAlias = formatPlanText(padRight(aliasText, aliasWidth), credential.usageSnapshot?.planType);
+		return [padRight(`${prefix}${formattedAlias} ${labelText}`, safeContentWidth)];
+	}
+
+	const body = formatPlanText(
+		truncateAccountIdentifier(accountLabel || alias, bodyWidth),
+		credential.usageSnapshot?.planType,
+	);
+	return [padRight(`${prefix}${body}`, safeContentWidth)];
+}
+
+export function renderAccountEntryLines(options: AccountEntryLineOptions): string[] {
+	const safeContentWidth = Math.max(1, Math.floor(options.contentWidth));
+	const formatPlanText = options.formatPlanText ?? ((text: string) => text);
+	if (options.singleLine) {
+		return renderSingleLineAccountEntry(
+			options.credential,
+			safeContentWidth,
+			options.isSelected,
+			options.isMarked,
+			options.statusCell,
+			formatPlanText,
+		);
+	}
+
+	const accountLabel = getCredentialAccountLabel(options.credential);
+	if (!accountLabel) {
+		return renderUnlabeledAccountEntryLines(
+			options.credential,
+			safeContentWidth,
+			options.isSelected,
+			options.isMarked,
+			options.statusCell,
+			formatPlanText,
+		);
+	}
+
+	const columnWidths = resolveAccountColumnWidths(safeContentWidth);
+	if (!columnWidths) {
+		const cursor = options.isSelected ? "▶" : " ";
+		const activeMarker = options.isMarked || options.credential.isManualActive ? "*" : " ";
+		const alias = formatPlanText(getCredentialAlias(options.credential), options.credential.usageSnapshot?.planType);
+		const prefix = `${cursor} ${activeMarker} ${options.statusCell} ${alias}`;
+		const accountWidth = Math.max(1, safeContentWidth - visibleWidth(prefix) - 1);
+		const accountLines = wrapAccountDisplayNameLines(accountLabel, accountWidth);
+		const continuationPrefix = " ".repeat(visibleWidth(prefix) + 1);
+		return accountLines.map((accountLine, lineIndex) => {
+			if (lineIndex === 0) {
+				const accountSuffix = accountLine ? ` ${accountLine}` : "";
+				return padRight(`${prefix}${accountSuffix}`, safeContentWidth);
+			}
+			return padRight(`${continuationPrefix}${accountLine}`, safeContentWidth);
+		});
+	}
+
+	const cursor = options.isSelected ? "▶" : " ";
+	const activeMarker = options.isMarked || options.credential.isManualActive ? "*" : " ";
+	const alias = formatPlanText(
+		padRight(getCredentialAlias(options.credential), columnWidths.alias),
+		options.credential.usageSnapshot?.planType,
+	);
+	const accountLines = wrapAccountDisplayNameLines(accountLabel, columnWidths.account);
+	const firstPrefix = `${cursor} ${activeMarker} ${options.statusCell} `;
+	const continuationPrefix = `${" ".repeat(ACCOUNT_ROW_PREFIX_WIDTH + columnWidths.alias)} `;
+	return accountLines.map((accountLine, lineIndex) => {
+		if (lineIndex === 0) {
+			const accountSuffix = accountLine ? ` ${accountLine}` : "";
+			return padRight(`${firstPrefix}${alias}${accountSuffix}`, safeContentWidth);
+		}
+		return padRight(`${continuationPrefix}${accountLine}`, safeContentWidth);
+	});
+}
+
 function renderProgressBar(percentUsed: number | null, width: number): string {
 	if (percentUsed === null || !Number.isFinite(percentUsed)) {
 		return `[${"░".repeat(Math.max(4, width))}] n/a`;
@@ -567,17 +732,17 @@ interface PaneWidths {
 	details: number;
 }
 
-function splitPaneWidths(totalWidth: number): PaneWidths {
+export function splitPaneWidths(totalWidth: number): PaneWidths {
 	const minimumProviders = 16;
-	const minimumAccounts = 18;
-	const minimumDetails = 36;
+	const minimumAccounts = ACCOUNT_PANE_MIN_WIDTH;
+	const minimumDetails = 30;
 	const usable = Math.max(
 		minimumProviders + minimumAccounts + minimumDetails,
 		totalWidth - GRID_VERTICAL_SEPARATOR_COLUMNS,
 	);
 
-	let providers = Math.floor(usable * 0.22);
-	let accounts = Math.floor(usable * 0.27);
+	let providers = Math.floor(usable * 0.18);
+	let accounts = Math.floor(usable * 0.46);
 	let details = usable - providers - accounts;
 
 	if (providers < minimumProviders) {
@@ -624,6 +789,19 @@ function formatCredentialDisplayName(credentialId: string, friendlyName: string 
 	return `${normalized} (${safeCredentialId})`;
 }
 
+function formatCloudflareIdentityRefreshMessage(
+	result: CloudflareCredentialIdentityRefreshResult,
+	displayName: string,
+): string {
+	if (result.status === "unsupported") {
+		return `Cloudflare identity unavailable for ${displayName}: ${result.message}`;
+	}
+	if (result.status === "unchanged") {
+		return `Cloudflare identity checked for ${displayName}: ${result.friendlyName ?? "saved identity"} is already saved.`;
+	}
+	return `Cloudflare identity refreshed for ${displayName}: ${result.friendlyName ?? "resolved identity"} saved.`;
+}
+
 function formatWindowDurationLabel(windowMinutes: number | null): string | null {
 	if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
 		return null;
@@ -666,6 +844,10 @@ export function resolveUsageWindowLabel(
 	snapshot: UsageSnapshot,
 	slot: "primary" | "secondary",
 ): string {
+	if (snapshot.provider === "blazeapi") {
+		return slot === "primary" ? "Daily requests" : "Premium credits";
+	}
+
 	const window = slot === "primary" ? snapshot.primary : snapshot.secondary;
 	const durationLabel = formatWindowDurationLabel(window?.windowMinutes ?? null);
 	if (!durationLabel) {
@@ -904,6 +1086,114 @@ async function addApiKeysFromModal(
 	};
 }
 
+async function addOpenAICodexImportsFromModal(
+	accountManager: AccountManager,
+	importInput: string,
+): Promise<{ message: string; credentialId: string }> {
+	const parsedResult = await parseOpenAICodexCredentialImportInput(importInput);
+	if (!parsedResult.ok) {
+		throw new Error(parsedResult.message);
+	}
+
+	const parsedInput = parsedResult.parsed;
+	const successfulAdds: Array<{ credentialId: string; isBackupCredential: boolean; credentialIds: string[] }> = [];
+	const updatedExistingCredentialIds: string[] = [];
+	const failedAdds: Array<{ ordinal: number; message: string }> = [];
+	let latestCredentialIds: string[] = [];
+	let lastTouchedCredentialId: string | null = null;
+
+	for (const [index, credential] of parsedInput.credentials.entries()) {
+		try {
+			const missingRefreshToken = credential.refresh.trim().length === 0;
+			const added = await accountManager.addOAuthCredential(
+				OPENAI_CODEX_IMPORT_PROVIDER_ID,
+				credential,
+				{
+					backgroundExclusionReason: missingRefreshToken
+						? "missing_refresh_token_on_import"
+						: undefined,
+				},
+			);
+			latestCredentialIds = added.credentialIds;
+			lastTouchedCredentialId = added.credentialId;
+
+			if (added.didAddCredential === false) {
+				updatedExistingCredentialIds.push(added.duplicateOfCredentialId ?? added.credentialId);
+				continue;
+			}
+
+			successfulAdds.push(added);
+		} catch (error: unknown) {
+			failedAdds.push({
+				ordinal: index + 1,
+				message: getErrorMessage(error),
+			});
+		}
+	}
+
+	if (successfulAdds.length === 0 && updatedExistingCredentialIds.length === 0) {
+		const firstError = failedAdds[0]?.message ?? "No OpenAI Codex credentials were imported.";
+		throw new Error(firstError);
+	}
+
+	const fallbackCredentialId =
+		successfulAdds[successfulAdds.length - 1]?.credentialId ??
+		updatedExistingCredentialIds[updatedExistingCredentialIds.length - 1] ??
+		lastTouchedCredentialId ??
+		latestCredentialIds[0] ??
+		OPENAI_CODEX_IMPORT_PROVIDER_ID;
+	const totalCredentials = latestCredentialIds.length;
+	const importedCount = successfulAdds.length;
+	const updatedCount = updatedExistingCredentialIds.length;
+	const summaryParts: string[] = [];
+	if (importedCount > 0) {
+		summaryParts.push(
+			importedCount === 1
+				? `Imported OpenAI Codex credential ${successfulAdds[0]?.credentialId}.`
+				: `Imported ${importedCount} OpenAI Codex credentials: ${successfulAdds.map((result) => result.credentialId).join(", ")}.`,
+		);
+	}
+	if (updatedCount > 0) {
+		summaryParts.push(
+			`Updated ${updatedCount} existing OpenAI Codex credential${updatedCount === 1 ? "" : "s"}: ${updatedExistingCredentialIds.join(", ")}.`,
+		);
+	}
+	summaryParts.push(`Total credentials: ${totalCredentials}`);
+
+	const detailParts: string[] = [];
+	if (parsedInput.duplicateCount > 0) {
+		detailParts.push(
+			`Skipped ${parsedInput.duplicateCount} duplicate import record${parsedInput.duplicateCount === 1 ? "" : "s"}.`,
+		);
+	}
+	if (parsedInput.invalidRecordCount > 0) {
+		const firstInvalid = parsedInput.invalidRecordMessages[0];
+		detailParts.push(
+			firstInvalid
+				? `Skipped ${parsedInput.invalidRecordCount} invalid import record${parsedInput.invalidRecordCount === 1 ? "" : "s"}. First issue: ${firstInvalid}`
+				: `Skipped ${parsedInput.invalidRecordCount} invalid import record${parsedInput.invalidRecordCount === 1 ? "" : "s"}.`,
+		);
+	}
+	if (parsedInput.ignoredLineCount > 0) {
+		detailParts.push(
+			`Ignored ${parsedInput.ignoredLineCount} empty/fence line${parsedInput.ignoredLineCount === 1 ? "" : "s"}.`,
+		);
+	}
+	if (failedAdds.length > 0) {
+		const failedOrdinals = failedAdds.map((entry) => `#${entry.ordinal}`).join(", ");
+		detailParts.push(
+			`Failed to import ${failedAdds.length} credential${failedAdds.length === 1 ? "" : "s"} (${failedOrdinals}).`,
+		);
+	}
+
+	return {
+		message: detailParts.length > 0
+			? `${summaryParts.join(" ")} ${detailParts.join(" ")}`
+			: summaryParts.join(" "),
+		credentialId: fallbackCredentialId,
+	};
+}
+
 function createEmptyProviderStatus(provider: SupportedProviderId): ProviderStatus {
 	return {
 		provider,
@@ -959,7 +1249,9 @@ export function hydrateStatusWithCachedUsage(
 async function loadAllProviderStatuses(accountManager: AccountManager): Promise<ProviderStatus[]> {
 	const providers = await accountManager.getSupportedProviders();
 	const settled = await Promise.allSettled(
-		providers.map(async (provider) => accountManager.getProviderStatus(provider)),
+		providers.map(async (provider) => accountManager.getProviderStatus(provider, {
+			allowExternalIdentityLookups: false,
+		})),
 	);
 
 	return settled.map((result, index) => {
@@ -969,6 +1261,33 @@ async function loadAllProviderStatuses(accountManager: AccountManager): Promise<
 		}
 		return createEmptyProviderStatus(provider);
 	});
+}
+
+const FRAME_BORDER_ROWS = 2;
+const THREE_PANE_CHROME_ROWS = 3;
+
+export function resolveMultiAuthOverlayOptions(
+	terminal?: { terminalColumns?: number | null; terminalRows?: number | null },
+): ModalOverlayOptions {
+	return resolveResponsiveOverlayOptions({
+		...terminal,
+		minimumWidth: 48,
+		minimumHeight: 14,
+		widthRatio: 0.98,
+		heightRatio: 0.92,
+	});
+}
+
+function resolveMultiAuthRuntimeOverlayOptions(): OverlayOptions {
+	return resolveResponsiveOverlayRuntimeOptions({
+		minimumWidth: 48,
+		widthRatio: 0.98,
+		heightRatio: 0.92,
+	});
+}
+
+export function resolveMultiAuthContentRows(overlayOptions: Pick<ModalOverlayOptions, "maxHeight">): number {
+	return Math.max(1, overlayOptions.maxHeight - FRAME_BORDER_ROWS);
 }
 
 class MultiAuthManagerModal {
@@ -982,7 +1301,6 @@ class MultiAuthManagerModal {
 	private busyMessage: string | null = null;
 	private infoMessage: string | null = null;
 	private isBusy = false;
-	private usageRefreshEpoch = 0;
 	private readonly hiddenProviders: Set<SupportedProviderId>;
 	private showHiddenProviders = false;
 	private showDisabledAccounts = false;
@@ -995,13 +1313,41 @@ class MultiAuthManagerModal {
 		private readonly done: () => void,
 		private readonly requestRender: () => void,
 		private readonly modalVisibility: ModalVisibilityController,
+		private readonly resolveMaxContentRows: () => number | null,
 		initialStatuses: ProviderStatus[],
 		initialHiddenProviders: SupportedProviderId[],
 	) {
 		this.statuses = initialStatuses;
 		this.hiddenProviders = new Set(initialHiddenProviders);
 		this.syncSelectionState(this.statuses[0]?.provider);
-		void this.refreshUsageSnapshots();
+		if (this.statuses.length === 0) {
+			this.isBusy = true;
+			this.busyMessage = "Loading provider statuses...";
+			void this.loadInitialState();
+		}
+	}
+
+	private async loadInitialState(): Promise<void> {
+		try {
+			const [statuses, hiddenProviders] = await Promise.all([
+				loadAllProviderStatuses(this.accountManager),
+				this.accountManager.getHiddenProviders(),
+			]);
+			this.statuses = statuses;
+			this.hiddenProviders.clear();
+			for (const provider of hiddenProviders) {
+				this.hiddenProviders.add(provider);
+			}
+			this.syncSelectionState(this.statuses[0]?.provider);
+			this.infoMessage = "Provider statuses loaded.";
+		} catch (error: unknown) {
+			this.infoMessage = `Failed to load provider statuses: ${getErrorMessage(error)}`;
+			this.ctx.ui.notify(this.infoMessage, "error");
+		} finally {
+			this.isBusy = false;
+			this.busyMessage = null;
+			this.requestRender();
+		}
 	}
 
 	private getProviderVisibilitySummary(): ProviderVisibilitySummary<ProviderStatus> {
@@ -1012,6 +1358,46 @@ class MultiAuthManagerModal {
 		return this.statuses.some((status) =>
 			status.credentials.some((credential) => Boolean(credential.disabledError)),
 		);
+	}
+
+	private getDuplicateAccountIndicators(status: ProviderStatus): Map<string, DuplicateAccountIndicator> {
+		const groups = new Map<string, DuplicateAccountIndicator>();
+		for (const credential of status.credentials) {
+			const email = normalizeDuplicateEmailKey(credential.identityEmail);
+			let planType = credential.usageSnapshot?.planType;
+			let planKey = normalizeDuplicatePlanKey(status.provider, planType);
+			if (!planKey && credential.identityPlanType) {
+				planType = credential.identityPlanType;
+				planKey = normalizeDuplicatePlanKey(status.provider, planType);
+			}
+			if (!email || !planKey) {
+				continue;
+			}
+
+			const groupKey = `${email}\u0000${planKey}`;
+			const group = groups.get(groupKey);
+			if (group) {
+				group.credentialIds.push(credential.credentialId);
+				continue;
+			}
+
+			groups.set(groupKey, {
+				email,
+				planLabel: normalizePlanLabel(planType),
+				credentialIds: [credential.credentialId],
+			});
+		}
+
+		const indicators = new Map<string, DuplicateAccountIndicator>();
+		for (const group of groups.values()) {
+			if (group.credentialIds.length <= 1) {
+				continue;
+			}
+			for (const credentialId of group.credentialIds) {
+				indicators.set(credentialId, group);
+			}
+		}
+		return indicators;
 	}
 
 	private resolveNoProviderSelectedLines(): string[] {
@@ -1045,13 +1431,15 @@ class MultiAuthManagerModal {
 		const runtimeStatus = this.busyMessage ?? this.infoMessage ?? `Focused pane: ${focusedPaneLabel}.`;
 		const statusLines = this.buildStatusLines(runtimeStatus, safeWidth);
 		const footerLines = this.buildFooterLines(safeWidth);
+		const dashboardChromeRows = safeWidth >= THREE_PANE_MIN_WIDTH ? THREE_PANE_CHROME_ROWS : 0;
 		const reservedRows =
-			statusLines.length + footerLines.length + 5 + MODAL_TITLE_BOTTOM_MARGIN_ROWS;
+			statusLines.length + footerLines.length + dashboardChromeRows + 3 + MODAL_TITLE_BOTTOM_MARGIN_ROWS;
 		const bodyRowCount = resolveBodyRowBudget({
 			defaultRows: GRID_BODY_ROW_COUNT,
-			terminalRows: resolveTerminalRows(),
+			terminalRows: this.resolveMaxContentRows(),
 			reservedRows,
 			minimumRows: MIN_BODY_ROW_COUNT,
+			fitAvailableRows: true,
 		});
 		const dashboardRows = this.renderDashboardRows(safeWidth, bodyRowCount);
 
@@ -1243,7 +1631,7 @@ class MultiAuthManagerModal {
 		const selectedAccountLineIndex = selectedProviderStatus
 			? this.getSelectedAccountLineIndex(selectedProviderStatus, widths.accounts)
 			: 0;
-		const visibleBodyRowCount = Math.max(MIN_BODY_ROW_COUNT, bodyRowCount);
+		const visibleBodyRowCount = Math.max(0, bodyRowCount);
 		const visibleAccountLines = getScrollableWindow(
 			accountLines,
 			selectedAccountLineIndex,
@@ -1340,7 +1728,7 @@ class MultiAuthManagerModal {
 			rows.push(line);
 		}
 
-		return clampRenderedRows(rows, Math.max(MIN_BODY_ROW_COUNT, bodyRowCount));
+		return clampRenderedRows(rows, bodyRowCount);
 	}
 
 	private buildProvidersPaneLines(columnWidth: number): string[] {
@@ -1385,55 +1773,23 @@ class MultiAuthManagerModal {
 		contentWidth: number,
 		isSelected: boolean,
 		isMarked: boolean,
+		duplicateIndicator?: DuplicateAccountIndicator,
 	): string[] {
-		const columnWidths = resolveAccountColumnWidths(contentWidth);
-		if (!columnWidths) {
-			return this.buildCompactAccountEntryLines(credential, contentWidth, isSelected, isMarked);
+		const lines = renderAccountEntryLines({
+			credential,
+			contentWidth,
+			isSelected,
+			isMarked,
+			statusCell: this.getAccountStatusCell(credential, duplicateIndicator),
+			formatPlanText: (text, planType) => this.colorizePlanText(text, planType),
+			singleLine: true,
+		});
+
+		if (!credential.disabledError) {
+			return lines;
 		}
 
-		const cursor = isSelected ? "▶" : " ";
-		const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
-		const statusCell = this.getAccountStatusCell(credential);
-		const alias = this.colorizePlanText(
-			padRight(getCredentialAlias(credential), columnWidths.alias),
-			resolveCredentialPlanLabel(credential),
-		);
-		const accountLines = wrapAccountDisplayNameLines(
-			getCredentialAccountLabel(credential),
-			columnWidths.account,
-		);
-		const firstPrefix = `${cursor} ${activeMarker} ${statusCell} `;
-		const continuationPrefix = `${" ".repeat(ACCOUNT_ROW_PREFIX_WIDTH + columnWidths.alias)} `;
-		return accountLines.map((accountLine, lineIndex) => {
-			if (lineIndex === 0) {
-				const accountSuffix = accountLine ? ` ${accountLine}` : "";
-				return padRight(`${firstPrefix}${alias}${accountSuffix}`, contentWidth);
-			}
-			return padRight(`${continuationPrefix}${accountLine}`, contentWidth);
-		});
-	}
-
-	private buildCompactAccountEntryLines(
-		credential: CredentialStatus,
-		contentWidth: number,
-		isSelected: boolean,
-		isMarked: boolean,
-	): string[] {
-		const cursor = isSelected ? "▶" : " ";
-		const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
-		const statusCell = this.getAccountStatusCell(credential);
-		const alias = this.colorizePlanText(getCredentialAlias(credential), resolveCredentialPlanLabel(credential));
-		const prefix = `${cursor} ${activeMarker} ${statusCell} ${alias}`;
-		const accountWidth = Math.max(1, contentWidth - visibleWidth(prefix) - 1);
-		const accountLines = wrapAccountDisplayNameLines(getCredentialAccountLabel(credential), accountWidth);
-		const continuationPrefix = " ".repeat(visibleWidth(prefix) + 1);
-		return accountLines.map((accountLine, lineIndex) => {
-			if (lineIndex === 0) {
-				const accountSuffix = accountLine ? ` ${accountLine}` : "";
-				return padRight(`${prefix}${accountSuffix}`, contentWidth);
-			}
-			return padRight(`${continuationPrefix}${accountLine}`, contentWidth);
-		});
+		return lines.map((line) => this.theme.fg("error", line));
 	}
 
 	private buildAccountsPaneLines(status: ProviderStatus | null, columnWidth: number): string[] {
@@ -1445,6 +1801,7 @@ class MultiAuthManagerModal {
 		const selectedCredentialIds = new Set(this.getBatchSelectedCredentialIds(status));
 		const contentWidth = Math.max(1, getPaneContentWidth(columnWidth));
 		const selectedEntryIndex = this.getSelectedEntryIndex(status);
+		const duplicateIndicators = this.getDuplicateAccountIndicators(status);
 		const lines: string[] = [];
 		if (
 			visibleCredentials.length === 0 &&
@@ -1464,6 +1821,7 @@ class MultiAuthManagerModal {
 					contentWidth,
 					index === selectedEntryIndex,
 					selectedCredentialIds.has(credential.credentialId),
+					duplicateIndicators.get(credential.credentialId),
 				),
 			);
 		}
@@ -1527,8 +1885,11 @@ class MultiAuthManagerModal {
 			const selectedForDeletion = this.getBatchSelectedCredentialIds(status);
 			const hasVisibleAccounts = visibleCredentials.length > 0;
 			const capabilities = this.accountManager.getProviderCapabilities(status.provider);
+			const supportsImport = providerSupportsCredentialImport(status.provider);
 			const addHint = capabilities.supportsOAuth
-				? "Add backup via API key or OAuth login."
+				? supportsImport
+					? "Add backup via API key, OAuth login, or OmniOnboard/CPA/Sub2API JSON/CSV/ZIP import."
+					: "Add backup via API key or OAuth login."
 				: "Add backup via API key (batch mode opens a multiline editor; one key per line).";
 			const lines = [
 				`Provider: ${formatProviderLabel(status.provider)}`,
@@ -1557,6 +1918,7 @@ class MultiAuthManagerModal {
 		}
 
 		const selectedCredential = selectedEntry.credential;
+		const duplicateIndicator = this.getDuplicateAccountIndicators(status).get(selectedCredential.credentialId);
 		const batchSelectionCount = this.getBatchSelectedCredentialIds(status).length;
 		const state = this.getCredentialState(selectedCredential);
 		const planType =
@@ -1569,6 +1931,18 @@ class MultiAuthManagerModal {
 		const selectionMode = selectedCredential.isManualActive
 			? "Manual active (persists across sessions/restarts)"
 			: "Automatic";
+		const duplicatePeerCount = duplicateIndicator
+			? duplicateIndicator.credentialIds.length - 1
+			: 0;
+		const duplicateDetailLine = duplicateIndicator
+			? `Duplicate: ${this.theme.fg(
+				"warning",
+				[
+					`Same email+plan as ${duplicatePeerCount} other account${duplicatePeerCount === 1 ? "" : "s"}`,
+					`(${duplicateIndicator.email}, ${duplicateIndicator.planLabel})`,
+				].join(" "),
+			)}`
+			: null;
 		const detailLines: string[] = [
 			`Name:      ${formatCredentialDisplayName(selectedCredential.credentialId, selectedCredential.friendlyName)}`,
 			`ID:        ${selectedCredential.credentialId}`,
@@ -1579,7 +1953,8 @@ class MultiAuthManagerModal {
 			`Selection: ${selectionMode}`,
 			`Marked:    ${this.isCredentialBatchSelected(status.provider, selectedCredential.credentialId) ? "Batch delete queue" : "No"}`,
 			`Rotation:  ${formatRotationModeLabel(status.rotationMode)}`,
-			`Usage:     ${selectedCredential.usageCount} requests`,
+			`Usage:     ${selectedCredential.usageCount} usage units`,
+			...(duplicateDetailLine ? [duplicateDetailLine] : []),
 		];
 		if (hasUsageApi) {
 			detailLines.push(
@@ -1669,7 +2044,7 @@ class MultiAuthManagerModal {
 			if (credential.usageFetchError) {
 				return buildUsageUnavailableLines(credential.usageFetchError, detailWidth);
 			}
-			return ["Loading usage data..."];
+			return buildMissingUsageDetailLines(detailWidth);
 		}
 
 		const barWidth = clamp(Math.floor(detailWidth * 0.45), 10, 26);
@@ -1719,6 +2094,9 @@ class MultiAuthManagerModal {
 			}
 			lines.push(resolveUsageWindowLabel(snapshot, "secondary"));
 			lines.push(renderProgressBar(snapshot.secondary.usedPercent, barWidth));
+			if (snapshot.provider === "blazeapi" && snapshot.credits?.balance) {
+				lines.push(snapshot.credits.balance);
+			}
 			const reset = formatResetCountdown(snapshot.secondary.resetsAt);
 			if (reset !== "n/a") {
 				lines.push(`Resets in ${reset}`);
@@ -1734,12 +2112,21 @@ class MultiAuthManagerModal {
 		return this.theme.fg(getPlanHighlightColor(planType), text);
 	}
 
-	private getAccountStatusCell(credential: CredentialStatus): string {
+	private getAccountStatusCell(
+		credential: CredentialStatus,
+		duplicateIndicator?: DuplicateAccountIndicator,
+	): string {
 		const state = this.getCredentialState(credential);
-		return state.label === "Ready" || state.label === "Active" || state.label === "Manual"
+		const statusCell = state.label === "Ready" || state.label === "Active" || state.label === "Manual"
 			? "[●]"
 			: "[○]";
+		if (!duplicateIndicator) {
+			return statusCell;
+		}
+		return `${statusCell} ${this.theme.fg("warning", "[DUP]")}`;
 	}
+
+	private static readonly EXHAUSTED_QUOTA_ERROR_THRESHOLD = 5;
 
 	private getCredentialState(credential: CredentialStatus): { symbol: string; label: string } {
 		const now = Date.now();
@@ -1758,6 +2145,18 @@ class MultiAuthManagerModal {
 		if (
 			typeof credential.quotaExhaustedUntil === "number" &&
 			credential.quotaExhaustedUntil > now
+		) {
+			return { symbol: "◌", label: "Exhaust" };
+		}
+		// Detect dead credentials that accumulated repeated quota errors
+		// and never recovered (e.g. prepaid credits permanently depleted).
+		// lastQuotaError is cleared on success, so if it's still set the
+		// last operation failed with a quota/rate-limit error.
+		if (
+			typeof credential.quotaErrorCount === "number" &&
+			credential.quotaErrorCount >= MultiAuthManagerModal.EXHAUSTED_QUOTA_ERROR_THRESHOLD &&
+			typeof credential.lastQuotaError === "string" &&
+			credential.lastQuotaError.length > 0
 		) {
 			return { symbol: "◌", label: "Exhaust" };
 		}
@@ -2055,6 +2454,9 @@ class MultiAuthManagerModal {
 		if (capabilities.supportsOAuth) {
 			methods.push({ label: "OAuth login", value: "oauth" });
 		}
+		if (providerSupportsCredentialImport(provider)) {
+			methods.push({ label: "Import OmniOnboard/CPA/Sub2API JSON/CSV/ZIP", value: "import" });
+		}
 		if (methods.length === 1) {
 			return methods[0]?.value ?? null;
 		}
@@ -2067,9 +2469,13 @@ class MultiAuthManagerModal {
 		const selectedMethod = await this.selectAddMethod("Add provider", [
 			{ label: "Use API key", value: "api_key" },
 			{ label: "Use OAuth login", value: "oauth" },
+			{ label: "Import OmniOnboard/CPA/Sub2API JSON/CSV/ZIP", value: "import" },
 		]);
 		if (!selectedMethod) {
 			return null;
+		}
+		if (selectedMethod === "import") {
+			return { provider: OPENAI_CODEX_IMPORT_PROVIDER_ID, method: selectedMethod };
 		}
 		if (selectedMethod === "oauth") {
 			const provider = await this.promptForOAuthProviderSelection(selectedProvider);
@@ -2206,12 +2612,16 @@ class MultiAuthManagerModal {
 		provider: SupportedProviderId,
 		method: AddProviderMethod,
 	): Promise<string> {
-		const result =
-			method === "oauth"
-				? await loginProviderFromModal(this.ctx, this.accountManager, provider)
+		const result = method === "oauth"
+			? await loginProviderFromModal(this.ctx, this.accountManager, provider)
+			: method === "import"
+				? await this.addOpenAICodexImportCredentialsForProvider(provider)
 				: await this.addApiKeyCredentialForProvider(provider);
 		if (!result) {
-			return "API key add cancelled.";
+			if (method === "import") {
+				return "Import cancelled.";
+			}
+			return method === "oauth" ? "OAuth login cancelled." : "API key add cancelled.";
 		}
 		await this.reloadStatuses({
 			provider,
@@ -2236,6 +2646,21 @@ class MultiAuthManagerModal {
 			return null;
 		}
 		return addApiKeysFromModal(this.accountManager, provider, apiKeyInput, supportsBatchAdd);
+	}
+
+	private async addOpenAICodexImportCredentialsForProvider(
+		provider: SupportedProviderId,
+	): Promise<{ message: string; credentialId: string } | null> {
+		if (!providerSupportsCredentialImport(provider)) {
+			throw new Error("Credential import is only supported for openai-codex.");
+		}
+		const importInput = await this.ctx.ui.editor(
+			"Paste OpenAI Codex OmniOnboard/CPA/Sub2API JSON/CSV, or a path to a .zip export.",
+		);
+		if (!importInput) {
+			return null;
+		}
+		return addOpenAICodexImportsFromModal(this.accountManager, importInput);
 	}
 
 	private renameSelectedAccount(): void {
@@ -2353,10 +2778,7 @@ class MultiAuthManagerModal {
 		const deletionLabels = deletion.credentialIds.map(
 			(credentialId) => credentialLabelById.get(credentialId) ?? credentialId,
 		);
-		const previewLines = deletionLabels.slice(0, 5).map((label) => `- ${label}`);
-		if (deletionLabels.length > previewLines.length) {
-			previewLines.push(`- …and ${deletionLabels.length - previewLines.length} more`);
-		}
+		const previewLines = deletionLabels.map((label) => `- ${label}`);
 		const busyMessage =
 			deletion.credentialIds.length === 1
 				? `Deleting ${deletion.credentialIds[0]}...`
@@ -2412,12 +2834,17 @@ class MultiAuthManagerModal {
 		);
 
 		const isApiKeyCredential = selectedEntry.credential.credentialType === "api_key";
+		const isCloudflareApiKeyCredential = isApiKeyCredential && isCloudflareWorkersAiProvider(status.provider);
 		const hasUsageApi = this.accountManager.hasUsageProvider(status.provider);
 		this.runAction(
 			isApiKeyCredential
-				? hasUsageApi
-					? `Refreshing usage state for ${selectedEntry.credential.credentialId}...`
-					: `Checking ${selectedEntry.credential.credentialId}...`
+				? isCloudflareApiKeyCredential
+					? hasUsageApi
+						? `Refreshing identity and usage state for ${selectedEntry.credential.credentialId}...`
+						: `Refreshing Cloudflare identity for ${selectedEntry.credential.credentialId}...`
+					: hasUsageApi
+						? `Refreshing usage state for ${selectedEntry.credential.credentialId}...`
+						: `Checking ${selectedEntry.credential.credentialId}...`
 				: `Refreshing token for ${selectedEntry.credential.credentialId}...`,
 			async () => {
 				const refreshResult = !isApiKeyCredential
@@ -2425,6 +2852,12 @@ class MultiAuthManagerModal {
 							status.provider,
 							selectedEntry.credential.credentialId,
 						)
+					: null;
+				const cloudflareIdentityRefresh = isCloudflareApiKeyCredential
+					? await this.accountManager.refreshCloudflareCredentialIdentity(
+						status.provider,
+						selectedEntry.credential.credentialId,
+					)
 					: null;
 				const usage = hasUsageApi
 					? await this.accountManager.getCredentialUsageSnapshot(
@@ -2439,17 +2872,29 @@ class MultiAuthManagerModal {
 				await this.reloadStatuses(preserveSelection);
 				if (usage?.error) {
 					if (isApiKeyCredential) {
-						return `Credential checked for ${displayName}. Usage warning: ${usage.error}.`;
+						const checkedMessage = cloudflareIdentityRefresh
+							? formatCloudflareIdentityRefreshMessage(cloudflareIdentityRefresh, displayName)
+							: `Credential checked for ${displayName}.`;
+						return `${checkedMessage} Usage warning: ${usage.error}.`;
 					}
-					return refreshResult?.disposition === "preserved_active_token"
-						? `Refresh endpoint failed for ${displayName}, but the current token is still active. Usage warning: ${usage.error}.`
-						: `Token refreshed for ${displayName}. Usage warning: ${usage.error}.`;
+					if (refreshResult?.disposition === "preserved_active_token") {
+						return `Refresh endpoint failed for ${displayName}, but the current token is still active. Usage warning: ${usage.error}.`;
+					}
+					if (refreshResult?.disposition === "skipped_missing_refresh_token") {
+						return `Token refresh skipped for ${displayName} because it was imported without a refresh token. Usage warning: ${usage.error}.`;
+					}
+					return `Token refreshed for ${displayName}. Usage warning: ${usage.error}.`;
 				}
 				if (isApiKeyCredential) {
-					return `Credential checked for ${displayName}.`;
+					return cloudflareIdentityRefresh
+						? formatCloudflareIdentityRefreshMessage(cloudflareIdentityRefresh, displayName)
+						: `Credential checked for ${displayName}.`;
 				}
-				return refreshResult?.disposition === "preserved_active_token"
-					? `Refresh endpoint failed for ${displayName}, but the current token is still active and will continue to be used.`
+				if (refreshResult?.disposition === "preserved_active_token") {
+					return `Refresh endpoint failed for ${displayName}, but the current token is still active and will continue to be used.`;
+				}
+				return refreshResult?.disposition === "skipped_missing_refresh_token"
+					? `Token refresh skipped for ${displayName} because it was imported without a refresh token; current access token will continue to be used.`
 					: `Token refreshed for ${displayName}.`;
 			},
 		);
@@ -2539,158 +2984,6 @@ class MultiAuthManagerModal {
 			});
 	}
 
-	private async refreshUsageSnapshots(): Promise<void> {
-		const refreshEpoch = ++this.usageRefreshEpoch;
-		const preserveSelection = this.getCurrentSelectionAnchor();
-		const usageByCredentialKey = new Map<string, CredentialUsageDisplayState>();
-		const credentials = this.statuses.flatMap((status) =>
-			this.accountManager.hasUsageProvider(status.provider)
-				? status.credentials.map((credential) => ({
-					provider: status.provider,
-					credentialId: credential.credentialId,
-				}))
-				: [],
-		);
-		const refreshCandidateWindows = this.accountManager.selectUsageRefreshCandidateWindows(
-			credentials,
-			"modal-refresh",
-		);
-
-		const applyUsageState = (
-			provider: SupportedProviderId,
-			credentialId: string,
-			usageState: CredentialUsageDisplayState,
-		): void => {
-			usageByCredentialKey.set(this.getCredentialMapKey(provider, credentialId), usageState);
-			if (refreshEpoch !== this.usageRefreshEpoch) {
-				return;
-			}
-			this.setCredentialUsageState(provider, credentialId, usageState);
-		};
-
-		for (const { provider, credentialId } of credentials) {
-			const usage = this.accountManager.getCachedCredentialUsageDisplaySnapshot(provider, credentialId);
-			if (!usage) {
-				continue;
-			}
-			applyUsageState(provider, credentialId, {
-				usageSnapshot: usage.snapshot,
-				usageFetchError: usage.error ?? undefined,
-				usageSnapshotDisplayOnly: usage.displayOnly,
-			});
-		}
-		if (refreshEpoch !== this.usageRefreshEpoch) {
-			return;
-		}
-
-		for (const refreshCandidates of refreshCandidateWindows) {
-			const freshTasks = refreshCandidates.map(async ({ provider, credentialId }) => {
-				const credentialKey = this.getCredentialMapKey(provider, credentialId);
-				try {
-					const usage = await this.accountManager.getCredentialUsageSnapshot(provider, credentialId, {
-						forceRefresh: true,
-						coordinationOperation: "modal-refresh",
-					});
-					const previousUsageState = usageByCredentialKey.get(credentialKey);
-					const hasFreshSnapshot = usage.snapshot !== null;
-					applyUsageState(provider, credentialId, {
-						usageSnapshot: usage.snapshot ?? previousUsageState?.usageSnapshot ?? null,
-						usageFetchError: usage.error ?? previousUsageState?.usageFetchError,
-						usageSnapshotDisplayOnly: hasFreshSnapshot
-							? usage.displayOnly
-							: previousUsageState?.usageSnapshotDisplayOnly,
-					});
-				} catch (error: unknown) {
-					const previousUsageState = usageByCredentialKey.get(credentialKey);
-					applyUsageState(provider, credentialId, {
-						usageSnapshot: previousUsageState?.usageSnapshot ?? null,
-						usageFetchError: `Usage unavailable (${getErrorMessage(error)})`,
-						usageSnapshotDisplayOnly: previousUsageState?.usageSnapshotDisplayOnly,
-					});
-				}
-			});
-
-			await Promise.allSettled(freshTasks);
-			if (refreshEpoch !== this.usageRefreshEpoch) {
-				return;
-			}
-		}
-
-		const latestStatuses = await loadAllProviderStatuses(this.accountManager);
-		if (refreshEpoch !== this.usageRefreshEpoch) {
-			return;
-		}
-
-		this.statuses = this.mergeStatusesWithUsage(latestStatuses, usageByCredentialKey);
-		this.syncSelectionState(preserveSelection?.provider);
-		this.restoreSelection(preserveSelection ?? null);
-		this.requestRender();
-	}
-
-	private setCredentialUsageState(
-		provider: SupportedProviderId,
-		credentialId: string,
-		usageState: CredentialUsageDisplayState,
-	): void {
-		let updated = false;
-		this.statuses = this.statuses.map((status) => {
-			if (status.provider !== provider) {
-				return status;
-			}
-
-			let credentialUpdated = false;
-			const nextCredentials = status.credentials.map((credential) => {
-				if (credential.credentialId !== credentialId) {
-					return credential;
-				}
-				credentialUpdated = true;
-				return {
-					...credential,
-					usageSnapshot: usageState.usageSnapshot,
-					usageSnapshotDisplayOnly: usageState.usageSnapshotDisplayOnly,
-					usageFetchError: usageState.usageFetchError,
-				};
-			});
-
-			if (!credentialUpdated) {
-				return status;
-			}
-
-			updated = true;
-			return {
-				...status,
-				credentials: nextCredentials,
-			};
-		});
-
-		if (updated) {
-			this.requestRender();
-		}
-	}
-
-	private mergeStatusesWithUsage(
-		statuses: ProviderStatus[],
-		usageByCredentialKey: Map<string, CredentialUsageDisplayState>,
-	): ProviderStatus[] {
-		return statuses.map((status) => ({
-			...status,
-			credentials: status.credentials.map((credential) => {
-				const usageState = usageByCredentialKey.get(
-					this.getCredentialMapKey(status.provider, credential.credentialId),
-				);
-				if (!usageState) {
-					return credential;
-				}
-				return {
-					...credential,
-					usageSnapshot: usageState.usageSnapshot,
-					usageSnapshotDisplayOnly: usageState.usageSnapshotDisplayOnly,
-					usageFetchError: usageState.usageFetchError,
-				};
-			}),
-		}));
-	}
-
 	private async reloadStatuses(preserveSelection?: SelectionAnchor): Promise<void> {
 		const preferredProvider = preserveSelection?.provider ?? this.getSelectedProviderStatus()?.provider;
 		this.statuses = await loadAllProviderStatuses(this.accountManager);
@@ -2708,7 +3001,6 @@ class MultiAuthManagerModal {
 			}
 		}
 		this.requestRender();
-		void this.refreshUsageSnapshots();
 	}
 
 	private getDisplayedStatuses(): readonly ProviderStatus[] {
@@ -2788,17 +3080,24 @@ class MultiAuthManagerModal {
 		}
 
 		const displayedProviders = new Set(displayedStatuses.map((status) => status.provider));
+		const shouldSyncProviderCursor = this.selectedProviderPaneIndex < displayedStatuses.length;
 		if (preferredProvider && displayedProviders.has(preferredProvider)) {
 			this.selectedProviderId = preferredProvider;
-		} else if (!(this.selectedProviderId && displayedProviders.has(this.selectedProviderId))) {
-			this.selectedProviderId = displayedStatuses[0]?.provider ?? null;
+		} else if (this.selectedProviderId && displayedProviders.has(this.selectedProviderId)) {
+			// Keep the current provider anchor when filters or reloads still display it.
+		} else if (shouldSyncProviderCursor) {
+			this.selectedProviderId = displayedStatuses[this.selectedProviderPaneIndex]?.provider ?? null;
+		} else {
+			this.selectedProviderId = displayedStatuses[displayedStatuses.length - 1]?.provider ?? null;
 		}
 
-		if (this.selectedProviderPaneIndex < displayedStatuses.length) {
+		if (shouldSyncProviderCursor) {
 			const selectedProviderIndex = displayedStatuses.findIndex(
 				(status) => status.provider === this.selectedProviderId,
 			);
-			this.selectedProviderPaneIndex = selectedProviderIndex >= 0 ? selectedProviderIndex : 0;
+			this.selectedProviderPaneIndex = selectedProviderIndex >= 0
+				? selectedProviderIndex
+				: this.selectedProviderPaneIndex;
 		}
 	}
 
@@ -2976,25 +3275,14 @@ class MultiAuthManagerModal {
 		return this.getVisibleCredentials(status).length + 1;
 	}
 
-	private getCredentialMapKey(provider: SupportedProviderId, credentialId: string): string {
-		return `${provider}:${credentialId}`;
-	}
 }
 
-async function openMultiAuthModal(
+export async function openMultiAuthModal(
 	ctx: ExtensionCommandContext,
 	accountManager: AccountManager,
 ): Promise<void> {
-	const [statuses, hiddenProviders] = await Promise.all([
-		loadAllProviderStatuses(accountManager),
-		accountManager.getHiddenProviders(),
-	]);
-	const overlayOptions = {
-		anchor: "center" as const,
-		width: "96%" as const,
-		maxHeight: "96%" as const,
-		margin: 0,
-	};
+	const overlayOptions = resolveMultiAuthRuntimeOverlayOptions();
+	const resolveMaxContentRows = (): number => resolveMultiAuthContentRows(resolveMultiAuthOverlayOptions());
 	const modalVisibility = new ModalVisibilityController();
 
 	await ctx.ui.custom<void>(
@@ -3009,8 +3297,9 @@ async function openMultiAuthModal(
 				},
 				() => tui.requestRender(),
 				modalVisibility,
-				statuses,
-				hiddenProviders,
+				resolveMaxContentRows,
+				[],
+				[],
 			);
 
 			return {

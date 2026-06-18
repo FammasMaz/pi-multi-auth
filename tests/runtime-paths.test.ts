@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthWriter } from "../src/auth-writer.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
+import {
+	getAgentRuntimeRoot,
+	PI_DELEGATED_AUTH_RUNTIME_DIR_ENV,
+	PI_MULTI_AUTH_RUNTIME_DIR_ENV,
+	resolveAgentRuntimePath,
+} from "../src/runtime-paths.js";
 import { MultiAuthStorage } from "../src/storage.js";
 
 async function withEnv<T>(
@@ -35,7 +41,7 @@ async function withEnv<T>(
 	}
 }
 
-test("pi-multi-auth uses PI_MULTI_AUTH_RUNTIME_DIR for delegated runtime state", async () => {
+test("pi-multi-auth uses PI_DELEGATED_AUTH_RUNTIME_DIR for delegated runtime state", async () => {
 	const tmpHome = mkdtempSync(join(tmpdir(), "pi-multi-auth-home-"));
 	const runtimeRoot = mkdtempSync(join(tmpdir(), "pi-multi-auth-runtime-"));
 	const runtimeModelsPath = join(runtimeRoot, "models.json");
@@ -65,7 +71,8 @@ test("pi-multi-auth uses PI_MULTI_AUTH_RUNTIME_DIR for delegated runtime state",
 			HOME: tmpHome,
 			USERPROFILE: tmpHome,
 			PI_CODING_AGENT_DIR: runtimeRoot,
-			PI_MULTI_AUTH_RUNTIME_DIR: runtimeRoot,
+			PI_DELEGATED_AUTH_RUNTIME_DIR: runtimeRoot,
+			PI_MULTI_AUTH_RUNTIME_DIR: undefined,
 		},
 		async () => {
 			const authWriter = new AuthWriter();
@@ -89,6 +96,33 @@ test("pi-multi-auth uses PI_MULTI_AUTH_RUNTIME_DIR for delegated runtime state",
 			assert.equal(metadata?.baseUrl, "https://example.com/runtime");
 			assert.equal(metadata?.models[0]?.id, "runtime-model");
 			assert.equal(providers.includes("runtime-provider"), true);
+		},
+	);
+});
+
+test("pi-multi-auth accepts the legacy runtime dir only when the delegated env var is unset", async () => {
+	const delegatedRuntimeRoot = mkdtempSync(join(tmpdir(), "pi-multi-auth-delegated-runtime-"));
+	const legacyRuntimeRoot = mkdtempSync(join(tmpdir(), "pi-multi-auth-legacy-runtime-"));
+
+	await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: undefined,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: legacyRuntimeRoot,
+			PI_CODING_AGENT_DIR: undefined,
+		},
+		() => {
+			assert.equal(getAgentRuntimeRoot(), legacyRuntimeRoot);
+		},
+	);
+
+	await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: delegatedRuntimeRoot,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: legacyRuntimeRoot,
+			PI_CODING_AGENT_DIR: undefined,
+		},
+		() => {
+			assert.equal(getAgentRuntimeRoot(), delegatedRuntimeRoot);
 		},
 	);
 });
@@ -124,6 +158,7 @@ test("pi-multi-auth falls back to HOME-based runtime paths without isolation", a
 			HOME: tmpHome,
 			USERPROFILE: tmpHome,
 			PI_CODING_AGENT_DIR: undefined,
+			PI_DELEGATED_AUTH_RUNTIME_DIR: undefined,
 			PI_MULTI_AUTH_RUNTIME_DIR: undefined,
 		},
 		async () => {
@@ -145,4 +180,154 @@ test("pi-multi-auth falls back to HOME-based runtime paths without isolation", a
 			assert.equal(metadata?.models[0]?.id, "fallback-model");
 		},
 	);
+});
+
+test("getAgentRuntimeRoot treats whitespace-only env values as unset", async () => {
+	await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "   ",
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: undefined,
+			PI_CODING_AGENT_DIR: undefined,
+		},
+		async () => {
+			const root = getAgentRuntimeRoot();
+			// Should NOT be the whitespace value since it's all spaces
+			assert.notEqual(root, "   ");
+		},
+	);
+});
+
+test("getAgentRuntimeRoot full precedence chain with all env vars set", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "/top/priority",
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: "/middle/priority",
+			PI_CODING_AGENT_DIR: "/low/priority",
+			HOME: "/home/dir",
+			USERPROFILE: "/home/dir",
+		},
+		() => getAgentRuntimeRoot(),
+	);
+	assert.equal(result, "/top/priority");
+});
+
+test("getAgentRuntimeRoot falls back to PI_MULTI_AUTH_RUNTIME_DIR", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: undefined,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: "/legacy/runtime/dir",
+			PI_CODING_AGENT_DIR: undefined,
+		},
+		() => getAgentRuntimeRoot(),
+	);
+	assert.equal(result, "/legacy/runtime/dir");
+});
+
+test("getAgentRuntimeRoot falls back to PI_CODING_AGENT_DIR", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: undefined,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: undefined,
+			PI_CODING_AGENT_DIR: "/coding/agent/dir",
+		},
+		() => getAgentRuntimeRoot(),
+	);
+	assert.equal(result, "/coding/agent/dir");
+});
+
+test("getAgentRuntimeRoot uses USERPROFILE without HOME", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: undefined,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: undefined,
+			PI_CODING_AGENT_DIR: undefined,
+			HOME: undefined,
+			USERPROFILE: "/custom/userprofile",
+		},
+		async () => getAgentRuntimeRoot(),
+	);
+	assert.equal(result, join("/custom/userprofile", ".pi", "agent"));
+});
+
+test("resolveAgentRuntimePath handles nested segments", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "/base/path",
+		},
+		() => resolveAgentRuntimePath("subdir", "nested", "file.json"),
+	);
+	assert.equal(result, join("/base/path", "subdir", "nested", "file.json"));
+});
+
+test("resolveAgentRuntimePath handles trailing separator in env value", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "/base/path/",
+		},
+		() => resolveAgentRuntimePath("file.json"),
+	);
+	// path.join normalizes trailing separator
+	assert.equal(result, join("/base/path/", "file.json"));
+});
+
+test("resolveAgentRuntimePath handles empty segments gracefully", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "/base",
+		},
+		() => resolveAgentRuntimePath("", "file.json"),
+	);
+	assert.equal(result, join("/base", "", "file.json"));
+});
+
+test("multi-auth storage path is fixed at construction time", async () => {
+	const { join, sep } = await import("node:path");
+	const pathA = ["", "path", "a"].join(sep);
+	const pathB = ["", "path", "b"].join(sep);
+
+	await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: pathA,
+			[PI_MULTI_AUTH_RUNTIME_DIR_ENV]: undefined,
+			PI_CODING_AGENT_DIR: undefined,
+		},
+		() => {
+			const storage = new MultiAuthStorage();
+			assert.ok(
+				storage.getPath().startsWith(pathA + sep),
+				`Storage path ${storage.getPath()} should start with ${pathA + sep}`,
+			);
+
+			// Change env var after construction — should NOT affect existing instance
+			const originalPath = storage.getPath();
+			process.env[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV] = pathB;
+			try {
+				assert.equal(
+					storage.getPath(),
+					originalPath,
+					"Existing instance keeps original path after env change",
+				);
+
+				// New instance should use the updated env var
+				const storage2 = new MultiAuthStorage();
+				assert.ok(
+					storage2.getPath().startsWith(pathB + sep),
+					`New storage path ${storage2.getPath()} should start with ${pathB + sep}`,
+				);
+			} finally {
+				// Restore env var so cleanup doesn't fail
+				process.env[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV] = pathA;
+			}
+		},
+	);
+});
+
+test("resolveAgentRuntimePath returns root when no segments given", async () => {
+	const result = await withEnv(
+		{
+			[PI_DELEGATED_AUTH_RUNTIME_DIR_ENV]: "/root/path",
+		},
+		() => resolveAgentRuntimePath(),
+	);
+	assert.equal(result, join("/root/path"));
 });

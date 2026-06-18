@@ -36,6 +36,7 @@ export class AsyncBufferedLogWriter {
 	private flushPromise: Promise<void> | null = null;
 	private flushRequestedWhileBusy = false;
 	private shutdownHooksRegistered = false;
+	private shutdownFlushHandler: (() => void) | null = null;
 
 	constructor(private readonly options: AsyncBufferedLogWriterOptions) {
 		this.enabled = options.enabled;
@@ -69,6 +70,7 @@ export class AsyncBufferedLogWriter {
 
 		this.enabled = enabled;
 		if (!enabled) {
+			this.unregisterShutdownHooks();
 			this.clearBuffer();
 		}
 	}
@@ -172,9 +174,24 @@ export class AsyncBufferedLogWriter {
 		const flushSafely = (): void => {
 			void this.flush().catch(() => undefined);
 		};
-		// Only hook beforeExit. Pi owns SIGINT/SIGTERM for graceful TUI shutdown;
-		// registering signal handlers here can race with interactive-mode cleanup.
+		this.shutdownFlushHandler = flushSafely;
 		process.once("beforeExit", flushSafely);
+	}
+
+	private unregisterShutdownHooks(): void {
+		if (!this.shutdownHooksRegistered || !this.shutdownFlushHandler) {
+			return;
+		}
+
+		process.off("beforeExit", this.shutdownFlushHandler);
+		this.shutdownHooksRegistered = false;
+		this.shutdownFlushHandler = null;
+	}
+
+	async dispose(): Promise<void> {
+		this.unregisterShutdownHooks();
+		await this.flush();
+		this.clearBuffer();
 	}
 
 	private pushLine(line: string): void {

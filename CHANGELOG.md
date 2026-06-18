@@ -2,21 +2,70 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
-
-### Fixed
-- Passed through unmanaged providers that share a wrapped API, preventing multi-auth credential rotation from intercepting auth owned by other extensions such as `grok-cli`.
-
-## 0.7.1 - 2026-06-16
+## 0.10.0 - 2026-06-01
 
 ### Added
-- Added `noCooldownProviders` to skip quota and transient credential cooldowns for configured providers.
-- Added `noStreamWatchdogProviders` to disable attempt and idle stream timeouts for configured providers.
-- Added `providerStreamTimeouts` for per-provider partial overrides of global `streamTimeouts`.
+- Added delegated auth broker support with `PI_DELEGATED_AUTH_*` runtime environment variables and legacy fallback handling.
+- Added retry-budget and half-open probe controls for credential balancing, token-weighted usage accounting, and background exclusion handling for credentials missing refresh tokens.
+- Added backup recovery, atomic writes, and Windows ACL hardening for credential and state file persistence.
+- Added persistent usage cache and usage coordinator robustness improvements, import handling updates, and longer Codex usage request timeouts.
 
 ### Changed
-- Default `noCooldownProviders` and `noStreamWatchdogProviders` include `LiteLLM` so slow LiteLLM/LiteLLM-proxy streams are not cut off by multi-auth watchdogs or backoff cooldowns.
-- Stream watchdog limits are resolved per active provider on each request (including failover targets).
+- Improved provider retry behavior with jittered exponential backoff, abortable sleeps, retry-budget integration, and token-estimate-aware success recording.
+- Updated OAuth command flows for missing refresh token messaging and OmniOnboard naming.
+- Widened Pi peer dependency compatibility to include Pi 0.77.x and 0.78.x and updated development tooling.
+
+### Fixed
+- Decayed stale quota errors over time with success-streak recovery so recovered credentials can return to rotation.
+- Improved auth writer and storage recovery from partial or corrupted snapshots.
+
+### Removed
+- Removed unused carousel and quota bar formatter code.
+
+## 0.9.0 - 2026-05-26
+
+### Added
+- Added process-scoped credential leases that track which credentials are held by each running process, preventing concurrent credential reuse across parallel Pi sessions while allowing shared-lease fallback when no unleased alternatives exist.
+- Added `ProviderCredentialLeaseState` type and `credentialLeases` field on `ProviderRotationState` in `multi-auth.json` for persistent lease tracking.
+- Added automatic migration of legacy per-provider rotation modes from `multi-auth.json` to `config.json` `rotationModes` on first initialization, preserving user overrides.
+- Added exhausted-quota credential detection in the multi-auth modal that marks credentials with five or more consecutive quota errors and a lingering `lastQuotaError` as "Exhaust" instead of "Ready".
+- Added `enqueueAllCredentialUsageRefresh` for bulk usage refresh scheduling across all provider credentials.
+
+### Changed
+- Simplified `config.json` to expose only `debug`, `hiddenProviders`, and `rotationModes` configuration keys; removed `excludeProviders`, `cascade`, `health`, `historyPersistence`, `modelEntitlements`, `oauthRefresh`, and `usageCoordination` keys from the user-facing configuration surface.
+- Moved hidden-provider state from `multi-auth.json` `ui.hiddenProviders` to `config.json` `hiddenProviders` so provider visibility survives `multi-auth.json` resets.
+- Moved cascade, health, OAuth-refresh, and usage-coordination configuration to internal defaults so the extension no longer depends on user-facing configuration for subsystem tuning.
+- Updated Codex OAuth refresh lead time to five minutes to reduce last-second token refresh failures.
+- Widened Pi peer dependency ranges to `^0.74.0 || ^0.75.0` and bumped dev dependencies to `^0.75.5`.
+
+### Removed
+- Removed `src/history-storage.ts` module and `MultiAuthHistoryStore`; health and cascade history persistence is no longer user-configurable.
+- Removed `MultiAuthUiState` interface and `ui` top-level key from `MultiAuthState` in `multi-auth.json`.
+
+## 0.8.0 - 2026-05-22
+
+### Added
+- Added first-class Kimi For Coding OAuth login using device code flow with token refresh support.
+- Added first-class Qwen OAuth login using device code flow with PKCE, resource-URL base-URL discovery, and token refresh.
+- Added Kimi For Coding usage/quota provider that fetches rate-limit windows from the `/usages` endpoint with timed and untimed window classification.
+- Added BlazeAPI usage/quota provider (`src/usage/blazeapi.ts`) that fetches plan limits (`daily_requests`, `premium_daily_credits`, `rate_limit_rpm`, `expires_at`), daily request counters, and premium credit consumption from `GET /api/usage` using `Authorization: Bearer blz_*`. Translates the counters into the shared `RateLimitWindow` primary (daily requests) and secondary (premium credits) windows with a UTC-midnight reset estimate, surfaces the remaining premium credit balance via `UsageCredits`, and routes through the existing `quotaClassifier` and `usageCoordinator` pathways. Verified live against `https://blazeai.boxu.dev/api/usage`.
+- Added a backward-compatible parser fallback for the legacy `/api/account` flat usage shape (numeric `usage.today` with a sibling `usage.premium_used`) so the provider keeps working if BlazeAPI rolls back to that response format.
+- Added `blazeapi: "BlazeAPI"` to `API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES` so BlazeAPI appears in the API-key credential setup dialog with a friendly display name, and registered `blazeapiUsageProvider` in `src/usage/providers.ts`, which auto-enables `hasExternalAccountState: true` and the standard rotation profile via `provider-rotation-profile.ts`.
+- Added `tests/blazeapi-usage.test.ts` covering provider registration, Pro plan parsing against the live `/api/usage` payload shape, Free plan parsing with zero premium credits, credential-scoped `baseUrl` normalization (stripping `/v1/chat/completions` suffixes), legacy `/api/account` shape fallback, 401 token-expiration handling, and missing-plan-limit rejection.
+- Added BlazeAPI model-plan eligibility routing in `src/model-entitlements.ts`: `BlazeApiPlanType`, `normalizeBlazeApiPlanType`, `isBlazeApiPlanEligibleForPremiumModel`, and a curated set + regex patterns for premium-credit-charging models (`claude-opus-*`, `claude-sonnet-*`, `moonshotai/kimi-k2.6`, `qwen/qwen3.5-397b`, `z-ai/glm-5.1`). `modelRequiresEntitlement` now routes through BlazeAPI logic for the `blazeapi` provider so premium-charging models auto-route to `Pro`/`Premium` credentials (where `premium_daily_credits > 0`).
+- Added BlazeAPI plan-tier routing via `rankBlazeApiCredentialsByPlanTier`, `providerUsesPlanTierRanking`, and a new `preferredCredentialTiers` field on `CredentialModelEligibility`. BlazeAPI credentials are ranked Premium → Pro → Free for every model call: higher tiers receive faster server-side pool priority and are tried first; when an active tier exhausts its `daily_requests` (primary) or `premium_daily_credits` (secondary) budget, rotation automatically falls back to the next tier and finally to the catch-all eligible set. This reverses the prior conservation-oriented preference (which routed free-tier models to Free credentials) in favor of "benefit from the highest plan first, fall back as quotas exhaust."
+- Added BlazeAPI-aware `normalizeBlazeApiModelId` that preserves vendor namespaces (`moonshotai/`, `z-ai/`, `qwen/`) and only strips the leading `blazeapi/` provider prefix, so namespaced model IDs configured in `settings.json` (e.g. `blazeapi/moonshotai/kimi-k2.6`) match the entitlement catalog correctly. Fixed a latent bug where `resolveCredentialModelEligibility` was passing the codex-normalized (namespace-stripped) model id to entitlement helpers, which prevented BlazeAPI namespaced premium models from triggering entitlement filtering at runtime.
+- Added a BlazeAPI-specific failure message in `resolveCredentialModelEligibility` when no `Pro`/`Premium` credential is available: *“No BlazeAPI credentials with premium daily credits available for … Upgrade to BlazeAPI Pro or Premium, or add a Pro/Premium credential to call premium-charging models.”*
+- Added a generalized multi-pass selection loop in `AccountManager.acquireCredential` that consumes `preferredCredentialTiers` when present: each non-empty tier is tried as its own selection pass (with the configured rotation mode applied within the tier) before falling back to the next tier, ending in the catch-all `available` pass. Existing single-tier `preferredCredentialIds` consumers (codex) keep working unchanged.
+- Added `tests/blazeapi-entitlement.test.ts` cases covering: `providerUsesPlanTierRanking`, `rankBlazeApiCredentialsByPlanTier` ordering with trailing unknown-plan bucket, premium-charging model selects Premium first, free-tier model selects Premium first (server-side priority benefit), Premium-exhausted free-tier model falls back to Pro, Premium+Pro-exhausted free-tier model falls back to Free, premium-credit-exhausted Premium credential falls back to Pro for premium-charging models, BlazeAPI-specific failure message when no premium tier is reachable, and the asserted-removal of the old `modelPrefersFreePlan` BlazeAPI preference.
+- Added provider capability matrix to README documenting API key, OAuth, and usage/quota support for all recognized providers.
+- Added environment variable documentation and `.env.example` template for OAuth client overrides, runtime path overrides, and display overrides.
+
+### Changed
+- Updated README OAuth provider coverage to list supported first-class OAuth providers: Cline, Kilo, Kimi For Coding, and Qwen.
+- Added BlazeAPI to the README provider capability matrix as an API-key provider with usage/quota support.
+- Changed the BlazeAPI default rotation mode to `usage-based` in `resolveDefaultRotationMode`, matching the `openai-codex` default, so newly-added BlazeAPI provider state starts in usage-based rotation. Existing persisted `rotationMode` in `multi-auth.json` is preserved; the live workspace state file was migrated separately from `round-robin` to `usage-based` so the rotation now respects per-credential premium-credit consumption.
+- Updated package metadata, published file list, and lockfile version to `0.8.0`, including `.env.example` so the README-linked environment template is included in the package.
 
 ## 0.7.0 - 2026-05-04
 

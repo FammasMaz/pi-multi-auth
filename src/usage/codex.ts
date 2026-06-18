@@ -12,7 +12,8 @@ import type {
 
 const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_USAGE_USER_AGENT = "pi-multi-auth/0.1.0";
-const CODEX_USAGE_REQUEST_TIMEOUT_MS = 3_000;
+const CODEX_USAGE_REQUEST_TIMEOUT_MS = 8_000;
+const CODEX_USAGE_RETRY_REQUEST_TIMEOUT_MS = 15_000;
 const OPENAI_AUTH_CLAIM_KEY = "https://api.openai.com/auth";
 const MAX_CODEX_ACCOUNT_ID_CACHE_ENTRIES = 128;
 
@@ -521,6 +522,10 @@ async function fetchCodexUsageViaIpv4(
 	});
 }
 
+function isRetryableCodexUsageStatus(status: number): boolean {
+	return status === 408 || status === 425 || status >= 500;
+}
+
 async function fetchCodexUsageResponse(
 	headers: Record<string, string>,
 	timeoutMs: number = CODEX_USAGE_REQUEST_TIMEOUT_MS,
@@ -562,6 +567,23 @@ async function fetchCodexUsageResponse(
 	}
 }
 
+async function fetchCodexUsageResponseWithRetry(
+	headers: Record<string, string>,
+): Promise<{ status: number; bodyText: string; viaIpv4Fallback: boolean; responseHeaders: Record<string, string> }> {
+	try {
+		const response = await fetchCodexUsageResponse(headers);
+		if (!isRetryableCodexUsageStatus(response.status)) {
+			return response;
+		}
+	} catch (error: unknown) {
+		if (!isCodexUsageTransportError(error)) {
+			throw error;
+		}
+	}
+
+	return fetchCodexUsageResponse(headers, CODEX_USAGE_RETRY_REQUEST_TIMEOUT_MS);
+}
+
 /**
  * Fetches OpenAI Codex usage/quota from /backend-api/wham/usage.
  */
@@ -583,7 +605,7 @@ export const codexUsageProvider: UsageProvider<UsageAuth> = {
 			headers["ChatGPT-Account-Id"] = accountId;
 		}
 
-		const response = await fetchCodexUsageResponse(headers);
+		const response = await fetchCodexUsageResponseWithRetry(headers);
 		if (response.status === 401) {
 			throw new Error("OpenAI Codex token expired or invalid");
 		}

@@ -12,6 +12,7 @@ import type { ProviderRotationState, SupportedProviderId } from "../types.js";
 import { RollingMetricSeries } from "../performance-metrics.js";
 import type {
 	BalancerCredentialState,
+	BalancerUsageSnapshot,
 	CooldownInfo,
 	CredentialLease,
 	DelegatedCredentialRequest,
@@ -40,6 +41,8 @@ const LEASE_TTL_MS = 24 * 60 * 60 * 1000;
 const LIGHTWEIGHT_SESSION_LEASE_TTL_MS = 5 * 60 * 1000;
 const LIGHTWEIGHT_SESSION_LEASE_SCOPE_PREFIX = "lightweight-session";
 const TRANSIENT_COOLDOWN_REASON_PATTERN = /transient/i;
+const CASCADE_HALF_OPEN_PROBE_BLOCK_MS = 100;
+const CASCADE_HALF_OPEN_PROBE_TTL_MS = 30_000;
 
 type KeyDistributorConfig = {
 	waitTimeoutMs: number;
@@ -88,28 +91,27 @@ type ModelEligibilityResolver = (
 	signal?: AbortSignal,
 ) => Promise<CredentialModelEligibility> | CredentialModelEligibility;
 
-function buildSelectionPasses(
-	available: ReadonlySet<string>,
-	preferredIdGroups?: readonly (readonly string[])[],
-	preferredIds?: readonly string[],
-): Set<string>[] {
-	const priorityGroups = preferredIdGroups
-		?.map((group) => new Set(group.filter((credentialId) => available.has(credentialId))))
-		.filter((group) => group.size > 0);
-	if (priorityGroups && priorityGroups.length > 0) {
-		const coveredCredentialIds = new Set(priorityGroups.flatMap((group) => [...group]));
-		return coveredCredentialIds.size >= available.size
-			? priorityGroups
-			: [...priorityGroups, new Set(available)];
-	}
+type CredentialSelectionValidation = {
+	available: boolean;
+	reason?: string;
+};
 
-	const preferredAvailable = preferredIds && preferredIds.length > 0
-		? new Set(preferredIds.filter((credentialId) => available.has(credentialId)))
-		: null;
-	return preferredAvailable && preferredAvailable.size > 0
-		? [preferredAvailable, new Set(available)]
-		: [new Set(available)];
-}
+type CredentialSelectionValidator = (
+	providerId: SupportedProviderId,
+	credentialId: string,
+	context: SelectionContext,
+	signal?: AbortSignal,
+) => Promise<CredentialSelectionValidation> | CredentialSelectionValidation;
+
+type UsageSnapshotProvider = (
+	providerId: SupportedProviderId,
+	credentialIds: readonly string[],
+	signal?: AbortSignal,
+) => Promise<Record<string, BalancerUsageSnapshot | undefined>> | Record<string, BalancerUsageSnapshot | undefined>;
+
+const DRAINING_ENTER_USED_PERCENT = 85;
+const DRAINING_EXIT_USED_PERCENT = 75;
+const EXHAUSTED_USED_PERCENT = 99;
 
 /**
  * Balancer service that coordinates credential leases, cooldowns, and weighted key selection.
@@ -124,6 +126,8 @@ export class KeyDistributor {
 	private readonly lightweightSubagentSessionIdsByScopeKey = new Map<string, Set<string>>();
 	private readonly lightweightParentSessionIdByScopeKey = new Map<string, string>();
 	private readonly lightweightLeaseScopeKeysByParentSessionId = new Map<string, Set<string>>();
+	private readonly cascadeProbeReservedAtByProvider = new Map<SupportedProviderId, number>();
+	private readonly stickyCredentialBySelectionSession = new Map<string, string>();
 	private readonly waitersByProvider = new Map<SupportedProviderId, Set<Waiter>>();
 	private readonly wakeTimerByProvider = new Map<SupportedProviderId, ReturnType<typeof setTimeout>>();
 	private readonly metricsByProvider = new Map<SupportedProviderId, ProviderMetricState>();
@@ -132,6 +136,8 @@ export class KeyDistributor {
 		{ locked: boolean; waiters: Array<() => void> }
 	>();
 	private modelEligibilityResolver?: ModelEligibilityResolver;
+	private credentialSelectionValidator?: CredentialSelectionValidator;
+	private usageSnapshotProvider?: UsageSnapshotProvider;
 	private providerCapabilitiesResolver?: (
 		providerId: SupportedProviderId,
 	) => ProviderCapabilities;
@@ -161,6 +167,13 @@ export class KeyDistributor {
 		this.modelEligibilityResolver = resolver;
 	}
 
+	setCredentialSelectionValidator(validator: CredentialSelectionValidator): void {
+		this.credentialSelectionValidator = validator;
+	}
+
+	setUsageSnapshotProvider(provider: UsageSnapshotProvider): void {
+		this.usageSnapshotProvider = provider;
+	}
 	setProviderCapabilitiesResolver(
 		resolver: (providerId: SupportedProviderId) => ProviderCapabilities,
 	): void {
@@ -434,7 +447,13 @@ export class KeyDistributor {
 	 * Selects a credential for a non-exclusive orchestrator request.
 	 */
 	async acquireKey(context: SelectionContext, options: AcquireWaitOptions = {}): Promise<string> {
-		return this.acquireCredentialId(context, options.signal);
+		return this.acquireCredentialId(
+			{
+				...context,
+				stickyCredential: context.stickyCredential ?? false,
+			},
+			options.signal,
+		);
 	}
 
 	/**
@@ -478,6 +497,7 @@ export class KeyDistributor {
 		const providerState = this.getOrCreateState(resolvedProviderId);
 		providerState.cooldowns[normalizedCredentialId] = cooldown;
 		this.unregisterLeaseByCredentialId(normalizedCredentialId);
+		this.clearStickySelectionsForCredential(normalizedCredentialId);
 		this.scheduleWake(resolvedProviderId);
 
 		await this.storage.withLock((state) => {
@@ -595,6 +615,7 @@ export class KeyDistributor {
 
 		// Clear any active lease for this credential
 		this.unregisterLeaseByCredentialId(normalizedCredentialId);
+		this.clearStickySelectionsForCredential(normalizedCredentialId);
 
 		// Clear cooldown tracking for this credential
 		const providerState = this.getOrCreateState(resolvedProviderId);
@@ -701,6 +722,7 @@ export class KeyDistributor {
 			activeRequests: { ...state.activeRequests },
 			lastUsedAt: { ...state.lastUsedAt },
 			healthScores: { ...(state.healthScores ?? {}) },
+			quotaDrainStates: { ...(state.quotaDrainStates ?? {}) },
 		};
 	}
 
@@ -942,6 +964,7 @@ export class KeyDistributor {
 			usageCount: Readonly<Record<string, number>>;
 			balancerState: Readonly<BalancerCredentialState>;
 			leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
+			usageSnapshots?: Readonly<Record<string, BalancerUsageSnapshot | undefined>>;
 		},
 		now: number,
 		signal?: AbortSignal,
@@ -1001,6 +1024,75 @@ export class KeyDistributor {
 					}
 					break;
 				}
+			}
+			case "usage-based": {
+				const selectedIndex = getUsageBasedCandidateIndex(snapshot.providerState, available);
+				return selectedIndex === undefined
+					? null
+					: snapshot.providerState.credentialIds[selectedIndex] ?? null;
+			}
+			case "balancer":
+			default: {
+				if (context.stickyCredential !== false) {
+					const stickyCredentialId = this.getStickyCredentialForSelectionSession(
+						context,
+						available,
+						snapshot.usageSnapshots,
+					);
+					if (stickyCredentialId) {
+						return stickyCredentialId;
+					}
+				}
+
+				const selectedCredentialId = selectBestCredential(context, snapshot, {
+					waitTimeoutMs: this.config.waitTimeoutMs,
+					defaultCooldownMs: this.config.defaultCooldownMs,
+					maxConcurrentPerKey: this.config.maxConcurrentPerKey,
+					tolerance: this.config.tolerance,
+				});
+				if (selectedCredentialId && context.stickyCredential !== false) {
+					this.stickyCredentialBySelectionSession.set(
+						this.getSelectionSessionKey(context),
+						selectedCredentialId,
+					);
+				}
+				return selectedCredentialId;
+			}
+		}
+	}
+
+	private getStickyCredentialForSelectionSession(
+		context: SelectionContext,
+		available: ReadonlySet<string>,
+		usageSnapshots?: Readonly<Record<string, BalancerUsageSnapshot | undefined>>,
+	): string | null {
+		const selectionSessionKey = this.getSelectionSessionKey(context);
+		const credentialId = this.stickyCredentialBySelectionSession.get(selectionSessionKey);
+		if (!credentialId) {
+			return null;
+		}
+		if (!available.has(credentialId)) {
+			this.stickyCredentialBySelectionSession.delete(selectionSessionKey);
+			return null;
+		}
+		if (
+			this.isBalancerUsageExhausted(usageSnapshots?.[credentialId]) &&
+			this.hasNonExhaustedAlternative(credentialId, available, usageSnapshots)
+		) {
+			this.stickyCredentialBySelectionSession.delete(selectionSessionKey);
+			return null;
+		}
+		return credentialId;
+	}
+
+	private getSelectionSessionKey(context: SelectionContext): string {
+		return `${context.providerId}\u0000${context.requestingSessionId}`;
+	}
+
+	private clearStickySelectionsForCredential(credentialId: string): void {
+		for (const [selectionSessionKey, selectedCredentialId] of this.stickyCredentialBySelectionSession) {
+			if (selectedCredentialId === credentialId) {
+				this.stickyCredentialBySelectionSession.delete(selectionSessionKey);
 			}
 		}
 
@@ -1065,6 +1157,18 @@ export class KeyDistributor {
 		});
 	}
 
+	private async validateSelectedCredential(
+		providerId: SupportedProviderId,
+		credentialId: string,
+		context: SelectionContext,
+		signal?: AbortSignal,
+	): Promise<CredentialSelectionValidation> {
+		if (!this.credentialSelectionValidator) {
+			return { available: true };
+		}
+		return this.credentialSelectionValidator(providerId, credentialId, context, signal);
+	}
+
 	private async acquireCredentialId(
 		context: SelectionContext,
 		signal?: AbortSignal,
@@ -1075,6 +1179,7 @@ export class KeyDistributor {
 		);
 		await this.clearExpiredCooldowns();
 		const waitDeadline = Date.now() + this.config.waitTimeoutMs;
+		const dynamicallyExcludedCredentialIds = new Set<string>();
 
 		while (true) {
 			throwFixedAbortErrorIfAborted(
@@ -1090,7 +1195,10 @@ export class KeyDistributor {
 				this.notifyAvailability(providerId);
 			}
 
-			const snapshot = await this.buildSnapshot(context.providerId, now);
+			const snapshot = this.applySelectionContextRotationMode(
+				await this.buildSnapshot(context.providerId, now, signal),
+				context,
+			);
 			throwFixedAbortErrorIfAborted(
 				signal,
 				createCredentialAvailabilityAbortMessage(context.providerId),
@@ -1101,8 +1209,16 @@ export class KeyDistributor {
 				);
 			}
 
+			const selectionContext = dynamicallyExcludedCredentialIds.size > 0
+				? {
+					...context,
+					excludedIds: [
+						...new Set([...context.excludedIds, ...dynamicallyExcludedCredentialIds]),
+					],
+				}
+				: context;
 			const effectiveContext = await this.resolveEffectiveSelectionContext(
-				context,
+				selectionContext,
 				snapshot.credentialIds,
 				signal,
 			);
@@ -1117,6 +1233,23 @@ export class KeyDistributor {
 				signal,
 			);
 			if (selectedCredentialId) {
+				const validation = await this.validateSelectedCredential(
+					context.providerId,
+					selectedCredentialId,
+					effectiveContext,
+					signal,
+				);
+				if (!validation.available) {
+					dynamicallyExcludedCredentialIds.add(selectedCredentialId);
+					this.clearStickySelectionsForCredential(selectedCredentialId);
+					multiAuthDebugLogger.log("delegated_credential_selection_rejected", {
+						provider: context.providerId,
+						credentialId: selectedCredentialId,
+						reason: validation.reason ?? "selection-validation",
+					});
+					continue;
+				}
+
 				const selectedAt = Date.now();
 				await this.recordProviderSelection(
 					context.providerId,
@@ -1137,6 +1270,23 @@ export class KeyDistributor {
 
 			await this.waitForAvailability(context.providerId, remainingMs, signal);
 		}
+	}
+
+	private applySelectionContextRotationMode<Snapshot extends { providerState: ProviderRotationState }>(
+		snapshot: Snapshot,
+		context: SelectionContext,
+	): Snapshot {
+		if (!context.rotationMode || snapshot.providerState.rotationMode === context.rotationMode) {
+			return snapshot;
+		}
+
+		return {
+			...snapshot,
+			providerState: {
+				...snapshot.providerState,
+				rotationMode: context.rotationMode,
+			},
+		};
 	}
 
 	private async resolveEffectiveSelectionContext(
@@ -1189,12 +1339,13 @@ export class KeyDistributor {
 		};
 	}
 
-	private async buildSnapshot(providerId: SupportedProviderId, now: number): Promise<{
+	private async buildSnapshot(providerId: SupportedProviderId, now: number, signal?: AbortSignal): Promise<{
 		providerState: ProviderRotationState;
 		credentialIds: readonly string[];
 		usageCount: Readonly<Record<string, number>>;
 		balancerState: Readonly<BalancerCredentialState>;
 		leasesByCredentialId: Readonly<Record<string, CredentialLease | undefined>>;
+		usageSnapshots?: Readonly<Record<string, BalancerUsageSnapshot | undefined>>;
 	}> {
 		const providerState = this.applyLightweightRotationState(
 			providerId,
@@ -1205,10 +1356,22 @@ export class KeyDistributor {
 		const balancerState = this.getOrCreateState(providerId);
 
 		const activeCascade = providerState.cascadeState?.[providerId]?.active;
-		const cascadeBlockedUntil =
-			activeCascade?.isActive === true && activeCascade.nextRetryAt > now
-				? activeCascade.nextRetryAt
-				: null;
+		let cascadeBlockedUntil: number | null = null;
+		if (activeCascade?.isActive === true) {
+			if (activeCascade.nextRetryAt > now) {
+				cascadeBlockedUntil = activeCascade.nextRetryAt;
+				this.cascadeProbeReservedAtByProvider.delete(providerId);
+			} else {
+				const reservedAt = this.cascadeProbeReservedAtByProvider.get(providerId);
+				if (reservedAt !== undefined && now - reservedAt < CASCADE_HALF_OPEN_PROBE_TTL_MS) {
+					cascadeBlockedUntil = now + CASCADE_HALF_OPEN_PROBE_BLOCK_MS;
+				} else {
+					this.cascadeProbeReservedAtByProvider.set(providerId, now);
+				}
+			}
+		} else {
+			this.cascadeProbeReservedAtByProvider.delete(providerId);
+		}
 		const cascadeBlockedCredentialIds = new Set(
 			cascadeBlockedUntil === null
 				? []
@@ -1255,6 +1418,17 @@ export class KeyDistributor {
 		trimRecordByKeys(balancerState.lastUsedAt, validCredentialIds);
 		trimRecordByKeys(balancerState.cooldowns, validCredentialIds);
 		trimRecordByKeys(balancerState.healthScores ?? {}, validCredentialIds);
+		this.mergePersistedQuotaDrainStates(balancerState, providerState.quotaDrainStates);
+		trimRecordByKeys(balancerState.quotaDrainStates ?? {}, validCredentialIds);
+		const usageSnapshots = providerState.rotationMode === "balancer"
+			? await this.resolveUsageSnapshots(providerId, credentialIds, signal)
+			: {};
+		if (providerState.rotationMode === "balancer") {
+			const didUpdateDrainStates = this.updateQuotaDrainStates(balancerState, validCredentialIds, usageSnapshots, now);
+			if (didUpdateDrainStates) {
+				await this.persistQuotaDrainStates(providerId, balancerState.quotaDrainStates ?? {}, validCredentialIds);
+			}
+		}
 		this.releaseOrphanLeases(providerId, validCredentialIds);
 
 		const leasesByCredentialId: Record<string, CredentialLease | undefined> = {};
@@ -1277,7 +1451,132 @@ export class KeyDistributor {
 			usageCount: providerState.usageCount,
 			balancerState,
 			leasesByCredentialId,
+			usageSnapshots,
 		};
+	}
+
+	private async resolveUsageSnapshots(
+		providerId: SupportedProviderId,
+		credentialIds: readonly string[],
+		signal?: AbortSignal,
+	): Promise<Record<string, BalancerUsageSnapshot | undefined>> {
+		if (!this.usageSnapshotProvider || credentialIds.length === 0) {
+			return {};
+		}
+		try {
+			return await this.usageSnapshotProvider(providerId, credentialIds, signal);
+		} catch (error: unknown) {
+			if (error instanceof Error && error.name === "AbortError") {
+				throw error;
+			}
+			multiAuthDebugLogger.log("balancer_usage_snapshot_provider_failed", {
+				provider: providerId,
+				message: error instanceof Error ? error.message : String(error),
+			});
+			return {};
+		}
+	}
+
+	private mergePersistedQuotaDrainStates(
+		balancerState: BalancerCredentialState,
+		persistedDrainStates: ProviderRotationState["quotaDrainStates"],
+	): void {
+		if (!persistedDrainStates) {
+			return;
+		}
+		balancerState.quotaDrainStates = balancerState.quotaDrainStates ?? {};
+		for (const [credentialId, drainState] of Object.entries(persistedDrainStates)) {
+			balancerState.quotaDrainStates[credentialId] ??= { ...drainState };
+		}
+	}
+
+	private async persistQuotaDrainStates(
+		providerId: SupportedProviderId,
+		quotaDrainStates: Readonly<NonNullable<BalancerCredentialState["quotaDrainStates"]>>,
+		validCredentialIds: ReadonlySet<string>,
+	): Promise<void> {
+		await this.storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			const nextDrainStates: NonNullable<ProviderRotationState["quotaDrainStates"]> = {};
+			for (const [credentialId, drainState] of Object.entries(quotaDrainStates)) {
+				if (!validCredentialIds.has(credentialId) || drainState.draining !== true) {
+					continue;
+				}
+				nextDrainStates[credentialId] = { ...drainState };
+			}
+			const hasNextDrainStates = Object.keys(nextDrainStates).length > 0;
+			const current = providerState.quotaDrainStates ?? {};
+			if (JSON.stringify(current) === JSON.stringify(hasNextDrainStates ? nextDrainStates : undefined)) {
+				return { result: false };
+			}
+			if (hasNextDrainStates) {
+				providerState.quotaDrainStates = nextDrainStates;
+			} else {
+				providerState.quotaDrainStates = undefined;
+			}
+			return { result: true, next: state };
+		});
+	}
+
+	private updateQuotaDrainStates(
+		balancerState: BalancerCredentialState,
+		validCredentialIds: ReadonlySet<string>,
+		usageSnapshots: Readonly<Record<string, BalancerUsageSnapshot | undefined>>,
+		now: number,
+	): boolean {
+		balancerState.quotaDrainStates = balancerState.quotaDrainStates ?? {};
+		let changed = false;
+		for (const credentialId of validCredentialIds) {
+			const usage = usageSnapshots[credentialId];
+			const usedPercent = usage?.usedPercent;
+			if (usedPercent === undefined || usedPercent === null || !Number.isFinite(usedPercent)) {
+				continue;
+			}
+			const existing = balancerState.quotaDrainStates[credentialId];
+			const shouldDrain = this.isBalancerUsageExhausted(usage) ||
+				usedPercent >= DRAINING_ENTER_USED_PERCENT ||
+				(existing?.draining === true && usedPercent > DRAINING_EXIT_USED_PERCENT);
+			if (shouldDrain) {
+				const nextDrainState = {
+					draining: true,
+					enteredAt: existing?.enteredAt ?? now,
+					lastUsedPercent: usedPercent,
+					updatedAt: now,
+				};
+				changed = changed || JSON.stringify(existing) !== JSON.stringify(nextDrainState);
+				balancerState.quotaDrainStates[credentialId] = nextDrainState;
+				continue;
+			}
+			if (balancerState.quotaDrainStates[credentialId] !== undefined) {
+				delete balancerState.quotaDrainStates[credentialId];
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private isBalancerUsageExhausted(usage: BalancerUsageSnapshot | undefined): boolean {
+		if (!usage) {
+			return false;
+		}
+		return usage.quotaState.state === "exhausted" ||
+			(usage.usedPercent !== null && usage.usedPercent >= EXHAUSTED_USED_PERCENT);
+	}
+
+	private hasNonExhaustedAlternative(
+		credentialId: string,
+		available: ReadonlySet<string>,
+		usageSnapshots?: Readonly<Record<string, BalancerUsageSnapshot | undefined>>,
+	): boolean {
+		for (const availableCredentialId of available) {
+			if (availableCredentialId === credentialId) {
+				continue;
+			}
+			if (!this.isBalancerUsageExhausted(usageSnapshots?.[availableCredentialId])) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private registerLease(lease: InternalLease): void {

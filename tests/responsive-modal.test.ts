@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	renderWrappedFooterActions,
+	RESPONSIVE_MODAL_DEFAULT_SCALE,
 	resolveBodyRowBudget,
+	resolveResponsiveOverlayOptions,
 	resolveTerminalRows,
 	wrapTextToWidth,
 } from "../src/formatters/responsive-modal.js";
@@ -18,7 +20,16 @@ import {
 	summarizeProviderVisibility,
 } from "../src/formatters/modal-ui.js";
 import { formatRotationModeLabel } from "../src/rotation-modes.js";
-import { hydrateStatusWithCachedUsage, resolveModalRefreshAction, classifyCredentialPlanTier, filterCredentialsByPlan, resolveCredentialPlanLabel } from "../src/commands.js";
+import {
+	hydrateStatusWithCachedUsage,
+	renderAccountEntryLines,
+	resolveModalRefreshAction,
+	resolveMultiAuthContentRows,
+	resolveMultiAuthOverlayOptions,
+	splitPaneWidths,
+} from "../src/commands.js";
+import { resolveOAuthLoginOverlayOptions } from "../src/oauth-login-flow.js";
+import { resolveProviderConfigurationOverlayOptions } from "../src/provider-configuration-dialog.js";
 import type { CredentialStatus, ProviderStatus, SupportedProviderId } from "../src/types.js";
 
 const PROVIDER_FOOTER_ACTIONS = resolveFooterActions({
@@ -134,6 +145,219 @@ test("body row budget shrinks when terminal rows are constrained", () => {
 	});
 
 	assert.equal(bodyRows, 5);
+});
+
+test("body row budget can prioritize fixed chrome when overlays are very short", () => {
+	const bodyRows = resolveBodyRowBudget({
+		defaultRows: 22,
+		terminalRows: 10,
+		reservedRows: 12,
+		minimumRows: 4,
+		fitAvailableRows: true,
+	});
+
+	assert.equal(bodyRows, 0);
+});
+
+test("responsive overlay fallback defaults are at least 40% larger", () => {
+	const overlay = resolveResponsiveOverlayOptions({
+		terminalColumns: Number.NaN,
+		terminalRows: Number.NaN,
+	});
+	const previousDefaultWidth = Math.floor(120 * 0.92);
+	const previousDefaultHeight = Math.floor(36 * 0.86);
+
+	assert.ok(
+		overlay.width >= Math.ceil(previousDefaultWidth * RESPONSIVE_MODAL_DEFAULT_SCALE),
+		`expected fallback width to scale by ${RESPONSIVE_MODAL_DEFAULT_SCALE}x`,
+	);
+	assert.ok(
+		overlay.maxHeight >= Math.ceil(previousDefaultHeight * RESPONSIVE_MODAL_DEFAULT_SCALE),
+		`expected fallback height to scale by ${RESPONSIVE_MODAL_DEFAULT_SCALE}x`,
+	);
+});
+
+test("modal-specific preferred dimensions are at least 40% larger when space allows", () => {
+	const largeTerminal = { terminalColumns: 240, terminalRows: 80 };
+	const cases = [
+		{
+			name: "multi-auth",
+			resolveOverlay: resolveMultiAuthOverlayOptions,
+			previousWidth: 132,
+			previousHeight: Math.floor(36 * 0.9),
+		},
+		{
+			name: "provider configuration",
+			resolveOverlay: resolveProviderConfigurationOverlayOptions,
+			previousWidth: 120,
+			previousHeight: Math.floor(36 * 0.88),
+		},
+		{
+			name: "oauth login",
+			resolveOverlay: resolveOAuthLoginOverlayOptions,
+			previousWidth: 110,
+			previousHeight: Math.floor(36 * 0.86),
+		},
+	] as const;
+
+	for (const testCase of cases) {
+		const overlay = testCase.resolveOverlay(largeTerminal);
+		const targetWidth = Math.ceil(testCase.previousWidth * RESPONSIVE_MODAL_DEFAULT_SCALE);
+		const targetHeight = Math.ceil(testCase.previousHeight * RESPONSIVE_MODAL_DEFAULT_SCALE);
+
+		assert.ok(overlay.width >= targetWidth, `${testCase.name} width did not scale by 40%`);
+		assert.ok(overlay.maxHeight >= targetHeight, `${testCase.name} height did not scale by 40%`);
+		assert.ok(overlay.width <= largeTerminal.terminalColumns - overlay.margin * 2);
+		assert.ok(overlay.maxHeight <= largeTerminal.terminalRows - overlay.margin * 2);
+	}
+});
+
+test("responsive overlay options are numeric and stay inside terminal margins", () => {
+	const matrices = [
+		{ terminalColumns: 52, terminalRows: 20 },
+		{ terminalColumns: 80, terminalRows: 24 },
+		{ terminalColumns: 120, terminalRows: 36 },
+		{ terminalColumns: 180, terminalRows: 54 },
+	] as const;
+	const resolvers = [
+		resolveResponsiveOverlayOptions,
+		resolveMultiAuthOverlayOptions,
+		resolveProviderConfigurationOverlayOptions,
+		resolveOAuthLoginOverlayOptions,
+	] as const;
+
+	for (const terminal of matrices) {
+		for (const resolveOverlay of resolvers) {
+			const overlay = resolveOverlay(terminal);
+			assert.equal(overlay.anchor, "center");
+			assert.equal(typeof overlay.width, "number");
+			assert.equal(typeof overlay.maxHeight, "number");
+			assert.ok(Number.isInteger(overlay.width), "width should be an integer column count");
+			assert.ok(Number.isInteger(overlay.maxHeight), "height should be an integer row count");
+			assert.ok(overlay.width <= terminal.terminalColumns - overlay.margin * 2);
+			assert.ok(overlay.maxHeight <= terminal.terminalRows - overlay.margin * 2);
+			assert.ok(overlay.width >= 1);
+			assert.ok(overlay.maxHeight >= 1);
+		}
+	}
+});
+
+test("rendered multi-auth modal budget keeps status and footer visible across terminal sizes", () => {
+	const theme = {
+		fg(_color: string, text: string) {
+			return text;
+		},
+		bold(text: string) {
+			return text;
+		},
+	};
+	const matrices = [
+		{ terminalColumns: 52, terminalRows: 20, expectThreePane: false },
+		{ terminalColumns: 80, terminalRows: 24, expectThreePane: false },
+		{ terminalColumns: 120, terminalRows: 36, expectThreePane: true },
+		{ terminalColumns: 180, terminalRows: 54, expectThreePane: true },
+	] as const;
+
+	for (const terminal of matrices) {
+		const overlay = resolveMultiAuthOverlayOptions(terminal);
+		const contentWidth = Math.max(1, overlay.width - 2);
+		const statusLines = wrapTextToWidth("Status: Focused pane: Providers.", contentWidth);
+		const footerLines = renderWrappedFooterActions(PROVIDER_FOOTER_ACTIONS, contentWidth);
+		const dashboardChromeRows = contentWidth >= 96 ? 3 : 0;
+		const reservedRows = statusLines.length + footerLines.length + dashboardChromeRows + 4;
+		const bodyRows = resolveBodyRowBudget({
+			defaultRows: 22,
+			terminalRows: resolveMultiAuthContentRows(overlay),
+			reservedRows,
+			minimumRows: 4,
+			fitAvailableRows: true,
+		});
+		const contentLines = [
+			"  Pi Multi Auth",
+			"",
+			...Array.from({ length: dashboardChromeRows + bodyRows }, () => "dashboard"),
+			"",
+			...statusLines,
+			"─".repeat(contentWidth),
+			...footerLines,
+		];
+		const rendered = renderZellijFrame(contentLines, overlay.width, theme, {
+			titleLeft: "",
+			focused: true,
+		});
+		const output = rendered.lines.join("\n");
+
+		assert.ok(rendered.lines.length <= overlay.maxHeight);
+		assert.match(output, /Status: Focused pane: Providers\./);
+		assert.match(output, /\[Esc\] Close/);
+		assert.equal(contentWidth >= 96, terminal.expectThreePane);
+		for (const line of rendered.lines) {
+			assert.equal(visibleWidth(line), overlay.width);
+		}
+	}
+});
+
+test("three-pane accounts header fits at responsive modal width", () => {
+	const widths = splitPaneWidths(110);
+	const accountInnerWidth = Math.max(1, widths.accounts - 4);
+	const headerText = "Accounts: github-copilot (1)";
+
+	assert.ok(
+		accountInnerWidth >= visibleWidth(headerText),
+		`expected accounts inner width ${accountInnerWidth} to fit ${headerText}`,
+	);
+});
+
+test("account rows use full pane width for unlabeled credential IDs", () => {
+	const credential: CredentialStatus = {
+		credentialId: "verylongusername@example.com",
+		credentialType: "oauth",
+		redactedSecret: "token",
+		index: 0,
+		isActive: true,
+		isExpired: false,
+		usageCount: 0,
+		quotaErrorCount: 0,
+		expiresAt: null,
+	};
+	const lines = renderAccountEntryLines({
+		credential,
+		contentWidth: 36,
+		isSelected: true,
+		isMarked: true,
+		statusCell: "[●]",
+	});
+
+	assert.equal(lines.length, 1);
+	assert.match(lines[0] ?? "", /verylongusername@example\.com/);
+	assert.doesNotMatch(lines[0] ?? "", /…/);
+	assert.equal(visibleWidth(lines[0] ?? ""), 36);
+});
+
+test("account rows stay width-bounded in genuinely narrow panes", () => {
+	const credential: CredentialStatus = {
+		credentialId: "verylongusername@example.com",
+		credentialType: "oauth",
+		redactedSecret: "token",
+		index: 0,
+		isActive: true,
+		isExpired: false,
+		usageCount: 0,
+		quotaErrorCount: 0,
+		expiresAt: null,
+	};
+	const lines = renderAccountEntryLines({
+		credential,
+		contentWidth: 16,
+		isSelected: true,
+		isMarked: true,
+		statusCell: "[●]",
+	});
+
+	assert.ok(lines.length > 1, "expected narrow account rows to wrap");
+	for (const line of lines) {
+		assert.equal(visibleWidth(line), 16);
+	}
 });
 
 test("terminal row resolver falls back to LINES env when stdout rows are unavailable", () => {

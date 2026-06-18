@@ -1,4 +1,4 @@
-import type { OverlayHandle } from "@mariozechner/pi-tui";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
 
 /**
  * Manages temporary modal hiding while nested UI dialogs are active.

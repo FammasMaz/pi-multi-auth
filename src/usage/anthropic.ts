@@ -1,3 +1,4 @@
+import { runWithTimeoutSignal } from "../async-utils.js";
 import { quotaClassifier } from "../quota-classifier.js";
 import { headersToRecord, rateLimitHeaderParser } from "../rate-limit-headers.js";
 import type { RateLimitWindow, UsageAuth, UsageProvider, UsageSnapshot } from "./types.js";
@@ -5,6 +6,7 @@ import { isRecord } from "../auth-error-utils.js";
 
 const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_OAUTH_BETA_HEADER = "oauth-2025-04-20";
+const ANTHROPIC_USAGE_REQUEST_TIMEOUT_MS = 3_000;
 
 interface AnthropicUsageWindow {
 	utilization?: number;
@@ -95,14 +97,27 @@ export const anthropicUsageProvider: UsageProvider<UsageAuth> = {
 			return null;
 		}
 
-		const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
-			method: "GET",
-			headers: {
-				Authorization: `Bearer ${auth.accessToken}`,
-				"anthropic-beta": ANTHROPIC_OAUTH_BETA_HEADER,
-				"User-Agent": "pi-multi-auth",
+		const { response, data } = await runWithTimeoutSignal(
+			async (signal) => {
+				const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
+					method: "GET",
+					headers: {
+						Authorization: `Bearer ${auth.accessToken}`,
+						"anthropic-beta": ANTHROPIC_OAUTH_BETA_HEADER,
+						"User-Agent": "pi-multi-auth",
+					},
+					signal,
+				});
+				return {
+					response,
+					data: response.ok ? ((await response.json()) as unknown) : null,
+				};
 			},
-		});
+			{
+				timeoutMs: ANTHROPIC_USAGE_REQUEST_TIMEOUT_MS,
+				timeoutMessage: `Anthropic usage request timed out after ${ANTHROPIC_USAGE_REQUEST_TIMEOUT_MS}ms`,
+			},
+		);
 
 		if (!response.ok) {
 			if (response.status === 401) {
@@ -114,7 +129,6 @@ export const anthropicUsageProvider: UsageProvider<UsageAuth> = {
 			throw new Error(`Anthropic usage request failed with status ${response.status}`);
 		}
 
-		const data = (await response.json()) as unknown;
 		const parsed = parseUsageResponse(data);
 		if (!parsed) {
 			throw new Error("Anthropic usage response format was invalid");

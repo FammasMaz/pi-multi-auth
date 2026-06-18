@@ -2,9 +2,24 @@ import type { ParsedRateLimitHeaders, ProviderRateLimitConfig } from "./types-qu
 
 const PROVIDER_CONFIGS: Record<string, ProviderRateLimitConfig> = {
 	"openai-codex": {
-		limitHeaders: ["x-ratelimit-limit-requests", "x-ratelimit-limit"],
-		remainingHeaders: ["x-ratelimit-remaining-requests", "x-ratelimit-remaining"],
-		resetHeaders: ["x-ratelimit-reset-requests", "x-ratelimit-reset"],
+		limitHeaders: [
+			"x-ratelimit-limit-requests",
+			"x-ratelimit-limit",
+			"x-codex-ratelimit-limit",
+			"x-codex-rate-limit-limit",
+		],
+		remainingHeaders: [
+			"x-ratelimit-remaining-requests",
+			"x-ratelimit-remaining",
+			"x-codex-ratelimit-remaining",
+			"x-codex-rate-limit-remaining",
+		],
+		resetHeaders: [
+			"x-ratelimit-reset-requests",
+			"x-ratelimit-reset",
+			"x-codex-ratelimit-reset",
+			"x-codex-rate-limit-reset",
+		],
 		resetFormat: "seconds",
 		parseRetryAfter: true,
 	},
